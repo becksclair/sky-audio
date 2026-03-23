@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
 import os
 import signal
 import sys
-import wave
 from collections.abc import AsyncIterator
 from concurrent import futures
 from typing import override
@@ -27,9 +25,9 @@ MODEL_NAME = os.environ.get("STT_MODEL", "nvidia/parakeet-tdt-0.6b-v3")
 SAMPLE_RATE = 16000
 
 
-def load_model() -> object:
+def load_model() -> torch.nn.Module:
     """Load the NeMo ASR model with fp16 to conserve VRAM."""
-    import nemo.collections.asr as nemo_asr
+    import nemo.collections.asr as nemo_asr  # type: ignore[import-unresolved]
 
     logger.info("Loading model %s...", MODEL_NAME)
     model = nemo_asr.models.ASRModel.from_pretrained(model_name=MODEL_NAME)
@@ -45,7 +43,7 @@ def load_model() -> object:
     return model
 
 
-def pcm_to_float32(pcm_bytes: bytes, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
+def pcm_to_float32(pcm_bytes: bytes) -> np.ndarray:
     """Convert raw 16-bit signed LE PCM bytes to float32 numpy array normalized to [-1, 1]."""
     audio = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
     return audio
@@ -54,7 +52,7 @@ def pcm_to_float32(pcm_bytes: bytes, sample_rate: int = SAMPLE_RATE) -> np.ndarr
 class SpeechToTextServicer(audio_engine_pb2_grpc.SpeechToTextServicer):
     """Bidirectional streaming STT using NVIDIA Parakeet TDT v3."""
 
-    def __init__(self, model: object) -> None:
+    def __init__(self, model: torch.nn.Module) -> None:
         self._model = model
 
     @override
@@ -96,7 +94,7 @@ class SpeechToTextServicer(audio_engine_pb2_grpc.SpeechToTextServicer):
     def _transcribe(self, audio: np.ndarray) -> str:
         """Run inference synchronously (called from executor)."""
         with torch.inference_mode():
-            with torch.amp.autocast("cuda", enabled=torch.cuda.is_available()):
+            with torch.autocast("cuda", enabled=torch.cuda.is_available()):  # type: ignore[attr-defined]
                 output = self._model.transcribe([audio], batch_size=1, verbose=False)  # type: ignore[union-attr]
         if output and len(output) > 0:
             result = output[0]
