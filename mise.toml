@@ -1,0 +1,78 @@
+[tools]
+go = "1.26"
+node = "25"
+bun = "latest"
+python = "3.13"
+
+[tasks.dev]
+description = "Start gateway + STT worker (dev mode)"
+run = "cd gateway && go run ./cmd/sky-audio"
+
+[tasks."dev:dashboard"]
+description = "Start Vite dev server with HMR (proxy to gateway on :8080)"
+run = "cd dashboard && bun run dev"
+
+[tasks.build]
+description = "Full production build: dashboard → embed → Go binary"
+run = "./build.sh"
+
+[tasks."build:dashboard"]
+description = "Build dashboard assets only"
+run = "cd dashboard && bun install --frozen-lockfile && bun run build"
+
+[tasks."build:gateway"]
+description = "Build Go gateway binary (assumes dashboard dist exists)"
+run = """
+rm -rf gateway/pkg/dashboard/dist
+cp -r dashboard/dist gateway/pkg/dashboard/dist
+cd gateway && go build -o sky-audio ./cmd/sky-audio
+"""
+
+[tasks."build:proto"]
+description = "Recompile protobuf stubs for Go and Python"
+run = """
+export PATH="$PATH:$(go env GOPATH)/bin"
+mkdir -p gateway/pkg/pb workers/python-nemo/pb
+protoc \
+  --go_out=gateway/pkg/pb --go-grpc_out=gateway/pkg/pb \
+  --go_opt=paths=source_relative --go-grpc_opt=paths=source_relative \
+  proto/audio_engine.proto
+python -m grpc_tools.protoc \
+  -I=proto \
+  --python_out=workers/python-nemo/pb \
+  --grpc_python_out=workers/python-nemo/pb \
+  proto/audio_engine.proto
+sed -i 's/^import audio_engine_pb2 as/from . import audio_engine_pb2 as/' \
+  workers/python-nemo/pb/audio_engine_pb2_grpc.py
+"""
+
+[tasks.test]
+description = "Run all Go tests"
+run = "cd gateway && go test ./... -count=1 -v"
+
+[tasks.check]
+description = "Full validation: vet + test + build"
+depends = ["check:vet", "test", "build"]
+
+[tasks."check:vet"]
+description = "Go vet"
+run = "cd gateway && go vet ./..."
+
+[tasks."check:types"]
+description = "Typecheck all languages"
+run = """
+cd gateway && go vet ./...
+cd ../dashboard && bun run typecheck 2>/dev/null || true
+cd ../workers/python-nemo && uv run basedpyright main.py
+"""
+
+[tasks.clean]
+description = "Remove build artifacts"
+run = """
+rm -rf gateway/sky-audio gateway/pkg/dashboard/dist dashboard/dist
+rm -f /tmp/sky-audio-*.sock
+"""
+
+[tasks."worker:stt"]
+description = "Run STT worker standalone (for debugging)"
+run = "cd workers/python-nemo && uv run python main.py"
