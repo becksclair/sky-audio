@@ -7,14 +7,18 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/heliasar/sky-audio/gateway/pkg/dashboard"
 	"github.com/heliasar/sky-audio/gateway/pkg/process"
+	"github.com/heliasar/sky-audio/gateway/pkg/vad"
 	"github.com/heliasar/sky-audio/gateway/pkg/vram"
 	skywebrtc "github.com/heliasar/sky-audio/gateway/pkg/webrtc"
 )
+
+const sttSocketPath = "/tmp/sky-audio-stt.sock"
 
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -50,6 +54,53 @@ func main() {
 		log.Fatalf("Failed to spawn STT worker: %v", err)
 	}
 
+	// Wait for the STT socket to appear and be connectable.
+	log.Println("[INFO] Waiting for STT worker socket...")
+	waitForSocket(sttSocketPath, 120*time.Second)
+
+	// 500ms ring buffer: 16kHz, 16-bit mono = 32000 bytes/sec, 500ms = 16000 bytes
+	const ringBufSize = 16000
+	ringBuf := vad.NewRingBuffer(ringBufSize)
+	var ringMu sync.Mutex
+
+	// STT gRPC client — retry until the worker is accepting connections.
+	var sttClient *skywebrtc.STTClient
+	for range 30 {
+		sttClient, err = skywebrtc.NewSTTClient(sttSocketPath)
+		if err != nil {
+			time.Sleep(time.Second)
+			continue
+		}
+		if err = sttClient.StartStream(ctx); err != nil {
+			sttClient.Close()
+			log.Printf("[INFO] STT not ready yet: %v", err)
+			time.Sleep(time.Second)
+			continue
+		}
+		break
+	}
+	if sttClient == nil || err != nil {
+		log.Fatalf("Failed to connect to STT worker after retries: %v", err)
+	}
+	defer sttClient.Close()
+	log.Println("[INFO] STT stream established")
+
+	// Read transcripts in background
+	go func() {
+		for {
+			transcript, err := sttClient.Recv()
+			if err != nil {
+				log.Printf("[stt] Recv error: %v", err)
+				return
+			}
+			log.Printf("[stt] Transcript (final=%v): %s", transcript.IsFinal, transcript.Text)
+		}
+	}()
+
+	// Audio chunk counter for simple energy-based VAD
+	var chunkCount int
+	var chunkMu sync.Mutex
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -58,8 +109,33 @@ func main() {
 
 	peerRegistry := skywebrtc.NewPeerRegistry()
 	mux.HandleFunc("/webrtc/offer", skywebrtc.OfferHandler(skywebrtc.PeerConfig{
-		OnPCMAudio: func(pcm []byte) {
-			log.Printf("[webrtc] Received %d bytes PCM audio", len(pcm))
+		OnPCMAudio: func(data []byte) {
+			ringMu.Lock()
+			ringBuf.Write(data)
+			ringMu.Unlock()
+
+			chunkMu.Lock()
+			chunkCount++
+			count := chunkCount
+			chunkMu.Unlock()
+
+			// Send every chunk to STT worker. The worker accumulates until is_end_of_speech.
+			// For now, send is_end_of_speech every ~50 chunks (~1s of audio at 20ms/chunk).
+			isEOS := count%50 == 0
+			if isEOS {
+				// Flush ring buffer and prepend to ensure no clipping
+				ringMu.Lock()
+				_ = ringBuf.Flush() // consume the buffer (data already sent chunk-by-chunk)
+				ringMu.Unlock()
+
+				chunkMu.Lock()
+				chunkCount = 0
+				chunkMu.Unlock()
+			}
+
+			if err := sttClient.SendAudio(data, isEOS, 16000); err != nil {
+				log.Printf("[stt] SendAudio error: %v", err)
+			}
 		},
 	}, peerRegistry))
 
@@ -95,4 +171,15 @@ func main() {
 
 	peerRegistry.CloseAll()
 	mgr.KillAll()
+}
+
+func waitForSocket(path string, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	log.Fatalf("Timed out waiting for socket: %s", path)
 }

@@ -100,7 +100,11 @@ class SpeechToTextServicer(audio_engine_pb2_grpc.SpeechToTextServicer):
                 output = self._model.transcribe([audio], batch_size=1, verbose=False)  # type: ignore[union-attr]
         if output and len(output) > 0:
             result = output[0]
-            return result.text if hasattr(result, "text") else str(result)
+            if hasattr(result, "text"):
+                return result.text
+            if isinstance(result, list) and len(result) > 0:
+                return str(result[0])
+            return str(result)
         return ""
 
 
