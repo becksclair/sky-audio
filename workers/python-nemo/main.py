@@ -30,7 +30,9 @@ def load_model() -> torch.nn.Module:
     import nemo.collections.asr as nemo_asr  # type: ignore[import-unresolved]
 
     logger.info("Loading model %s...", MODEL_NAME)
-    model = nemo_asr.models.ASRModel.from_pretrained(model_name=MODEL_NAME)
+    loaded = nemo_asr.models.ASRModel.from_pretrained(model_name=MODEL_NAME)
+    assert isinstance(loaded, torch.nn.Module), f"Expected Module, got {type(loaded)}"
+    model: torch.nn.Module = loaded
     model.eval()
 
     if torch.cuda.is_available():
