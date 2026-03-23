@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"sync/atomic"
 
 	"github.com/pion/webrtc/v4"
 )
@@ -50,8 +51,14 @@ func (pr *PeerRegistry) CloseAll() {
 	}
 }
 
+var peerCounter atomic.Uint64
+
 func NewPeerConnection(cfg PeerConfig) (*webrtc.PeerConnection, error) {
-	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
+		ICEServers: []webrtc.ICEServer{
+			{URLs: []string{"stun:stun.l.google.com:19302"}},
+		},
+	})
 	if err != nil {
 		return nil, fmt.Errorf("new peer connection: %w", err)
 	}
@@ -151,12 +158,17 @@ func OfferHandler(cfg PeerConfig, registry *PeerRegistry) http.HandlerFunc {
 			return
 		}
 
-		peerID := fmt.Sprintf("peer-%d", r.Context().Value(http.LocalAddrContextKey))
+		// Wait for ICE gathering to complete so the answer SDP contains all candidates.
+		<-webrtc.GatheringCompletePromise(pc)
+
+		peerID := fmt.Sprintf("peer-%d", peerCounter.Add(1))
 		registry.Add(peerID, pc)
 
 		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(answer); err != nil {
+		if err := json.NewEncoder(w).Encode(pc.LocalDescription()); err != nil {
 			log.Printf("[webrtc] write answer error: %v", err)
 		}
+
+		log.Printf("[webrtc] Peer %s connected", peerID)
 	}
 }
