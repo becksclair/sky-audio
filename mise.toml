@@ -6,7 +6,7 @@ python = "3.13"
 
 [tasks.dev]
 description = "Start gateway + STT worker (dev mode)"
-run = "cd gateway && go run ./cmd/sky-audio"
+run = "go run ./gateway/cmd/sky-audio"
 
 [tasks."dev:dashboard"]
 description = "Start Vite dev server with HMR (proxy to gateway on :8080)"
@@ -48,7 +48,7 @@ sed -i 's/^import audio_engine_pb2 as/from . import audio_engine_pb2 as/' \
 
 [tasks.test]
 description = "Run all Go tests"
-run = "cd gateway && go test ./... -count=1 -v"
+run = "go test ./gateway/... -count=1 -v"
 
 [tasks.check]
 description = "Full validation: vet + test + build"
@@ -56,13 +56,13 @@ depends = ["check:vet", "test", "build"]
 
 [tasks."check:vet"]
 description = "Go vet"
-run = "cd gateway && go vet ./..."
+run = "go vet ./gateway/..."
 
 [tasks."check:types"]
 description = "Typecheck all languages"
 run = """
-cd gateway && go vet ./...
-cd ../dashboard && bun run typecheck 2>/dev/null || true
+go vet ./gateway/...
+cd dashboard && bun run typecheck 2>/dev/null || true
 cd ../workers/python-nemo && uv run basedpyright main.py
 """
 
