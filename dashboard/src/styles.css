@@ -1,0 +1,83 @@
+@import "tailwindcss";
+@import "basecoat-css";
+
+@layer components {
+  .htk-shell {
+    @apply grid min-h-screen gap-4;
+  }
+
+  .htk-shell--with-sidebar {
+    @apply md:grid-cols-[var(--htk-sidebar-width,20rem)_1fr];
+  }
+
+  .htk-sidebar {
+    @apply flex min-h-0 flex-col gap-4 border-b p-4 md:border-b-0 md:border-r;
+  }
+
+  .htk-main {
+    @apply flex min-h-0 flex-col gap-4 p-4;
+  }
+
+  .htk-topbar,
+  .htk-footer {
+    @apply flex items-center gap-3;
+  }
+
+  .htk-content {
+    @apply flex min-h-0 flex-1 flex-col gap-4;
+  }
+
+  .htk-panel {
+    @apply min-h-0;
+  }
+
+  .htk-panel__header {
+    @apply flex flex-wrap items-start justify-between gap-3;
+  }
+
+  .htk-panel__actions {
+    @apply flex items-center gap-2;
+  }
+
+  .htk-panel__body {
+    @apply grid gap-4;
+  }
+
+  .htk-panel__body--flush {
+    @apply grid gap-0;
+  }
+
+  .htk-panel__footer {
+    @apply flex flex-wrap items-center justify-end gap-2;
+  }
+
+  .htk-chat {
+    @apply mx-auto flex w-full max-w-4xl flex-1 flex-col gap-4;
+  }
+
+  .htk-message {
+    @apply grid max-w-[85%] gap-3;
+  }
+
+  .htk-message--user {
+    @apply self-end;
+  }
+
+  .htk-message--assistant,
+  .htk-message--system,
+  .htk-message--tool {
+    @apply self-start;
+  }
+
+  .htk-composer {
+    @apply sticky bottom-0;
+  }
+
+  .htk-tool-result {
+    @apply border-dashed;
+  }
+
+  .htk-pre {
+    @apply max-h-80 overflow-auto rounded-xl bg-zinc-950 p-4 text-xs text-zinc-50;
+  }
+}

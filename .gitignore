@@ -1,5 +1,8 @@
 # Build artifacts
 gateway/sky-audio
+gateway/pkg/dashboard/dist/
+dashboard/dist/
+dashboard/node_modules/
 __pycache__/
 *.pyc
 

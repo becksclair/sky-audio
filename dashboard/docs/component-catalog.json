@@ -1,0 +1,184 @@
+{
+  "package": "@heliasar/toolkit",
+  "version": 1,
+  "defaults": {
+    "runtime": "preact",
+    "state": "signals-models",
+    "styleSystem": "basecoat-plus-wrappers",
+    "tooling": [
+      "vite-8",
+      "tsgo",
+      "oxlint-type-aware",
+      "oxfmt"
+    ]
+  },
+  "components": [
+    {
+      "name": "Button",
+      "kind": "primitive",
+      "import": "@heliasar/toolkit",
+      "props": {
+        "variant": [
+          "primary",
+          "secondary",
+          "destructive",
+          "outline",
+          "ghost",
+          "link"
+        ],
+        "size": [
+          "md",
+          "sm",
+          "lg"
+        ],
+        "loading": "boolean"
+      },
+      "useWhen": [
+        "cta",
+        "form submit",
+        "inline action"
+      ],
+      "avoidWhen": [
+        "plain text navigation",
+        "icon-only control without aria-label"
+      ]
+    },
+    {
+      "name": "Panel",
+      "kind": "primitive",
+      "import": "@heliasar/toolkit",
+      "props": [
+        "title",
+        "description",
+        "actions",
+        "footer",
+        "padded"
+      ],
+      "useWhen": [
+        "card-like sections",
+        "settings blocks",
+        "side panes"
+      ]
+    },
+    {
+      "name": "TextField",
+      "kind": "primitive",
+      "import": "@heliasar/toolkit",
+      "props": [
+        "label",
+        "description",
+        "error",
+        "fieldClassName",
+        "inputClassName"
+      ],
+      "useWhen": [
+        "single-line forms"
+      ]
+    },
+    {
+      "name": "TextAreaField",
+      "kind": "primitive",
+      "import": "@heliasar/toolkit",
+      "props": [
+        "label",
+        "description",
+        "error"
+      ],
+      "useWhen": [
+        "multiline forms"
+      ]
+    },
+    {
+      "name": "AppShell",
+      "kind": "composition",
+      "import": "@heliasar/toolkit",
+      "props": [
+        "sidebar",
+        "topbar",
+        "footer",
+        "sidebarWidth"
+      ],
+      "useWhen": [
+        "two-pane layouts",
+        "assistant shells"
+      ]
+    },
+    {
+      "name": "ChatComposer",
+      "kind": "composition",
+      "import": "@heliasar/toolkit",
+      "props": [
+        "value",
+        "onValueChange",
+        "onSubmit",
+        "onCancel",
+        "disabled",
+        "busy",
+        "placeholder",
+        "hint"
+      ],
+      "useWhen": [
+        "assistant input surfaces"
+      ]
+    },
+    {
+      "name": "MessageBubble",
+      "kind": "composition",
+      "import": "@heliasar/toolkit",
+      "props": [
+        "message"
+      ],
+      "useWhen": [
+        "assistant timelines"
+      ]
+    },
+    {
+      "name": "ToolResultCard",
+      "kind": "composition",
+      "import": "@heliasar/toolkit",
+      "props": [
+        "title",
+        "status",
+        "summary",
+        "payload"
+      ],
+      "useWhen": [
+        "tool output display",
+        "structured payloads"
+      ]
+    }
+  ],
+  "models": [
+    {
+      "name": "ChatModel",
+      "kind": "signals-model",
+      "import": "@heliasar/toolkit",
+      "signals": [
+        "messages",
+        "draft",
+        "busy",
+        "error",
+        "canSubmit"
+      ],
+      "actions": [
+        "setDraft",
+        "appendMessage",
+        "patchMessage",
+        "submit",
+        "abort",
+        "reset"
+      ],
+      "useWhen": [
+        "chat state",
+        "streaming flow",
+        "cancelable assistant tasks"
+      ]
+    }
+  ],
+  "agentRules": [
+    "prefer components from the catalog before raw markup",
+    "prefer createModel for long-lived async state",
+    "do not use tsconfig path aliases in this package",
+    "update docs and examples when adding public API"
+  ]
+}

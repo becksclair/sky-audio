@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/heliasar/sky-audio/gateway/pkg/dashboard"
 	"github.com/heliasar/sky-audio/gateway/pkg/process"
 	"github.com/heliasar/sky-audio/gateway/pkg/vram"
 	skywebrtc "github.com/heliasar/sky-audio/gateway/pkg/webrtc"
@@ -60,6 +62,14 @@ func main() {
 			log.Printf("[webrtc] Received %d bytes PCM audio", len(pcm))
 		},
 	}, peerRegistry))
+
+	// Serve the embedded dashboard at /dashboard/
+	dashFS, err := fs.Sub(dashboard.Assets, "dist")
+	if err != nil {
+		log.Fatalf("Failed to mount dashboard: %v", err)
+	}
+	mux.Handle("/dashboard/", http.StripPrefix("/dashboard/", http.FileServer(http.FS(dashFS))))
+	log.Println("[INFO] Dashboard available at /dashboard/")
 
 	addr := ":8080"
 	if p := os.Getenv("PORT"); p != "" {
