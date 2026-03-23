@@ -1,0 +1,8 @@
+{
+  "include": ["workers/python-nemo"],
+  "extraPaths": ["workers/python-nemo"],
+  "pythonVersion": "3.13",
+  "typeCheckingMode": "basic",
+  "venvPath": "workers/python-nemo",
+  "venv": ".venv"
+}

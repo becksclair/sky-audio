@@ -1,0 +1,40 @@
+syntax = "proto3";
+package audio_engine;
+
+option go_package = "github.com/heliasar/sky-audio/gateway/pkg/pb";
+
+service SpeechToText {
+  rpc TranscribeStream(stream AudioChunk) returns (stream Transcript);
+}
+
+service TextToSpeech {
+  rpc SynthesizeStream(stream TextToken) returns (stream AudioChunk);
+}
+
+service WorkerControl {
+  rpc GetStatus(Empty) returns (WorkerStatus);
+}
+
+message AudioChunk {
+  bytes pcm_data = 1;
+  bool is_end_of_speech = 2;
+  int32 sample_rate = 3;
+}
+
+message Transcript {
+  string text = 1;
+  bool is_final = 2;
+}
+
+message TextToken {
+  string text = 1;
+  bool is_eos = 2;
+}
+
+message WorkerStatus {
+  float vram_usage_mb = 1;
+  bool is_busy = 2;
+  string loaded_model = 3;
+}
+
+message Empty {}
