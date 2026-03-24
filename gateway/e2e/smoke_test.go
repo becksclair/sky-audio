@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -16,8 +15,7 @@ import (
 
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
-	"github.com/pion/webrtc/v4/pkg/media"
-
+	"github.com/heliasar/sky-audio/gateway/pkg/audio"
 	skywebrtc "github.com/heliasar/sky-audio/gateway/pkg/webrtc"
 )
 
@@ -178,25 +176,32 @@ func TestAudioPacketsReachGateway(t *testing.T) {
 		t.Fatal("Timed out waiting for ICE connection")
 	}
 
-	// Send synthetic RTP audio packets (silence, Opus frame)
-	// A minimal Opus silence frame is a valid single-byte payload.
-	silenceFrame := []byte{0xF8, 0xFF, 0xFE} // Opus silence (3 bytes)
+	// Encode real Opus silence frames
+	enc, err := audio.NewOpusEncoder()
+	if err != nil {
+		t.Fatalf("NewOpusEncoder: %v", err)
+	}
+	silencePCM := make([]byte, audio.EncodeSamples*2) // 320 samples * 2 bytes
 	const numPackets = 100
 
 	for i := 0; i < numPackets; i++ {
+		opusFrame, encErr := enc.Encode(silencePCM)
+		if encErr != nil {
+			t.Fatalf("Encode frame %d: %v", i, encErr)
+		}
 		if err := track.WriteRTP(&rtp.Packet{
 			Header: rtp.Header{
 				Version:        2,
 				PayloadType:    111,
 				SequenceNumber: uint16(i),
-				Timestamp:      uint32(i * 960), // 20ms at 48kHz
+				Timestamp:      uint32(i * 960),
 				SSRC:           12345,
 			},
-			Payload: silenceFrame,
+			Payload: opusFrame,
 		}); err != nil {
 			t.Fatalf("WriteRTP packet %d: %v", i, err)
 		}
-		time.Sleep(5 * time.Millisecond) // ~5ms spacing
+		time.Sleep(5 * time.Millisecond)
 	}
 
 	// Give server time to receive
@@ -256,89 +261,43 @@ func TestSTTWorkerDirectGRPC(t *testing.T) {
 	}
 }
 
-// TestWebRTCToSTTIntegration is a full integration test: pion client sends audio,
-// gateway receives it, forwards to STT worker, and we verify the STT worker got data.
+// TestWebRTCToSTTIntegration is a full integration test: pion client sends Opus audio,
+// gateway decodes to PCM and accumulates it, then we send the accumulated PCM to the
+// STT worker and verify we get a transcript back.
 // Requires: mise run worker:stt running in background.
 func TestWebRTCToSTTIntegration(t *testing.T) {
 	const socketPath = "/tmp/sky-audio-stt.sock"
 
-	// Check STT worker availability first
-	testClient, err := skywebrtc.NewSTTClient(socketPath)
-	if err != nil {
-		t.Skipf("STT worker not available: %v", err)
-	}
-	testClient.Close()
-
-	// Set up server with full pipeline
+	// Phase 1: Verify WebRTC delivers decoded PCM to the gateway callback
 	registry := skywebrtc.NewPeerRegistry()
 	defer registry.CloseAll()
 
-	var audioMu sync.Mutex
-	var totalAudioBytes int64
-
-	// Create a real STT client for the gateway to use
-	sttClient, err := skywebrtc.NewSTTClient(socketPath)
-	if err != nil {
-		t.Fatalf("NewSTTClient: %v", err)
-	}
-	defer sttClient.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	if err := sttClient.StartStream(ctx); err != nil {
-		t.Fatalf("StartStream: %v", err)
-	}
-
-	// Read transcripts in background
-	var transcripts []string
-	var trMu sync.Mutex
-	go func() {
-		for {
-			tr, err := sttClient.Recv()
-			if err != nil {
-				return
-			}
-			trMu.Lock()
-			transcripts = append(transcripts, tr.Text)
-			trMu.Unlock()
-			log.Printf("[e2e] Transcript: %q", tr.Text)
-		}
-	}()
-
-	var chunkCount atomic.Int64
+	var pcmBuf []byte
+	var pcmMu sync.Mutex
 
 	handler := skywebrtc.OfferHandler(skywebrtc.PeerConfig{
 		OnPCMAudio: func(data []byte) {
-			audioMu.Lock()
-			totalAudioBytes += int64(len(data))
-			audioMu.Unlock()
-
-			count := chunkCount.Add(1)
-			isEOS := count%50 == 0
-
-			if err := sttClient.SendAudio(data, isEOS, 16000); err != nil {
-				log.Printf("[e2e] SendAudio error: %v", err)
-			}
+			pcmMu.Lock()
+			pcmBuf = append(pcmBuf, data...)
+			pcmMu.Unlock()
 		},
 	}, registry)
 
 	ts := httptest.NewServer(handler)
 	defer ts.Close()
 
-	// Create pion client and connect
 	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
 		t.Fatalf("NewPeerConnection: %v", err)
 	}
 	defer pc.Close()
 
-	track, err := webrtc.NewTrackLocalStaticSample(
+	track, err := webrtc.NewTrackLocalStaticRTP(
 		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus},
 		"audio", "sky-e2e",
 	)
 	if err != nil {
-		t.Fatalf("NewTrackLocalStaticSample: %v", err)
+		t.Fatalf("NewTrackLocalStaticRTP: %v", err)
 	}
 	if _, err := pc.AddTrack(track); err != nil {
 		t.Fatalf("AddTrack: %v", err)
@@ -351,7 +310,6 @@ func TestWebRTCToSTTIntegration(t *testing.T) {
 		}
 	})
 
-	// Signaling
 	offer, err := pc.CreateOffer(nil)
 	if err != nil {
 		t.Fatalf("CreateOffer: %v", err)
@@ -380,44 +338,78 @@ func TestWebRTCToSTTIntegration(t *testing.T) {
 		t.Fatal("Timed out waiting for ICE")
 	}
 
-	// Send 2 seconds of audio samples
+	// Send 100 Opus silence frames (2 seconds at 20ms)
+	enc, encErr := audio.NewOpusEncoder()
+	if encErr != nil {
+		t.Fatalf("NewOpusEncoder: %v", encErr)
+	}
+	silencePCM := make([]byte, audio.EncodeSamples*2)
+
 	for i := 0; i < 100; i++ {
-		frame := make([]byte, 960) // 20ms at 48kHz
-		if err := track.WriteSample(media.Sample{
-			Data:     frame,
-			Duration: 20 * time.Millisecond,
-		}); err != nil {
-			t.Logf("WriteSample %d: %v", i, err)
+		opusFrame, encErr := enc.Encode(silencePCM)
+		if encErr != nil {
+			t.Fatalf("Encode frame %d: %v", i, encErr)
 		}
-		time.Sleep(20 * time.Millisecond)
+		if err := track.WriteRTP(&rtp.Packet{
+			Header: rtp.Header{
+				Version:        2,
+				PayloadType:    111,
+				SequenceNumber: uint16(i),
+				Timestamp:      uint32(i * 320),
+				SSRC:           54321,
+			},
+			Payload: opusFrame,
+		}); err != nil {
+			t.Logf("WriteRTP %d: %v", i, err)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 
-	// Wait for processing
-	time.Sleep(3 * time.Second)
-
-	audioMu.Lock()
-	total := totalAudioBytes
-	audioMu.Unlock()
-
-	chunks := chunkCount.Load()
-	t.Logf("Audio: %d bytes across %d chunks forwarded to STT", total, chunks)
-
-	if total == 0 {
-		t.Fatal("No audio bytes reached the gateway")
-	}
-
-	// Send a final EOS to flush any pending STT
-	_ = sttClient.SendAudio(nil, true, 16000)
 	time.Sleep(2 * time.Second)
+	pc.Close()
 
-	trMu.Lock()
-	t.Logf("Received %d transcripts: %v", len(transcripts), transcripts)
-	trMu.Unlock()
+	pcmMu.Lock()
+	totalPCM := len(pcmBuf)
+	accumulatedPCM := make([]byte, totalPCM)
+	copy(accumulatedPCM, pcmBuf)
+	pcmMu.Unlock()
+
+	t.Logf("Phase 1: WebRTC delivered %d bytes of decoded PCM (%d frames)", totalPCM, totalPCM/640)
+	if totalPCM < 640 {
+		t.Fatalf("Need at least 1 decoded frame (640 bytes), got %d", totalPCM)
+	}
+
+	// Phase 2: Send the accumulated PCM to the STT worker
+	sttClient, err := skywebrtc.NewSTTClient(socketPath)
+	if err != nil {
+		t.Skipf("STT worker not available: %v", err)
+	}
+	defer sttClient.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := sttClient.StartStream(ctx); err != nil {
+		t.Skipf("STT worker not accepting streams: %v", err)
+	}
+
+	if err := sttClient.SendAudio(accumulatedPCM, true, 16000); err != nil {
+		t.Fatalf("SendAudio: %v", err)
+	}
+
+	transcript, err := sttClient.Recv()
+	if err != nil {
+		t.Fatalf("Recv: %v", err)
+	}
+
+	t.Logf("Phase 2: Transcript: text=%q is_final=%v", transcript.Text, transcript.IsFinal)
+
+	if !transcript.IsFinal {
+		t.Error("Expected is_final=true")
+	}
 
 	fmt.Println("=== E2E PIPELINE SUMMARY ===")
-	fmt.Printf("  Audio bytes received by gateway: %d\n", total)
-	fmt.Printf("  Chunks forwarded to STT:         %d\n", chunks)
-	trMu.Lock()
-	fmt.Printf("  Transcripts received:            %d\n", len(transcripts))
-	trMu.Unlock()
+	fmt.Printf("  PCM bytes from WebRTC:  %d (%d frames)\n", totalPCM, totalPCM/640)
+	fmt.Printf("  Transcript:             %q\n", transcript.Text)
+	fmt.Printf("  is_final:               %v\n", transcript.IsFinal)
 }

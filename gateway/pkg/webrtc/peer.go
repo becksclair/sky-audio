@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/heliasar/sky-audio/gateway/pkg/audio"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -73,19 +74,29 @@ func NewPeerConnection(cfg PeerConfig) (*webrtc.PeerConnection, error) {
 	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 		log.Printf("[webrtc] Track received: codec=%s", track.Codec().MimeType)
 		go func() {
-			buf := make([]byte, 4096)
+			dec, err := audio.NewOpusDecoder()
+			if err != nil {
+				log.Printf("[webrtc] Failed to create Opus decoder: %v", err)
+				return
+			}
+
 			for {
-				n, _, err := track.Read(buf)
+				rtpPkt, _, err := track.ReadRTP()
 				if err != nil {
 					if err != io.EOF {
 						log.Printf("[webrtc] Track read error: %v", err)
 					}
 					return
 				}
-				// TODO: Decode Opus RTP payload to PCM via hraban/opus (requires CGO + libopus-dev).
-				// For now, pass raw RTP payload to the callback.
+
+				pcm, err := dec.Decode(rtpPkt.Payload)
+				if err != nil {
+					log.Printf("[webrtc] Opus decode error: %v", err)
+					continue
+				}
+
 				if cfg.OnPCMAudio != nil {
-					cfg.OnPCMAudio(buf[:n])
+					cfg.OnPCMAudio(pcm)
 				}
 			}
 		}()
