@@ -7,16 +7,17 @@ const ttsInput = signal('');
 const error = signal<string | null>(null);
 
 let pc: RTCPeerConnection | null = null;
+let mediaStream: MediaStream | null = null;
 
 async function connectWebRTC() {
   try {
     status.value = 'connecting';
     error.value = null;
 
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
 
     pc = new RTCPeerConnection();
-    stream.getTracks().forEach((track) => pc!.addTrack(track, stream));
+    mediaStream.getTracks().forEach((track) => pc!.addTrack(track, mediaStream!));
 
     pc.oniceconnectionstatechange = () => {
       if (pc?.iceConnectionState === 'disconnected' || pc?.iceConnectionState === 'failed') {
@@ -49,6 +50,10 @@ async function connectWebRTC() {
 }
 
 function disconnect() {
+  if (mediaStream) {
+    mediaStream.getTracks().forEach((t) => t.stop());
+    mediaStream = null;
+  }
   if (pc) {
     pc.close();
     pc = null;

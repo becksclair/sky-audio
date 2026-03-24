@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"time"
 	"sync/atomic"
 
 	"github.com/heliasar/sky-audio/gateway/pkg/audio"
@@ -169,8 +170,15 @@ func OfferHandler(cfg PeerConfig, registry *PeerRegistry) http.HandlerFunc {
 			return
 		}
 
-		// Wait for ICE gathering to complete so the answer SDP contains all candidates.
-		<-webrtc.GatheringCompletePromise(pc)
+		// Wait for ICE gathering to complete (with timeout to prevent hanging on unreachable STUN).
+		select {
+		case <-webrtc.GatheringCompletePromise(pc):
+		case <-time.After(10 * time.Second):
+			pc.Close()
+			log.Printf("[webrtc] ICE gathering timed out")
+			http.Error(w, "internal error", http.StatusGatewayTimeout)
+			return
+		}
 
 		peerID := fmt.Sprintf("peer-%d", peerCounter.Add(1))
 		registry.Add(peerID, pc)
