@@ -97,7 +97,20 @@ func main() {
 		}
 	}()
 
-	// Audio chunk counter for simple energy-based VAD
+	type audioMsg struct {
+		data []byte
+		eos  bool
+	}
+	audioCh := make(chan audioMsg, 256)
+
+	go func() {
+		for msg := range audioCh {
+			if err := sttClient.SendAudio(msg.data, msg.eos, 16000); err != nil {
+				log.Printf("[stt] SendAudio error: %v", err)
+			}
+		}
+	}()
+
 	var chunkCount int
 	var chunkMu sync.Mutex
 
@@ -119,13 +132,10 @@ func main() {
 			count := chunkCount
 			chunkMu.Unlock()
 
-			// Send every chunk to STT worker. The worker accumulates until is_end_of_speech.
-			// For now, send is_end_of_speech every ~50 chunks (~1s of audio at 20ms/chunk).
 			isEOS := count%50 == 0
 			if isEOS {
-				// Flush ring buffer and prepend to ensure no clipping
 				ringMu.Lock()
-				_ = ringBuf.Flush() // consume the buffer (data already sent chunk-by-chunk)
+				_ = ringBuf.Flush()
 				ringMu.Unlock()
 
 				chunkMu.Lock()
@@ -133,8 +143,10 @@ func main() {
 				chunkMu.Unlock()
 			}
 
-			if err := sttClient.SendAudio(data, isEOS, 16000); err != nil {
-				log.Printf("[stt] SendAudio error: %v", err)
+			select {
+			case audioCh <- audioMsg{data: data, eos: isEOS}:
+			default:
+				log.Println("[WARN] Audio channel full, dropping frame")
 			}
 		},
 	}, peerRegistry))
