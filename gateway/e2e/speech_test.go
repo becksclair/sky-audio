@@ -45,10 +45,7 @@ func TestSTTWorkerRealSpeech(t *testing.T) {
 	// Send the PCM in chunks (simulating streaming), then EOS
 	const chunkSize = 32000 // 1 second chunks
 	for i := 0; i < len(pcm); i += chunkSize {
-		end := i + chunkSize
-		if end > len(pcm) {
-			end = len(pcm)
-		}
+		end := min(i+chunkSize, len(pcm))
 		isLast := end == len(pcm)
 		if err := client.SendAudio(pcm[i:end], isLast, 16000); err != nil {
 			t.Fatalf("SendAudio chunk at offset %d: %v", i, err)
