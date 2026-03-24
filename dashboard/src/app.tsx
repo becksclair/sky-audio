@@ -75,7 +75,7 @@ export function App() {
           </div>
           <div class="flex items-center gap-2">
             {status.value === 'disconnected' ? (
-              <Button onClick={connectWebRTC}>Connect WebRTC</Button>
+              <Button onClick={() => void connectWebRTC()}>Connect WebRTC</Button>
             ) : status.value === 'connecting' ? (
               <Button disabled>Connecting…</Button>
             ) : (
