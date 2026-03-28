@@ -1,0 +1,13 @@
+[project]
+name = "python-pocket-tts"
+version = "0.1.0"
+description = "PocketTTS gRPC worker for sky-audio"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "grpcio>=1.78.0",
+    "grpcio-tools>=1.78.0",
+    "numpy>=2.4.3",
+    "pocket-tts",
+    "torch>=2.5.0",
+]

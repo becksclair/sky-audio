@@ -19,7 +19,7 @@ After completing this plan, a user will be able to start the `sky-audio` Go exec
 - [x] (2026-03-23) Implement TDD tests for the Go VAD Ring Buffer (500ms pre-speech buffering).
 - [x] (2026-03-23) Implement the Go VAD Ring Buffer (sans CGO Opus — deferred to WebRTC integration step).
 - [x] (2026-03-23) Implement Python STT Worker (Parakeet v3) gRPC server with fp16/bf16 VRAM constraints.
-- [ ] (2026-03-23) Implement Python/Rust TTS Worker (PocketTTS/Kyutai) gRPC server.
+- [x] (2026-03-24) Implement Python TTS Workers (PocketTTS + KyutaiTTS 1.6B) gRPC servers.
 - [x] (2026-03-23) Implement NVML-based VRAM querying in Go for request routing.
 - [x] (2026-03-23) Integrate `pion/webrtc` in the Go Gateway to accept browser mic streams and route to VAD.
 - [x] (2026-03-23) Embed the `@heliasar/toolkit` Preact dashboard into the Go binary (`//go:embed`).

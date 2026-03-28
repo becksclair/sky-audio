@@ -1,0 +1,13 @@
+[project]
+name = "python-kyutai-tts"
+version = "0.1.0"
+description = "Kyutai TTS 1.6B gRPC worker for sky-audio"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "grpcio>=1.78.0",
+    "grpcio-tools>=1.78.0",
+    "moshi>=0.2.11",
+    "numpy>=1.26",
+    "torch>=2.5.0",
+]

@@ -14,6 +14,7 @@ export default defineConfig({
     proxy: {
       '/webrtc': 'http://localhost:8080',
       '/health': 'http://localhost:8080',
+      '/api': 'http://localhost:8080',
     },
   },
 });

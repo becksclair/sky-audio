@@ -1,0 +1,13 @@
+{
+  "include": ["."],
+  "extraPaths": ["."],
+  "pythonVersion": "3.13",
+  "typeCheckingMode": "basic",
+  "reportAny": false,
+  "reportUnknownMemberType": false,
+  "reportUnknownVariableType": false,
+  "reportUnknownArgumentType": false,
+  "reportUnknownParameterType": false,
+  "reportMissingTypeStubs": false,
+  "reportUnusedCallResult": false
+}
