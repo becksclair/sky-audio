@@ -6,7 +6,7 @@ python = "3.13"
 
 [tasks.dev]
 description = "Start gateway + STT worker (dev mode)"
-run = "go run ./gateway/cmd/sky-audio"
+run = "CGO_LDFLAGS='-L/usr/local/lib/onnxruntime -lonnxruntime -Wl,-rpath,/usr/local/lib/onnxruntime' CGO_CFLAGS='-I/usr/local/include/onnxruntime' LD_LIBRARY_PATH=\"/usr/local/lib/onnxruntime:${LD_LIBRARY_PATH:-}\" go run ./gateway/cmd/sky-audio"
 
 [tasks."dev:dashboard"]
 description = "Start Vite dev server with HMR (proxy to gateway on :8080)"
@@ -25,7 +25,7 @@ description = "Build Go gateway binary (assumes dashboard dist exists)"
 run = """
 rm -rf gateway/pkg/dashboard/dist
 cp -r dashboard/dist gateway/pkg/dashboard/dist
-cd gateway && go build -o sky-audio ./cmd/sky-audio
+cd gateway && CGO_LDFLAGS='-L/usr/local/lib/onnxruntime -lonnxruntime -Wl,-rpath,/usr/local/lib/onnxruntime' CGO_CFLAGS='-I/usr/local/include/onnxruntime' LD_LIBRARY_PATH=\"/usr/local/lib/onnxruntime:${LD_LIBRARY_PATH:-}\" go build -o sky-audio ./cmd/sky-audio
 """
 
 [tasks."build:proto"]
@@ -44,11 +44,22 @@ python -m grpc_tools.protoc \
   proto/audio_engine.proto
 sed -i 's/^import audio_engine_pb2 as/from . import audio_engine_pb2 as/' \
   workers/python-nemo/pb/audio_engine_pb2_grpc.py
+for dir in workers/python-pocket-tts/pb workers/python-kyutai-tts/pb; do
+  mkdir -p "$dir"
+  cp workers/python-nemo/pb/audio_engine_pb2.py "$dir/"
+  cp workers/python-nemo/pb/audio_engine_pb2_grpc.py "$dir/"
+  cp workers/python-nemo/pb/audio_engine_pb2.pyi "$dir/" 2>/dev/null || true
+  touch "$dir/__init__.py"
+done
 """
 
 [tasks.test]
-description = "Run all Go tests"
-run = "go test ./gateway/... -count=1 -v"
+description = "Run local Go unit and package tests (excludes env-dependent e2e)"
+run = "CGO_LDFLAGS='-L/usr/local/lib/onnxruntime -lonnxruntime -Wl,-rpath,/usr/local/lib/onnxruntime' CGO_CFLAGS='-I/usr/local/include/onnxruntime' LD_LIBRARY_PATH=\"/usr/local/lib/onnxruntime:${LD_LIBRARY_PATH:-}\" go test $(go list ./gateway/... | grep -v '/gateway/e2e$') -count=1 -v"
+
+[tasks."test:e2e"]
+description = "Run gateway end-to-end tests (requires worker sockets and test assets)"
+run = "CGO_LDFLAGS='-L/usr/local/lib/onnxruntime -lonnxruntime -Wl,-rpath,/usr/local/lib/onnxruntime' CGO_CFLAGS='-I/usr/local/include/onnxruntime' LD_LIBRARY_PATH=\"/usr/local/lib/onnxruntime:${LD_LIBRARY_PATH:-}\" go test ./gateway/e2e -count=1 -v"
 
 [tasks.check]
 description = "Full validation: vet + test + build"
@@ -56,12 +67,12 @@ depends = ["check:vet", "test", "build"]
 
 [tasks."check:vet"]
 description = "Go vet"
-run = "go vet ./gateway/..."
+run = "CGO_LDFLAGS='-L/usr/local/lib/onnxruntime -lonnxruntime -Wl,-rpath,/usr/local/lib/onnxruntime' CGO_CFLAGS='-I/usr/local/include/onnxruntime' LD_LIBRARY_PATH=\"/usr/local/lib/onnxruntime:${LD_LIBRARY_PATH:-}\" go vet ./gateway/..."
 
 [tasks."check:types"]
 description = "Typecheck all languages"
 run = """
-go vet ./gateway/...
+CGO_LDFLAGS='-L/usr/local/lib/onnxruntime -lonnxruntime -Wl,-rpath,/usr/local/lib/onnxruntime' CGO_CFLAGS='-I/usr/local/include/onnxruntime' LD_LIBRARY_PATH="/usr/local/lib/onnxruntime:${LD_LIBRARY_PATH:-}" go vet ./gateway/...
 cd dashboard && bun run typecheck 2>/dev/null || true
 cd ../workers/python-nemo && uv run basedpyright main.py
 """
@@ -76,3 +87,11 @@ rm -f /tmp/sky-audio-*.sock
 [tasks."worker:stt"]
 description = "Run STT worker standalone (for debugging)"
 run = "cd workers/python-nemo && uv run python main.py"
+
+[tasks."worker:tts-pocket"]
+description = "Run PocketTTS worker standalone (for debugging)"
+run = "cd workers/python-pocket-tts && uv run python main.py"
+
+[tasks."worker:tts-kyutai"]
+description = "Run KyutaiTTS worker standalone (for debugging)"
+run = "cd workers/python-kyutai-tts && uv run python main.py"

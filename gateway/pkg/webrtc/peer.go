@@ -15,7 +15,8 @@ import (
 )
 
 type PeerConfig struct {
-	OnPCMAudio func(pcm []byte)
+	OnPCMAudio   func(pcm []byte)
+	OnTrackEnded func()
 }
 
 type PeerRegistry struct {
@@ -81,6 +82,12 @@ func NewPeerConnection(cfg PeerConfig) (*webrtc.PeerConnection, error) {
 				return
 			}
 
+			defer func() {
+				if cfg.OnTrackEnded != nil {
+					cfg.OnTrackEnded()
+				}
+			}()
+
 			for {
 				rtpPkt, _, err := track.ReadRTP()
 				if err != nil {
@@ -88,6 +95,10 @@ func NewPeerConnection(cfg PeerConfig) (*webrtc.PeerConnection, error) {
 						log.Printf("[webrtc] Track read error: %v", err)
 					}
 					return
+				}
+
+				if len(rtpPkt.Payload) == 0 {
+					continue
 				}
 
 				pcm, err := dec.Decode(rtpPkt.Payload)

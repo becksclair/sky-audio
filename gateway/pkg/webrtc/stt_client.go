@@ -11,17 +11,16 @@ import (
 )
 
 // STTClient wraps a gRPC bidi stream to an STT worker over a Unix socket.
-// It is NOT safe for concurrent use from multiple goroutines.
-// Callers must ensure sequential access or external synchronization.
+// SendAudio and Recv may be called concurrently from separate goroutines.
+// Insecure credentials are intentional — transport is a Unix domain socket (local IPC only).
 type STTClient struct {
-	mu     sync.Mutex
+	sendMu sync.Mutex
+	recvMu sync.Mutex
 	conn   *grpc.ClientConn
 	client pb.SpeechToTextClient
 	stream grpc.BidiStreamingClient[pb.AudioChunk, pb.Transcript]
 }
 
-// NewSTTClient dials the STT worker on the given Unix socket path.
-// Insecure credentials are intentional — transport is a Unix domain socket (local IPC only).
 func NewSTTClient(socketPath string) (*STTClient, error) {
 	conn, err := grpc.NewClient(
 		"unix://"+socketPath,
@@ -38,8 +37,8 @@ func NewSTTClient(socketPath string) (*STTClient, error) {
 }
 
 func (c *STTClient) StartStream(ctx context.Context) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
 
 	stream, err := c.client.TranscribeStream(ctx)
 	if err != nil {
@@ -50,8 +49,8 @@ func (c *STTClient) StartStream(ctx context.Context) error {
 }
 
 func (c *STTClient) SendAudio(pcm []byte, isEndOfSpeech bool, sampleRate int32) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
 
 	if c.stream == nil {
 		return fmt.Errorf("stream not started")
@@ -64,8 +63,8 @@ func (c *STTClient) SendAudio(pcm []byte, isEndOfSpeech bool, sampleRate int32) 
 }
 
 func (c *STTClient) Recv() (*pb.Transcript, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.recvMu.Lock()
+	defer c.recvMu.Unlock()
 
 	if c.stream == nil {
 		return nil, fmt.Errorf("stream not started")
@@ -74,8 +73,8 @@ func (c *STTClient) Recv() (*pb.Transcript, error) {
 }
 
 func (c *STTClient) Close() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
 
 	if c.stream != nil {
 		_ = c.stream.CloseSend()
