@@ -209,7 +209,7 @@ func main() {
 	log.Println("[INFO] Silero VAD initialized")
 
 	pipeline.StartTranscriptLoop(func(transcript *pb.Transcript) {
-		log.Printf("[stt] Transcript (final=%v): %s", transcript.IsFinal, transcript.Text)
+		log.Printf("[stt] Transcript received (final=%v, chars=%d)", transcript.IsFinal, utf8.RuneCountInString(transcript.Text))
 		if transcript.Text != "" {
 			broadcastTranscript(transcript.Text)
 		}
@@ -328,7 +328,7 @@ func ttsHandlerWithSynth(clients map[string]ttsSynthesizer) http.HandlerFunc {
 
 		client, ok := clients[req.Engine]
 		if !ok {
-			http.Error(w, "unknown engine: "+req.Engine, http.StatusBadRequest)
+			http.Error(w, "unknown engine", http.StatusBadRequest)
 			return
 		}
 

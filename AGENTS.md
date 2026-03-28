@@ -48,4 +48,5 @@ mise run check
 
 - `build.sh` and `mise` tasks already export the CGO and linker flags needed for the Silero/ONNX-backed gateway build.
 - If Go builds fail with missing `onnxruntime_c_api.h` or `libonnxruntime.so`, check the ONNX Runtime paths first.
+- For Go diagnostics and vet/build validation in this repo, prefer `mise run check`, `mise run check:vet`, or an equivalent custom command that preserves the ONNX CGO environment. Bare `go vet ./...` or `go build ./...` can false-fail on ONNX-backed packages.
 - Do not treat `gateway/e2e` failures as ordinary unit-test regressions unless the worker sockets and test assets are present.

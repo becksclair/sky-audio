@@ -65,8 +65,8 @@ class TextToSpeechServicer(audio_engine_pb2_grpc.TextToSpeechServicer):
                         text_buf.clear()
                         continue
 
-                    logger.info("Synthesizing: %s", full_text[:80])
-                    audio_tensor: torch.Tensor = await asyncio.get_event_loop().run_in_executor(
+                    logger.info("Synthesizing text (chars=%d)", len(full_text))
+                    audio_tensor: torch.Tensor = await asyncio.get_running_loop().run_in_executor(
                         None, self._synthesize, full_text
                     )
 
@@ -141,7 +141,7 @@ async def serve() -> None:
     logger.info("TTS-Pocket worker listening on unix://%s", SOCKET_PATH)
 
     stop_event = asyncio.Event()
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         def _stop() -> None:
             _ = stop_event.set()

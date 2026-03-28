@@ -8,6 +8,7 @@ import os
 import queue as stdlib_queue
 import signal
 import sys
+import threading
 from collections.abc import AsyncIterator
 from concurrent import futures
 from typing import Any, override
@@ -56,11 +57,21 @@ class TextToSpeechServicer(audio_engine_pb2_grpc.TextToSpeechServicer):
     _model: Any
     _condition_attrs: Any
     _sample_rate: int
+    _generate_lock: asyncio.Lock
+    _busy: threading.Event
 
-    def __init__(self, model: Any, condition_attrs: Any) -> None:
+    def __init__(
+        self,
+        model: Any,
+        condition_attrs: Any,
+        generate_lock: asyncio.Lock,
+        busy: threading.Event,
+    ) -> None:
         self._model = model
         self._condition_attrs = condition_attrs
         self._sample_rate = int(model.mimi.sample_rate)
+        self._generate_lock = generate_lock
+        self._busy = busy
 
     @override
     async def SynthesizeStream(
@@ -84,70 +95,93 @@ class TextToSpeechServicer(audio_engine_pb2_grpc.TextToSpeechServicer):
                         text_buf.clear()
                         continue
 
-                    logger.info("Synthesizing: %s", full_text[:80])
+                    logger.info("Synthesizing text (chars=%d)", len(full_text))
 
-                    frame_queue: stdlib_queue.Queue[bytes | None] = stdlib_queue.Queue()
-                    model = self._model
-                    sample_rate = self._sample_rate
-
-                    def _on_frame(frame: torch.Tensor) -> None:
-                        if (frame != -1).all():
-                            pcm: torch.Tensor = model.mimi.decode(frame[:, 1:, :])
-                            pcm_float: np.ndarray[Any, np.dtype[np.float32]] = (
-                                pcm.squeeze().cpu().numpy()
-                            )
-                            pcm_int16: np.ndarray[Any, np.dtype[np.int16]] = (
-                                np.clip(pcm_float, -1.0, 1.0) * 32767
-                            ).astype(np.int16)
-                            frame_queue.put(pcm_int16.tobytes())
-
-                    def _run_generate() -> None:
+                    async with self._generate_lock:
+                        self._busy.set()
                         try:
-                            entries: Any = model.prepare_script(
-                                [full_text], padding_between=1
-                            )
-                            with model.mimi.streaming(1):
-                                model.generate(
-                                    [entries],
-                                    [self._condition_attrs],
-                                    on_frame=_on_frame,
-                                )
-                        finally:
-                            frame_queue.put(None)
+                            frame_queue: stdlib_queue.Queue[bytes | Exception | None] = stdlib_queue.Queue()
+                            model = self._model
+                            sample_rate = self._sample_rate
 
-                    loop = asyncio.get_event_loop()
-                    gen_fut = loop.run_in_executor(None, _run_generate)
+                            def _on_frame(frame: torch.Tensor) -> None:
+                                if (frame != -1).all():
+                                    pcm: torch.Tensor = model.mimi.decode(frame[:, 1:, :])
+                                    pcm_float: np.ndarray[Any, np.dtype[np.float32]] = (
+                                        pcm.squeeze().cpu().numpy()
+                                    )
+                                    pcm_int16: np.ndarray[Any, np.dtype[np.int16]] = (
+                                        np.clip(pcm_float, -1.0, 1.0) * 32767
+                                    ).astype(np.int16)
+                                    frame_queue.put(pcm_int16.tobytes())
 
-                    total_bytes = 0
-                    try:
-                        while True:
-                            pcm_bytes: bytes | None = await loop.run_in_executor(
-                                None, lambda: frame_queue.get(timeout=30)
-                            )
-                            if pcm_bytes is None:
-                                break
-                            total_bytes += len(pcm_bytes)
+                            def _run_generate() -> None:
+                                try:
+                                    entries: Any = model.prepare_script(
+                                        [full_text], padding_between=1
+                                    )
+                                    with model.mimi.streaming(1):
+                                        model.generate(
+                                            [entries],
+                                            [self._condition_attrs],
+                                            on_frame=_on_frame,
+                                        )
+                                except Exception as err:
+                                    frame_queue.put(err)
+                                finally:
+                                    frame_queue.put(None)
+
+                            loop = asyncio.get_running_loop()
+                            gen_fut = loop.run_in_executor(None, _run_generate)
+                            final_err: Exception | None = None
+
+                            total_bytes = 0
+                            try:
+                                while True:
+                                    queue_item: bytes | Exception | None = await loop.run_in_executor(
+                                        None, lambda: frame_queue.get(timeout=30)
+                                    )
+                                    if isinstance(queue_item, Exception):
+                                        raise queue_item
+                                    if queue_item is None:
+                                        break
+                                    total_bytes += len(queue_item)
+                                    yield audio_engine_pb2.AudioChunk(
+                                        pcm_data=queue_item,
+                                        sample_rate=sample_rate,
+                                        is_end_of_speech=False,
+                                    )
+                            except stdlib_queue.Empty:
+                                final_err = RuntimeError("timed out waiting for generated audio")
+                                gen_fut.cancel()
+                            except asyncio.CancelledError as err:
+                                final_err = err
+                                gen_fut.cancel()
+                            except Exception as err:
+                                final_err = err
+                            finally:
+                                results = await asyncio.gather(gen_fut, return_exceptions=True)
+                                gen_result = results[0]
+                                if final_err is None and isinstance(gen_result, Exception) and not isinstance(
+                                    gen_result, asyncio.CancelledError
+                                ):
+                                    final_err = gen_result
+
+                            if final_err is not None:
+                                raise final_err
+
                             yield audio_engine_pb2.AudioChunk(
-                                pcm_data=pcm_bytes,
+                                pcm_data=b"",
                                 sample_rate=sample_rate,
-                                is_end_of_speech=False,
+                                is_end_of_speech=True,
                             )
-                    except asyncio.CancelledError:
-                        gen_fut.cancel()
-                        raise
-                    finally:
-                        await asyncio.gather(gen_fut, return_exceptions=True)
-
-                    yield audio_engine_pb2.AudioChunk(
-                        pcm_data=b"",
-                        sample_rate=sample_rate,
-                        is_end_of_speech=True,
-                    )
-                    logger.info(
-                        "Synthesized %.2fs of audio (streamed)",
-                        total_bytes / (2 * sample_rate),
-                    )
-                    text_buf.clear()
+                            logger.info(
+                                "Synthesized %.2fs of audio (streamed)",
+                                total_bytes / (2 * sample_rate),
+                            )
+                            text_buf.clear()
+                        finally:
+                            self._busy.clear()
         except asyncio.CancelledError:
             logger.info("Stream cancelled by client")
         except Exception:
@@ -156,6 +190,11 @@ class TextToSpeechServicer(audio_engine_pb2_grpc.TextToSpeechServicer):
 
 
 class WorkerControlServicer(audio_engine_pb2_grpc.WorkerControlServicer):
+    _busy: threading.Event
+
+    def __init__(self, busy: threading.Event) -> None:
+        self._busy = busy
+
     @override
     def GetStatus(
         self,
@@ -167,7 +206,7 @@ class WorkerControlServicer(audio_engine_pb2_grpc.WorkerControlServicer):
             vram_mb = torch.cuda.memory_allocated() / (1024 * 1024)
         return audio_engine_pb2.WorkerStatus(
             vram_usage_mb=vram_mb,
-            is_busy=False,
+            is_busy=self._busy.is_set(),
             loaded_model=MODEL_NAME,
         )
 
@@ -181,12 +220,14 @@ async def serve() -> None:
         pass
 
     model, condition_attrs = load_model()
+    generate_lock = asyncio.Lock()
+    busy = threading.Event()
 
     server = grpc.aio.server(futures.ThreadPoolExecutor(max_workers=4))
     audio_engine_pb2_grpc.add_TextToSpeechServicer_to_server(
-        TextToSpeechServicer(model, condition_attrs), server
+        TextToSpeechServicer(model, condition_attrs, generate_lock, busy), server
     )
-    audio_engine_pb2_grpc.add_WorkerControlServicer_to_server(WorkerControlServicer(), server)
+    audio_engine_pb2_grpc.add_WorkerControlServicer_to_server(WorkerControlServicer(busy), server)
     port = server.add_insecure_port(f"unix://{SOCKET_PATH}")
     if port == 0:
         raise RuntimeError(f"Failed to bind to unix://{SOCKET_PATH}")
@@ -195,7 +236,7 @@ async def serve() -> None:
     logger.info("TTS-Kyutai worker listening on unix://%s", SOCKET_PATH)
 
     stop_event = asyncio.Event()
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         def _stop() -> None:
             _ = stop_event.set()

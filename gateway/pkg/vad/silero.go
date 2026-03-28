@@ -1,6 +1,7 @@
 package vad
 
 import (
+	"errors"
 	"fmt"
 	"log"
 
@@ -25,7 +26,8 @@ const (
 )
 
 const (
-	inferWindowSize = 1024 // feed two 512-sample windows per Detect() call
+	inferWindowSize        = 1024 // feed two 512-sample windows per Detect() call
+	unexpectedSpeechEndMsg = "unexpected speech end"
 )
 
 // SileroVAD wraps the Silero VAD ONNX model for real-time streaming voice
@@ -90,7 +92,7 @@ func (v *SileroVAD) ProcessFrame(pcm []float32) ([]Event, error) {
 
 		segments, err := v.det.Detect(window)
 		if err != nil {
-			if err.Error() == "unexpected speech end" && v.wasSpeaking {
+			if isUnexpectedSpeechEnd(err) && v.wasSpeaking {
 				v.state = Idle
 				v.wasSpeaking = false
 				events = append(events, EventSpeechEnd)
@@ -143,8 +145,20 @@ func (v *SileroVAD) Reset() {
 func (v *SileroVAD) resetDetectorState() {
 	v.frameBuf = v.frameBuf[:0]
 	if v.det != nil {
-		_ = v.det.Reset()
+		if err := v.det.Reset(); err != nil {
+			log.Printf("[vad-silero] reset failed: %v", err)
+		}
 	}
+}
+
+func isUnexpectedSpeechEnd(err error) bool {
+	for err != nil {
+		if err.Error() == unexpectedSpeechEndMsg {
+			return true
+		}
+		err = errors.Unwrap(err)
+	}
+	return false
 }
 
 // Destroy releases ONNX resources.
