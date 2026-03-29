@@ -1177,6 +1177,60 @@ func main() {
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    1 << 20, // 1MB
 	}
+
+	// Admin endpoints for process lifecycle management
+	// Both endpoints trigger full cleanup and exit; restart vs quit is communicated
+	// via exit code to the parent process manager (systemd, docker, etc.)
+	adminHandler := func(action string, exitCode int) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusAccepted)
+			if _, err := w.Write([]byte(`{"status":"` + action + `"}`)); err != nil {
+				log.Printf("[WARN] %s response write error: %v", action, err)
+			}
+			// Trigger shutdown in background so we can return 202 first
+			go func() {
+				log.Printf("[INFO] %s requested via API - initiating graceful shutdown...", action)
+				// Stop lazy loaders first to prevent new worker spawns
+				sttLazy.Stop()
+				pocketLazy.Stop()
+				// Close TTS clients
+				for name, c := range ttsClients {
+					if c == nil {
+						continue
+					}
+					if err := c.Close(); err != nil {
+						log.Printf("[WARN] TTS client close failed during %s: %v", action, err)
+					}
+					delete(ttsClients, name)
+				}
+				// Shutdown HTTP server
+				shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if err := srv.Shutdown(shutdownCtx); err != nil {
+					log.Printf("[WARN] HTTP shutdown error during %s: %v", action, err)
+				}
+				// Close all peer connections
+				peerRegistry.CloseAll()
+				// Kill all worker processes
+				log.Printf("[INFO] Cleaning up worker processes for %s...", action)
+				if err := mgr.KillAll(); err != nil {
+					log.Printf("[WARN] Failed to kill all workers during %s: %v", action, err)
+				}
+				log.Printf("[INFO] %s complete - exiting with code %d", action, exitCode)
+				os.Exit(exitCode)
+			}()
+		}
+	}
+
+	mux.Handle("POST /restart", openaihttp.OptionalAuthMiddleware(adminHandler("restarting", 1)))
+	mux.Handle("POST /quit", openaihttp.OptionalAuthMiddleware(adminHandler("quitting", 0)))
+	log.Println("[INFO] Admin endpoints enabled: POST /restart, POST /quit (exit codes: restart=1, quit=0)")
+
 	go func() {
 		log.Printf("[INFO] Web server listening on %s", addr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
