@@ -13,11 +13,43 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pion/rtp"
-	"github.com/pion/webrtc/v4"
 	"github.com/heliasar/sky-audio/gateway/pkg/audio"
 	skywebrtc "github.com/heliasar/sky-audio/gateway/pkg/webrtc"
+	"github.com/pion/rtp"
+	"github.com/pion/webrtc/v4"
 )
+
+type testSession struct {
+	onPCM        func([]byte)
+	onTrackEnded func()
+	onClose      func()
+}
+
+func (s *testSession) Start() {}
+
+func (s *testSession) HandlePCM(data []byte) {
+	if s.onPCM != nil {
+		s.onPCM(data)
+	}
+}
+
+func (s *testSession) HandleTrackEnded() {
+	if s.onTrackEnded != nil {
+		s.onTrackEnded()
+	}
+}
+
+func (s *testSession) Close() {
+	if s.onClose != nil {
+		s.onClose()
+	}
+}
+
+type offerAnswer struct {
+	SDP       string `json:"sdp"`
+	Type      string `json:"type"`
+	SessionID string `json:"sessionId"`
+}
 
 // TestOfferAnswerExchange verifies the HTTP signaling works and returns a valid SDP answer.
 func TestOfferAnswerExchange(t *testing.T) {
@@ -26,8 +58,10 @@ func TestOfferAnswerExchange(t *testing.T) {
 
 	var received atomic.Int64
 	handler := skywebrtc.OfferHandler(skywebrtc.PeerConfig{
-		OnPCMAudio: func(data []byte) {
-			received.Add(int64(len(data)))
+		NewSession: func(peerID string) (skywebrtc.PeerSession, error) {
+			return &testSession{onPCM: func(data []byte) {
+				received.Add(int64(len(data)))
+			}}, nil
 		},
 	}, registry)
 
@@ -62,10 +96,13 @@ func TestOfferAnswerExchange(t *testing.T) {
 	}
 	<-webrtc.GatheringCompletePromise(pc)
 
-	offerJSON, _ := json.Marshal(map[string]string{
+	offerJSON, err := json.Marshal(map[string]string{
 		"sdp":  pc.LocalDescription().SDP,
 		"type": pc.LocalDescription().Type.String(),
 	})
+	if err != nil {
+		t.Fatalf("Marshal offer: %v", err)
+	}
 
 	resp, err := http.Post(ts.URL, "application/json", bytes.NewReader(offerJSON))
 	if err != nil {
@@ -78,16 +115,19 @@ func TestOfferAnswerExchange(t *testing.T) {
 		t.Fatalf("Expected 200, got %d: %s", resp.StatusCode, body)
 	}
 
-	var answer webrtc.SessionDescription
+	var answer offerAnswer
 	if err := json.NewDecoder(resp.Body).Decode(&answer); err != nil {
 		t.Fatalf("Decode answer: %v", err)
 	}
 
-	if answer.Type != webrtc.SDPTypeAnswer {
+	if answer.Type != webrtc.SDPTypeAnswer.String() {
 		t.Fatalf("Expected answer, got %s", answer.Type)
 	}
 	if answer.SDP == "" {
 		t.Fatal("Answer SDP is empty")
+	}
+	if answer.SessionID == "" {
+		t.Fatal("SessionID is empty")
 	}
 
 	t.Logf("Got valid SDP answer (%d bytes)", len(answer.SDP))
@@ -103,9 +143,11 @@ func TestAudioPacketsReachGateway(t *testing.T) {
 	var receivedPackets atomic.Int64
 
 	handler := skywebrtc.OfferHandler(skywebrtc.PeerConfig{
-		OnPCMAudio: func(data []byte) {
-			receivedBytes.Add(int64(len(data)))
-			receivedPackets.Add(1)
+		NewSession: func(peerID string) (skywebrtc.PeerSession, error) {
+			return &testSession{onPCM: func(data []byte) {
+				receivedBytes.Add(int64(len(data)))
+				receivedPackets.Add(1)
+			}}, nil
 		},
 	}, registry)
 
@@ -149,10 +191,13 @@ func TestAudioPacketsReachGateway(t *testing.T) {
 	}
 	<-webrtc.GatheringCompletePromise(pc)
 
-	offerJSON, _ := json.Marshal(map[string]string{
+	offerJSON, err := json.Marshal(map[string]string{
 		"sdp":  pc.LocalDescription().SDP,
 		"type": pc.LocalDescription().Type.String(),
 	})
+	if err != nil {
+		t.Fatalf("Marshal offer: %v", err)
+	}
 
 	resp, err := http.Post(ts.URL, "application/json", bytes.NewReader(offerJSON))
 	if err != nil {
@@ -160,11 +205,11 @@ func TestAudioPacketsReachGateway(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	var answer webrtc.SessionDescription
+	var answer offerAnswer
 	if err := json.NewDecoder(resp.Body).Decode(&answer); err != nil {
 		t.Fatalf("Decode answer: %v", err)
 	}
-	if err := pc.SetRemoteDescription(answer); err != nil {
+	if err := pc.SetRemoteDescription(webrtc.SessionDescription{SDP: answer.SDP, Type: webrtc.SDPTypeAnswer}); err != nil {
 		t.Fatalf("SetRemoteDescription: %v", err)
 	}
 
@@ -276,10 +321,12 @@ func TestWebRTCToSTTIntegration(t *testing.T) {
 	var pcmMu sync.Mutex
 
 	handler := skywebrtc.OfferHandler(skywebrtc.PeerConfig{
-		OnPCMAudio: func(data []byte) {
-			pcmMu.Lock()
-			pcmBuf = append(pcmBuf, data...)
-			pcmMu.Unlock()
+		NewSession: func(peerID string) (skywebrtc.PeerSession, error) {
+			return &testSession{onPCM: func(data []byte) {
+				pcmMu.Lock()
+				pcmBuf = append(pcmBuf, data...)
+				pcmMu.Unlock()
+			}}, nil
 		},
 	}, registry)
 
@@ -319,18 +366,26 @@ func TestWebRTCToSTTIntegration(t *testing.T) {
 	}
 	<-webrtc.GatheringCompletePromise(pc)
 
-	offerJSON, _ := json.Marshal(map[string]string{
+	offerJSON, err := json.Marshal(map[string]string{
 		"sdp":  pc.LocalDescription().SDP,
 		"type": pc.LocalDescription().Type.String(),
 	})
+	if err != nil {
+		t.Fatalf("Marshal offer: %v", err)
+	}
 	resp, err := http.Post(ts.URL, "application/json", bytes.NewReader(offerJSON))
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
-	var answer webrtc.SessionDescription
-	json.NewDecoder(resp.Body).Decode(&answer)
+	var answer offerAnswer
+	if err := json.NewDecoder(resp.Body).Decode(&answer); err != nil {
+		resp.Body.Close()
+		t.Fatalf("Decode answer: %v", err)
+	}
 	resp.Body.Close()
-	pc.SetRemoteDescription(answer)
+	if err := pc.SetRemoteDescription(webrtc.SessionDescription{SDP: answer.SDP, Type: webrtc.SDPTypeAnswer}); err != nil {
+		t.Fatalf("SetRemoteDescription: %v", err)
+	}
 
 	select {
 	case <-connected:

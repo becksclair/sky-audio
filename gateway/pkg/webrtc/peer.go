@@ -7,56 +7,92 @@ import (
 	"log"
 	"net/http"
 	"sync"
-	"time"
 	"sync/atomic"
+	"time"
 
 	"github.com/heliasar/sky-audio/gateway/pkg/audio"
 	"github.com/pion/webrtc/v4"
 )
 
+type PeerSession interface {
+	Start()
+	HandlePCM(pcm []byte)
+	HandleTrackEnded()
+	Close()
+}
+
 type PeerConfig struct {
-	OnPCMAudio   func(pcm []byte)
-	OnTrackEnded func()
+	NewSession func(peerID string) (PeerSession, error)
+}
+
+type peerEntry struct {
+	once    sync.Once
+	pc      *webrtc.PeerConnection
+	onClose func()
+}
+
+func (e *peerEntry) close(id string, state webrtc.PeerConnectionState, registry *PeerRegistry) {
+	e.once.Do(func() {
+		log.Printf("[webrtc] Peer %s state=%s, closing", id, state)
+		_ = e.pc.Close()
+		if e.onClose != nil {
+			e.onClose()
+		}
+		registry.mu.Lock()
+		delete(registry.peers, id)
+		registry.mu.Unlock()
+	})
 }
 
 type PeerRegistry struct {
 	mu    sync.Mutex
-	peers map[string]*webrtc.PeerConnection
+	peers map[string]*peerEntry
 }
 
 func NewPeerRegistry() *PeerRegistry {
-	return &PeerRegistry{peers: make(map[string]*webrtc.PeerConnection)}
+	return &PeerRegistry{peers: make(map[string]*peerEntry)}
 }
 
-func (pr *PeerRegistry) Add(id string, pc *webrtc.PeerConnection) {
+func (pr *PeerRegistry) Add(id string, pc *webrtc.PeerConnection, onClose func()) {
+	entry := &peerEntry{pc: pc, onClose: onClose}
+
 	pr.mu.Lock()
-	pr.peers[id] = pc
+	pr.peers[id] = entry
 	pr.mu.Unlock()
 
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		switch state {
 		case webrtc.PeerConnectionStateDisconnected, webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
-			log.Printf("[webrtc] Peer %s state=%s, closing", id, state)
-			pc.Close()
-			pr.mu.Lock()
-			delete(pr.peers, id)
-			pr.mu.Unlock()
+			entry.close(id, state, pr)
 		}
 	})
 }
 
+func (pr *PeerRegistry) Close(id string) {
+	pr.mu.Lock()
+	entry := pr.peers[id]
+	pr.mu.Unlock()
+	if entry != nil {
+		entry.close(id, webrtc.PeerConnectionStateClosed, pr)
+	}
+}
+
 func (pr *PeerRegistry) CloseAll() {
 	pr.mu.Lock()
-	defer pr.mu.Unlock()
-	for id, pc := range pr.peers {
-		pc.Close()
-		delete(pr.peers, id)
+	entries := make(map[string]*peerEntry, len(pr.peers))
+	for id, entry := range pr.peers {
+		entries[id] = entry
+	}
+	pr.mu.Unlock()
+
+	for id, entry := range entries {
+		entry.close(id, webrtc.PeerConnectionStateClosed, pr)
 	}
 }
 
 var peerCounter atomic.Uint64
 
-func NewPeerConnection(cfg PeerConfig) (*webrtc.PeerConnection, error) {
+func NewPeerConnection(session PeerSession) (*webrtc.PeerConnection, error) {
 	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
 			{URLs: []string{"stun:stun.l.google.com:19302"}},
@@ -76,17 +112,13 @@ func NewPeerConnection(cfg PeerConfig) (*webrtc.PeerConnection, error) {
 	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 		log.Printf("[webrtc] Track received: codec=%s", track.Codec().MimeType)
 		go func() {
+			defer session.HandleTrackEnded()
+
 			dec, err := audio.NewOpusDecoder()
 			if err != nil {
 				log.Printf("[webrtc] Failed to create Opus decoder: %v", err)
 				return
 			}
-
-			defer func() {
-				if cfg.OnTrackEnded != nil {
-					cfg.OnTrackEnded()
-				}
-			}()
 
 			for {
 				rtpPkt, _, err := track.ReadRTP()
@@ -107,9 +139,7 @@ func NewPeerConnection(cfg PeerConfig) (*webrtc.PeerConnection, error) {
 					continue
 				}
 
-				if cfg.OnPCMAudio != nil {
-					cfg.OnPCMAudio(pcm)
-				}
+				session.HandlePCM(pcm)
 			}
 		}()
 	})
@@ -120,6 +150,12 @@ func NewPeerConnection(cfg PeerConfig) (*webrtc.PeerConnection, error) {
 type offerRequest struct {
 	SDP  string `json:"sdp"`
 	Type string `json:"type"`
+}
+
+type offerResponse struct {
+	SDP       string `json:"sdp"`
+	Type      string `json:"type"`
+	SessionID string `json:"sessionId"`
 }
 
 const maxOfferBytes = 64 * 1024
@@ -149,18 +185,29 @@ func OfferHandler(cfg PeerConfig, registry *PeerRegistry) http.HandlerFunc {
 			return
 		}
 
-		pc, err := NewPeerConnection(cfg)
+		peerID := fmt.Sprintf("peer-%d", peerCounter.Add(1))
+		session, err := cfg.NewSession(peerID)
 		if err != nil {
+			log.Printf("[webrtc] session init error: %v", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+
+		pc, err := NewPeerConnection(session)
+		if err != nil {
+			session.Close()
 			log.Printf("[webrtc] peer connection error: %v", err)
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
 
+		registry.Add(peerID, pc, session.Close)
+
 		if err := pc.SetRemoteDescription(webrtc.SessionDescription{
 			Type: webrtc.SDPTypeOffer,
 			SDP:  offer.SDP,
 		}); err != nil {
-			pc.Close()
+			registry.Close(peerID)
 			log.Printf("[webrtc] set remote error: %v", err)
 			http.Error(w, "invalid offer", http.StatusBadRequest)
 			return
@@ -168,37 +215,43 @@ func OfferHandler(cfg PeerConfig, registry *PeerRegistry) http.HandlerFunc {
 
 		answer, err := pc.CreateAnswer(nil)
 		if err != nil {
-			pc.Close()
+			registry.Close(peerID)
 			log.Printf("[webrtc] create answer error: %v", err)
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
 
 		if err := pc.SetLocalDescription(answer); err != nil {
-			pc.Close()
+			registry.Close(peerID)
 			log.Printf("[webrtc] set local error: %v", err)
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
 
-		// Wait for ICE gathering to complete (with timeout to prevent hanging on unreachable STUN).
 		select {
 		case <-webrtc.GatheringCompletePromise(pc):
+		case <-r.Context().Done():
+			registry.Close(peerID)
+			return
 		case <-time.After(10 * time.Second):
-			pc.Close()
+			registry.Close(peerID)
 			log.Printf("[webrtc] ICE gathering timed out")
 			http.Error(w, "internal error", http.StatusGatewayTimeout)
 			return
 		}
 
-		peerID := fmt.Sprintf("peer-%d", peerCounter.Add(1))
-		registry.Add(peerID, pc)
-
 		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(pc.LocalDescription()); err != nil {
+		if err := json.NewEncoder(w).Encode(offerResponse{
+			SDP:       pc.LocalDescription().SDP,
+			Type:      pc.LocalDescription().Type.String(),
+			SessionID: peerID,
+		}); err != nil {
+			registry.Close(peerID)
 			log.Printf("[webrtc] write answer error: %v", err)
+			return
 		}
 
+		session.Start()
 		log.Printf("[webrtc] Peer %s connected", peerID)
 	}
 }

@@ -6,8 +6,15 @@ import (
 	"github.com/pion/webrtc/v4"
 )
 
+type noopSession struct{}
+
+func (noopSession) Start()            {}
+func (noopSession) HandlePCM([]byte)  {}
+func (noopSession) HandleTrackEnded() {}
+func (noopSession) Close()            {}
+
 func TestNewPeerConnectionHasAudioTransceiver(t *testing.T) {
-	pc, err := NewPeerConnection(PeerConfig{})
+	pc, err := NewPeerConnection(noopSession{})
 	if err != nil {
 		t.Fatalf("NewPeerConnection failed: %v", err)
 	}

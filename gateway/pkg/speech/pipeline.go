@@ -42,6 +42,8 @@ type Pipeline struct {
 	lastDropWarn     atomic.Int64
 	transcriptLoopOn atomic.Bool
 	errorOnce        sync.Once
+	destroyed        atomic.Bool
+	senderDone       chan struct{}
 }
 
 type Config struct {
@@ -72,26 +74,40 @@ func NewPipeline(ctx context.Context, sttClient *skywebrtc.STTClient, cfg Config
 
 func newPipelineWithDeps(ctx context.Context, sttClient sttStream, sileroVAD vadEngine, startSender bool) *Pipeline {
 	p := &Pipeline{
-		ctx:       ctx,
-		sttClient: sttClient,
-		ringBuf:   vad.NewRingBuffer(ringBufferSize),
-		sileroVAD: sileroVAD,
-		audioCh:   make(chan audioMsg, audioChSize),
-		errCh:     make(chan error, 1),
+		ctx:        ctx,
+		sttClient:  sttClient,
+		ringBuf:    vad.NewRingBuffer(ringBufferSize),
+		sileroVAD:  sileroVAD,
+		audioCh:    make(chan audioMsg, audioChSize),
+		errCh:      make(chan error, 1),
+		senderDone: make(chan struct{}),
 	}
 
 	if startSender {
 		go p.runAudioSender()
+	} else {
+		close(p.senderDone)
 	}
 	return p
 }
 
 func (p *Pipeline) Destroy() error {
+	p.vadMu.Lock()
+	defer p.vadMu.Unlock()
+	p.destroyed.Store(true)
 	return p.sileroVAD.Destroy()
 }
 
 func (p *Pipeline) Errors() <-chan error {
 	return p.errCh
+}
+
+func (p *Pipeline) WaitSenderDone() {
+	<-p.senderDone
+}
+
+func (p *Pipeline) SenderDone() <-chan struct{} {
+	return p.senderDone
 }
 
 func (p *Pipeline) StartTranscriptLoop(onTranscript func(*pb.Transcript)) {
@@ -121,6 +137,10 @@ func (p *Pipeline) HandlePCM(data []byte) {
 
 	floats := vad.PCMBytesToFloat32(data)
 	p.vadMu.Lock()
+	if p.destroyed.Load() {
+		p.vadMu.Unlock()
+		return
+	}
 	events, vadErr := p.sileroVAD.ProcessFrame(floats)
 	isSpeaking := p.sileroVAD.IsSpeaking()
 	p.vadMu.Unlock()
@@ -184,6 +204,10 @@ func (p *Pipeline) warnAudioDrop(msg string) {
 
 func (p *Pipeline) HandleTrackEnded() {
 	p.vadMu.Lock()
+	if p.destroyed.Load() {
+		p.vadMu.Unlock()
+		return
+	}
 	isSpeaking := p.sileroVAD.IsSpeaking()
 	if isSpeaking {
 		p.sileroVAD.Reset()
@@ -201,14 +225,32 @@ func (p *Pipeline) HandleTrackEnded() {
 }
 
 func (p *Pipeline) runAudioSender() {
+	defer close(p.senderDone)
+
+	send := func(msg audioMsg, suffix string) error {
+		if err := p.sttClient.SendAudio(msg.data, msg.eos, sampleRateHz); err != nil {
+			log.Printf("[stt] SendAudio error%s: %v", suffix, err)
+			p.reportError(err)
+			return err
+		}
+		return nil
+	}
+
 	for {
 		select {
 		case <-p.ctx.Done():
-			return
+			for {
+				select {
+				case msg := <-p.audioCh:
+					if err := send(msg, " while draining"); err != nil {
+						return
+					}
+				default:
+					return
+				}
+			}
 		case msg := <-p.audioCh:
-			if err := p.sttClient.SendAudio(msg.data, msg.eos, sampleRateHz); err != nil {
-				log.Printf("[stt] SendAudio error: %v", err)
-				p.reportError(err)
+			if err := send(msg, ""); err != nil {
 				return
 			}
 		}
