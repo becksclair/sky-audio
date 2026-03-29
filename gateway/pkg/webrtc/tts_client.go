@@ -44,13 +44,13 @@ func (c *TTSClient) GetStatus(ctx context.Context) (*pb.WorkerStatus, error) {
 	return status, nil
 }
 
-func (c *TTSClient) Synthesize(ctx context.Context, text string) (pcm []byte, sampleRate int32, err error) {
+func (c *TTSClient) Synthesize(ctx context.Context, text, voice string) (pcm []byte, sampleRate int32, err error) {
 	stream, err := c.client.SynthesizeStream(ctx)
 	if err != nil {
 		return nil, 0, fmt.Errorf("start synthesize stream: %w", err)
 	}
 
-	if err := stream.Send(&pb.TextToken{Text: text, IsEos: true}); err != nil {
+	if err := stream.Send(&pb.TextToken{Text: text, IsEos: true, Voice: voice}); err != nil {
 		return nil, 0, fmt.Errorf("send text token: %w", err)
 	}
 	if err := stream.CloseSend(); err != nil {

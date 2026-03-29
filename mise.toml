@@ -95,3 +95,15 @@ run = "cd workers/python-pocket-tts && uv run python main.py"
 [tasks."worker:tts-kyutai"]
 description = "Run KyutaiTTS worker standalone (for debugging)"
 run = "cd workers/python-kyutai-tts && uv run python main.py"
+
+[tasks."tts:prefetch:pocket"]
+description = "Download and catalog all PocketTTS voices locally"
+run = "cd workers/python-pocket-tts && uv run python prefetch_voices.py"
+
+[tasks."tts:prefetch:kyutai"]
+description = "Download and catalog all Kyutai voices locally"
+run = "cd workers/python-kyutai-tts && uv run python prefetch_voices.py"
+
+[tasks."tts:prefetch"]
+description = "Download and catalog all TTS voices locally"
+depends = ["tts:prefetch:pocket", "tts:prefetch:kyutai"]

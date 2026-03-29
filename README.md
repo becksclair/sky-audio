@@ -19,7 +19,16 @@ mise run dev:dashboard
 mise run build
 mise run test
 mise run check
+mise run tts:prefetch
 ```
+
+## TTS voice assets
+
+Kyutai and PocketTTS voice assets are intentionally vendored into this repo so the workers can run offline and in air-gapped environments. That also means the checkout is heavier than it looks at first glance: roughly 350 MB of voice files across the two worker `voices/` directories.
+
+- Treat those assets as part of the product, not accidental cache cruft.
+- If a fresh clone, sparse checkout, or local cleanup leaves the voice directories incomplete, run `mise run tts:prefetch` to repopulate the local catalogs and manifests.
+- The vendored catalogs live in `workers/python-pocket-tts/voices.json` and `workers/python-kyutai-tts/voices.json`.
 
 ## Test split
 
