@@ -45,14 +45,14 @@ export function App() {
           <div>
             <h1 class="text-xl font-semibold">Sky Audio Playground</h1>
             <p class="text-muted-foreground text-sm">
-              WebRTC STT + TTS — end-to-end pipeline testing
+              WebRTC STT + TTS - end-to-end pipeline testing
             </p>
           </div>
           <div class="flex items-center gap-2">
             {model.status.value === "disconnected" ? (
               <Button onClick={() => void model.connect()}>Connect WebRTC</Button>
             ) : model.status.value === "connecting" ? (
-              <Button disabled>Connecting…</Button>
+              <Button disabled>Connecting...</Button>
             ) : (
               <Button variant="outline" onClick={() => model.disconnect()}>
                 Disconnect
@@ -64,8 +64,8 @@ export function App() {
       footer={
         <p class="text-muted-foreground text-sm">
           Status: <strong>{model.status.value}</strong>
-          {model.sessionId.value ? <span class="ml-2">— Session {model.sessionId.value}</span> : null}
-          {model.error.value ? <span class="ml-2 text-red-500">— {model.error.value}</span> : null}
+          {model.sessionId.value ? <span class="ml-2">- Session {model.sessionId.value}</span> : null}
+          {model.error.value ? <span class="ml-2 text-red-500">- {model.error.value}</span> : null}
         </p>
       }
     >
@@ -160,7 +160,7 @@ export function App() {
                   }}
                   disabled={model.ttsCatalogBusy.value || !voiceCatalog}
                 >
-                  {voiceGroups.length === 0 ? <option value="all">Loading collections…</option> : null}
+                  {voiceGroups.length === 0 ? <option value="all">Loading collections...</option> : null}
                   {voiceGroups.map((group) => (
                     <option key={group.key} value={group.key}>
                       {group.label}
@@ -185,7 +185,7 @@ export function App() {
                           ? voiceCatalog.voices.length
                           : (voiceGroups.find((group) => group.key === voiceGroup)?.voices.length ?? 0)
                       } voices shown in this collection`
-                    : "Loading bundled voice catalog…"
+                    : "Loading bundled voice catalog..."
                 }
                 onInput={(event: Event) => {
                   setVoiceQuery((event.target as HTMLInputElement).value);
@@ -222,7 +222,7 @@ export function App() {
               {!voiceCatalog ? <option value="">Loading voices…</option> : null}
               {voiceCatalog && filteredVoices.length === 0 ? (
                 <option value={model.ttsVoice.value}>
-                  No matches for “{voiceQuery.trim()}” in this collection — keeping current voice
+                  No matches for "{voiceQuery.trim()}" in this collection — keeping current voice
                 </option>
               ) : null}
               {voiceCatalog
@@ -262,7 +262,7 @@ export function App() {
             }}
           />
           <Button disabled={!model.canSynthesize.value} onClick={() => void model.synthesize()}>
-            {model.ttsBusy.value ? "Synthesizing…" : "Synthesize"}
+            {model.ttsBusy.value ? "Synthesizing..." : "Synthesize"}
           </Button>
         </div>
       </Panel>

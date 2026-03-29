@@ -21,6 +21,7 @@ import (
 
 	"github.com/heliasar/sky-audio/gateway/pkg/audio"
 	"github.com/heliasar/sky-audio/gateway/pkg/dashboard"
+	"github.com/heliasar/sky-audio/gateway/pkg/openaihttp"
 	pb "github.com/heliasar/sky-audio/gateway/pkg/pb"
 	"github.com/heliasar/sky-audio/gateway/pkg/process"
 	"github.com/heliasar/sky-audio/gateway/pkg/speech"
@@ -117,6 +118,7 @@ func (h *transcriptHub) Publish(sessionID string, transcript *pb.Transcript) {
 		return
 	}
 
+	// Marshal JSON outside of lock to reduce contention
 	payload, err := json.Marshal(transcriptEvent{
 		Text:    transcript.Text,
 		IsFinal: transcript.IsFinal,
@@ -125,14 +127,26 @@ func (h *transcriptHub) Publish(sessionID string, transcript *pb.Transcript) {
 		log.Printf("[stt] transcript marshal error: %v", err)
 		return
 	}
+	payloadStr := string(payload)
 
 	h.mu.Lock()
-	defer h.mu.Unlock()
+	clients := make([]*sseClient, 0, len(h.clients[sessionID]))
 	for client := range h.clients[sessionID] {
+		clients = append(clients, client)
+	}
+	h.mu.Unlock()
+
+	// Send to clients outside of lock
+	dropped := 0
+	for _, client := range clients {
 		select {
-		case client.ch <- string(payload):
+		case client.ch <- payloadStr:
 		default:
+			dropped++
 		}
+	}
+	if dropped > 0 {
+		log.Printf("[stt] dropped %d messages to slow subscribers for session %s", dropped, sessionID)
 	}
 }
 
@@ -212,6 +226,197 @@ func sseHandler(hub *transcriptHub) http.HandlerFunc {
 	}
 }
 
+// trackedSession wraps a PeerSession to track session lifecycle for STT idle management
+type trackedSession struct {
+	skywebrtc.PeerSession
+	onClose func()
+	closed  atomic.Bool
+}
+
+func (s *trackedSession) Close() {
+	if s.closed.CompareAndSwap(false, true) {
+		s.onClose()
+	}
+	s.PeerSession.Close()
+}
+
+// lazySTTLoader manages on-demand STT worker spawning and idle shutdown
+type lazySTTLoader struct {
+	ctx          context.Context
+	runtime      *worker.Runtime
+	spec         worker.Spec
+	idleTimeout  time.Duration
+
+	mu           sync.Mutex
+	cond         *sync.Cond // signals when spawning completes
+	running      bool
+	spawning     bool // true while spawn is in progress (prevents concurrent spawns)
+	sessionCount int
+	idleTimer    *time.Timer
+	inShutdown   bool // prevents new spawns during shutdown
+}
+
+func newLazySTTLoader(ctx context.Context, runtime *worker.Runtime, spec worker.Spec, idleTimeout time.Duration) *lazySTTLoader {
+	l := &lazySTTLoader{
+		ctx:         ctx,
+		runtime:     runtime,
+		spec:        spec,
+		idleTimeout: idleTimeout,
+	}
+	l.cond = sync.NewCond(&l.mu)
+	return l
+}
+
+// EnsureRunning spawns the STT worker if not running and returns a cleanup function.
+// The cleanup function MUST be called when the session/request completes to enable idle timeout.
+func (l *lazySTTLoader) EnsureRunning() func() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	// Reject new spawns during active shutdown
+	if l.inShutdown {
+		return nil
+	}
+
+	// If already running, just add session and return cleanup
+	if l.running && l.runtime.IsRunning(l.spec.Name) {
+		l.sessionCount++
+		if l.idleTimer != nil {
+			l.idleTimer.Stop()
+			l.idleTimer = nil
+		}
+		return l.makeCleanup()
+	}
+
+	// Check if another goroutine is currently spawning (spawning flag set)
+	if l.spawning {
+		// Wait for spawn to complete using condition variable (avoids polling)
+		for l.spawning {
+			l.cond.Wait()
+		}
+		// Spawn completed, check result
+		if l.running {
+			l.sessionCount++
+			// Stop idle timer if first request completed while we were waiting
+			if l.idleTimer != nil {
+				l.idleTimer.Stop()
+				l.idleTimer = nil
+			}
+			return l.makeCleanup()
+		}
+		// Spawn failed
+		return nil
+	}
+
+	// We are the goroutine that will spawn
+	l.spawning = true
+	log.Println("[INFO] Spawning STT worker on demand...")
+	if err := l.runtime.Spawn(l.ctx, l.spec); err != nil {
+		l.spawning = false
+		l.cond.Broadcast() // wake waiters
+		log.Printf("[ERROR] Failed to spawn STT worker: %v", err)
+		return nil
+	}
+
+	// Wait for socket (outside lock to not block other operations)
+	l.mu.Unlock()
+	socketErr := worker.WaitForSocket(l.ctx, l.spec.SocketPath, l.spec.SocketTimeout)
+	l.mu.Lock()
+
+	// Re-check shutdown flag - if Stop() was called during socket wait, kill the worker
+	if l.inShutdown {
+		l.spawning = false
+		l.cond.Broadcast() // wake waiters
+		if err := l.runtime.Kill(l.spec.Name); err != nil {
+			log.Printf("[WARN] Failed to kill STT worker during shutdown: %v", err)
+		}
+		return nil
+	}
+
+	if socketErr != nil {
+		l.spawning = false
+		l.cond.Broadcast() // wake waiters
+		log.Printf("[ERROR] STT socket wait failed after spawn: %v", socketErr)
+		if err := l.runtime.Kill(l.spec.Name); err != nil {
+			log.Printf("[WARN] Failed to kill STT worker during socket wait recovery: %v", err)
+		}
+		return nil
+	}
+
+	l.spawning = false
+	l.running = true
+	l.sessionCount++
+	l.cond.Broadcast() // wake waiters
+	log.Println("[INFO] STT worker ready")
+	return l.makeCleanup()
+}
+
+// makeCleanup returns a cleanup function that decrements session count
+func (l *lazySTTLoader) makeCleanup() func() {
+	return func() {
+		l.RemoveSession()
+	}
+}
+
+func (l *lazySTTLoader) AddSession() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.sessionCount++
+	if l.idleTimer != nil {
+		l.idleTimer.Stop()
+		l.idleTimer = nil
+	}
+}
+
+func (l *lazySTTLoader) RemoveSession() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.sessionCount--
+	if l.sessionCount <= 0 && l.running && !l.inShutdown {
+		l.sessionCount = 0
+		l.idleTimer = time.AfterFunc(l.idleTimeout, l.shutdown)
+	}
+}
+
+func (l *lazySTTLoader) shutdown() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if l.sessionCount > 0 || !l.running || l.inShutdown {
+		return
+	}
+
+	l.running = false
+	// Note: inShutdown stays true - this worker slot is shut down
+	// A new spawn will reset inShutdown via EnsureRunning
+
+	log.Println("[INFO] STT idle timeout reached, shutting down worker...")
+	if err := l.runtime.Kill(l.spec.Name); err != nil {
+		log.Printf("[WARN] Failed to kill STT worker: %v", err)
+	}
+	// Clean up socket file
+	_ = os.Remove(l.spec.SocketPath)
+}
+
+func (l *lazySTTLoader) Stop() {
+	l.mu.Lock()
+	if l.idleTimer != nil {
+		l.idleTimer.Stop()
+		l.idleTimer = nil
+	}
+	wasRunning := l.running
+	l.running = false
+	l.inShutdown = true
+	l.mu.Unlock()
+	
+	if wasRunning {
+		log.Println("[INFO] Stopping STT worker...")
+		if err := l.runtime.Kill(l.spec.Name); err != nil {
+			log.Printf("[WARN] Failed to kill STT worker on stop: %v", err)
+		}
+	}
+}
+
 type audioSession struct {
 	id           string
 	ctx          context.Context
@@ -248,7 +453,9 @@ func newAudioSession(
 	if err != nil {
 		cancel()
 		streamCancel()
-		_ = sttClient.Close()
+		if closeErr := sttClient.Close(); closeErr != nil {
+			log.Printf("[WARN] Session %s STT close during cleanup failed: %v", peerID, closeErr)
+		}
 		return nil, err
 	}
 
@@ -377,14 +584,13 @@ func main() {
 			ReadinessProbe: "kyutai",
 		},
 	}
-	allWorkerSpecs := append([]worker.Spec{sttSpec}, ttsSpecs...)
-
-	if err := workerRuntime.SpawnAll(ctx, allWorkerSpecs); err != nil {
-		log.Fatalf("Failed to spawn workers: %v", err)
+	// Only spawn TTS workers at startup; STT is loaded on-demand
+	if err := workerRuntime.SpawnAll(ctx, ttsSpecs); err != nil {
+		log.Fatalf("Failed to spawn TTS workers: %v", err)
 	}
 
-	log.Println("[INFO] Waiting for worker sockets...")
-	if err := worker.WaitForSockets(ctx, allWorkerSpecs); err != nil {
+	log.Println("[INFO] Waiting for TTS worker sockets...")
+	if err := worker.WaitForSockets(ctx, ttsSpecs); err != nil {
 		log.Fatal(err)
 	}
 
@@ -394,9 +600,20 @@ func main() {
 	}
 	defer func() {
 		for _, c := range ttsClients {
-			_ = c.Close()
+			if err := c.Close(); err != nil {
+				log.Printf("[WARN] TTS client close failed: %v", err)
+			}
+		}
+		// Ensure all worker processes are killed on exit
+		log.Println("[INFO] Cleaning up worker processes...")
+		if err := mgr.KillAll(); err != nil {
+			log.Printf("[WARN] Failed to kill all workers: %v", err)
 		}
 	}()
+
+	// Lazy STT loader - spawns on demand, kills after idle timeout
+	sttLazy := newLazySTTLoader(ctx, workerRuntime, sttSpec, 2*time.Minute)
+	defer sttLazy.Stop()
 
 	transcripts := newTranscriptHub()
 	peerRegistry := skywebrtc.NewPeerRegistry()
@@ -416,17 +633,59 @@ func main() {
 		}
 	})
 
-	mux.HandleFunc("/webrtc/offer", skywebrtc.OfferHandler(skywebrtc.PeerConfig{
+	// Load voice catalogs once at startup (static data)
+	voiceCatalogs, err := loadTTSVoiceCatalogs(ttsVoiceCatalogPaths)
+	if err != nil {
+		log.Fatalf("Failed to load TTS voice catalogs: %v", err)
+	}
+	log.Printf("[INFO] Loaded voice catalogs: pocket=%d voices, kyutai=%d voices",
+		len(voiceCatalogs["pocket"].Voices), len(voiceCatalogs["kyutai"].Voices))
+
+	// Pre-encode voice catalogs to JSON for fast response (static data never changes)
+	voiceCatalogsJSON := preencodeVoiceCatalogs(voiceCatalogs)
+
+	// WebRTC endpoint - require auth when binding to non-loopback
+	webrtcHandler := skywebrtc.OfferHandler(skywebrtc.PeerConfig{
 		NewSession: func(peerID string) (skywebrtc.PeerSession, error) {
-			return newAudioSession(ctx, peerID, sttSpec.SocketPath, speechCfg, transcripts, func() {
+			// Ensure STT is running and get cleanup func for session tracking
+			cleanup := sttLazy.EnsureRunning()
+			if cleanup == nil {
+				return nil, fmt.Errorf("stt unavailable")
+			}
+			session, err := newAudioSession(ctx, peerID, sttSpec.SocketPath, speechCfg, transcripts, func() {
 				peerRegistry.Close(peerID)
 			})
+			if err != nil {
+				// Session creation failed, clean up immediately
+				cleanup()
+				return nil, err
+			}
+			// Wrap session with cleanup that handles both session close and idle tracking
+			return &trackedSession{
+				PeerSession: session,
+				onClose:     cleanup,
+			}, nil
 		},
-	}, peerRegistry))
+	}, peerRegistry)
+	mux.Handle("/webrtc/offer", openaihttp.OptionalAuthMiddleware(webrtcHandler))
 
-	mux.HandleFunc("/api/stt/stream", sseHandler(transcripts))
-	mux.HandleFunc("GET /api/tts/voices", ttsVoicesHandler(ttsVoiceCatalogPaths))
-	mux.HandleFunc("POST /api/tts/synthesize", ttsHandler(ttsClients))
+	// API endpoints - require auth when binding to non-loopback
+	apiMux := http.NewServeMux()
+	apiMux.HandleFunc("/api/stt/stream", sseHandler(transcripts))
+	apiMux.HandleFunc("GET /api/tts/voices", ttsVoicesHandler(voiceCatalogsJSON))
+	apiMux.HandleFunc("POST /api/tts/synthesize", ttsHandler(ttsClients))
+	mux.Handle("/api/", openaihttp.OptionalAuthMiddleware(apiMux))
+
+	// OpenAI-compatible endpoints for OpenClaw integration
+	// These provide /v1/audio/speech, /v1/audio/transcriptions, and /v1/models
+	openaiMux := http.NewServeMux()
+	openaiMux.HandleFunc("GET /v1/models", openaihttp.ModelsHandler())
+	openaiMux.HandleFunc("GET /v1/models/{model}", openaihttp.ModelsRetrieveHandler())
+	openaiMux.HandleFunc("POST /v1/audio/speech", openaihttp.TTSHandler(ttsClients))
+	openaiMux.HandleFunc("POST /v1/audio/transcriptions", openaihttp.TranscriptionsHandlerWithEnsureRunning(sttSpec.SocketPath, sttLazy.EnsureRunning))
+	// Apply optional auth middleware (requires SKY_AUDIO_API_KEY env var to enable)
+	mux.Handle("/v1/", openaihttp.OptionalAuthMiddleware(openaiMux))
+	log.Println("[INFO] OpenAI-compatible endpoints enabled at /v1/ (for OpenClaw integration)")
 
 	dashFS, err := fs.Sub(dashboard.Assets, "dist")
 	if err != nil {
@@ -435,12 +694,25 @@ func main() {
 	mux.Handle("/dashboard/", http.StripPrefix("/dashboard/", http.FileServer(http.FS(dashFS))))
 	log.Println("[INFO] Dashboard available at /dashboard/")
 
-	addr := ":8080"
+	addr := "127.0.0.1:8585"
 	if p := os.Getenv("PORT"); p != "" {
 		addr = ":" + p
 	}
 
-	srv := &http.Server{Addr: addr, Handler: mux}
+	// Security: Require API key for non-loopback binds
+	if !strings.HasPrefix(addr, "127.") && !strings.HasPrefix(addr, "localhost") && os.Getenv("SKY_AUDIO_API_KEY") == "" {
+		log.Fatal("[FATAL] SKY_AUDIO_API_KEY is required when binding to non-loopback address: " + addr)
+	}
+
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      120 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20, // 1MB
+	}
 	go func() {
 		log.Printf("[INFO] Web server listening on %s", addr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -458,7 +730,9 @@ func main() {
 	}
 
 	peerRegistry.CloseAll()
-	mgr.KillAll()
+	if err := mgr.KillAll(); err != nil {
+		log.Printf("[WARN] Failed to kill remaining workers: %v", err)
+	}
 }
 
 type ttsRequest struct {
@@ -511,19 +785,21 @@ func loadTTSVoiceCatalogs(paths map[string]string) (map[string]ttsVoiceCatalog, 
 	return catalogs, nil
 }
 
-func ttsVoicesHandler(paths map[string]string) http.HandlerFunc {
+func ttsVoicesHandler(catalogsJSON []byte) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		catalogs, err := loadTTSVoiceCatalogs(paths)
-		if err != nil {
-			log.Printf("[tts] Load voice catalogs error: %v", err)
-			http.Error(w, "failed to load voice catalogs", http.StatusInternalServerError)
-			return
-		}
 		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(catalogs); err != nil {
+		if _, err := w.Write(catalogsJSON); err != nil {
 			log.Printf("[tts] Write voice catalogs error: %v", err)
 		}
 	}
+}
+
+func preencodeVoiceCatalogs(catalogs map[string]ttsVoiceCatalog) []byte {
+	data, err := json.Marshal(catalogs)
+	if err != nil {
+		log.Fatalf("Failed to pre-encode voice catalogs: %v", err)
+	}
+	return data
 }
 
 func ttsHandlerWithSynth(clients map[string]ttsSynthesizer) http.HandlerFunc {
