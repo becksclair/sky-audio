@@ -598,6 +598,14 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to connect to TTS workers after retries: %v", err)
 	}
+
+	// Check ffmpeg availability - required for OpenAI TTS endpoint (default is OGG/Opus)
+	if !audio.IsFfmpegAvailable() {
+		log.Println("[WARN] ffmpeg not found in PATH. OpenAI TTS endpoint will only support WAV and PCM formats.")
+	} else {
+		log.Println("[INFO] ffmpeg available - OpenAI TTS endpoint supports opus, mp3, aac, flac, wav, pcm")
+	}
+
 	defer func() {
 		for _, c := range ttsClients {
 			if err := c.Close(); err != nil {
@@ -633,16 +641,13 @@ func main() {
 		}
 	})
 
-	// Load voice catalogs once at startup (static data)
-	voiceCatalogs, err := loadTTSVoiceCatalogs(ttsVoiceCatalogPaths)
+	// Load voice catalogs with manager (supports runtime updates)
+	voiceCatalogMgr, err := newVoiceCatalogManager(ttsVoiceCatalogPaths)
 	if err != nil {
 		log.Fatalf("Failed to load TTS voice catalogs: %v", err)
 	}
 	log.Printf("[INFO] Loaded voice catalogs: pocket=%d voices, kyutai=%d voices",
-		len(voiceCatalogs["pocket"].Voices), len(voiceCatalogs["kyutai"].Voices))
-
-	// Pre-encode voice catalogs to JSON for fast response (static data never changes)
-	voiceCatalogsJSON := preencodeVoiceCatalogs(voiceCatalogs)
+		len(voiceCatalogMgr.Get()["pocket"].Voices), len(voiceCatalogMgr.Get()["kyutai"].Voices))
 
 	// WebRTC endpoint - require auth when binding to non-loopback
 	webrtcHandler := skywebrtc.OfferHandler(skywebrtc.PeerConfig{
@@ -672,7 +677,9 @@ func main() {
 	// API endpoints - require auth when binding to non-loopback
 	apiMux := http.NewServeMux()
 	apiMux.HandleFunc("/api/stt/stream", sseHandler(transcripts))
-	apiMux.HandleFunc("GET /api/tts/voices", ttsVoicesHandler(voiceCatalogsJSON))
+	apiMux.HandleFunc("GET /api/tts/voices", ttsVoicesHandler(voiceCatalogMgr))
+	apiMux.HandleFunc("POST /api/tts/voices/default", ttsSetDefaultHandler(voiceCatalogMgr))
+	apiMux.HandleFunc("DELETE /api/tts/voices/{engine}/{voice...}", ttsDeleteVoiceHandler(voiceCatalogMgr))
 	apiMux.HandleFunc("POST /api/tts/synthesize", ttsHandler(ttsClients))
 	mux.Handle("/api/", openaihttp.OptionalAuthMiddleware(apiMux))
 
@@ -700,7 +707,12 @@ func main() {
 	}
 
 	// Security: Require API key for non-loopback binds
-	if !strings.HasPrefix(addr, "127.") && !strings.HasPrefix(addr, "localhost") && os.Getenv("SKY_AUDIO_API_KEY") == "" {
+	// Supports IPv4 loopback (127.x.x.x), IPv6 loopback ([::1]), and localhost
+	isLoopback := strings.HasPrefix(addr, "127.") ||
+		strings.HasPrefix(addr, "localhost") ||
+		strings.HasPrefix(addr, "[::1]") ||
+		addr == "[::1]"
+	if !isLoopback && os.Getenv("SKY_AUDIO_API_KEY") == "" {
 		log.Fatal("[FATAL] SKY_AUDIO_API_KEY is required when binding to non-loopback address: " + addr)
 	}
 
@@ -746,6 +758,149 @@ type ttsVoiceCatalog struct {
 	Voices  []string `json:"voices"`
 }
 
+// voiceCatalogManager handles mutable voice catalogs with thread-safe access.
+// It supports updating defaults and deleting voices while keeping the catalog
+// in sync with the JSON files on disk.
+type voiceCatalogManager struct {
+	mu       sync.RWMutex
+	catalogs map[string]ttsVoiceCatalog
+	paths    map[string]string
+}
+
+// newVoiceCatalogManager creates a manager and loads initial catalogs from disk.
+func newVoiceCatalogManager(paths map[string]string) (*voiceCatalogManager, error) {
+	catalogs, err := loadTTSVoiceCatalogs(paths)
+	if err != nil {
+		return nil, err
+	}
+	return &voiceCatalogManager{
+		catalogs: catalogs,
+		paths:    paths,
+	}, nil
+}
+
+// Get returns a copy of the current catalogs (thread-safe read).
+func (m *voiceCatalogManager) Get() map[string]ttsVoiceCatalog {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	
+	result := make(map[string]ttsVoiceCatalog, len(m.catalogs))
+	for engine, catalog := range m.catalogs {
+		voicesCopy := make([]string, len(catalog.Voices))
+		copy(voicesCopy, catalog.Voices)
+		result[engine] = ttsVoiceCatalog{
+			Default: catalog.Default,
+			Voices:  voicesCopy,
+		}
+	}
+	return result
+}
+
+// SetDefault sets the default voice for an engine and persists to disk.
+func (m *voiceCatalogManager) SetDefault(engine, voice string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	
+	catalog, ok := m.catalogs[engine]
+	if !ok {
+		return fmt.Errorf("unknown engine: %s", engine)
+	}
+	
+	// Verify the voice exists in the catalog
+	voiceExists := false
+	for _, v := range catalog.Voices {
+		if v == voice {
+			voiceExists = true
+			break
+		}
+	}
+	if !voiceExists {
+		return fmt.Errorf("voice not found: %s", voice)
+	}
+	
+	catalog.Default = voice
+	m.catalogs[engine] = catalog
+	
+	// Persist to disk
+	if err := m.saveCatalog(engine); err != nil {
+		return fmt.Errorf("failed to save catalog: %w", err)
+	}
+	
+	return nil
+}
+
+// DeleteVoice removes a voice from the catalog and persists to disk.
+// If the deleted voice was the default, it resets to the first available voice.
+func (m *voiceCatalogManager) DeleteVoice(engine, voice string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	
+	catalog, ok := m.catalogs[engine]
+	if !ok {
+		return fmt.Errorf("unknown engine: %s", engine)
+	}
+	
+	// Find and remove the voice
+	newVoices := make([]string, 0, len(catalog.Voices)-1)
+	found := false
+	for _, v := range catalog.Voices {
+		if v == voice {
+			found = true
+			continue
+		}
+		newVoices = append(newVoices, v)
+	}
+	if !found {
+		return fmt.Errorf("voice not found: %s", voice)
+	}
+	
+	catalog.Voices = newVoices
+	
+	// If we deleted the default voice, pick a new default (or clear if empty)
+	if catalog.Default == voice {
+		if len(catalog.Voices) > 0 {
+			catalog.Default = catalog.Voices[0]
+		} else {
+			catalog.Default = ""
+		}
+	}
+	
+	m.catalogs[engine] = catalog
+	
+	// Persist to disk
+	if err := m.saveCatalog(engine); err != nil {
+		return fmt.Errorf("failed to save catalog: %w", err)
+	}
+	
+	return nil
+}
+
+// saveCatalog writes a single engine's catalog to its JSON file.
+func (m *voiceCatalogManager) saveCatalog(engine string) error {
+	path, ok := m.paths[engine]
+	if !ok {
+		return fmt.Errorf("unknown engine path: %s", engine)
+	}
+	
+	catalog := m.catalogs[engine]
+	data, err := json.MarshalIndent(catalog, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal catalog: %w", err)
+	}
+	data = append(data, '\n')
+	
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		return fmt.Errorf("write catalog file: %w", err)
+	}
+	
+	return nil
+}
+
+// MarshalJSON returns the current catalogs as JSON (for HTTP responses).
+func (m *voiceCatalogManager) MarshalJSON() ([]byte, error) {
+	return json.Marshal(m.Get())
+}
+
 type ttsSynthesizer interface {
 	Synthesize(ctx context.Context, text, voice string) (pcm []byte, sampleRate int32, err error)
 }
@@ -785,15 +940,85 @@ func loadTTSVoiceCatalogs(paths map[string]string) (map[string]ttsVoiceCatalog, 
 	return catalogs, nil
 }
 
-func ttsVoicesHandler(catalogsJSON []byte) http.HandlerFunc {
+func ttsVoicesHandler(mgr *voiceCatalogManager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		if _, err := w.Write(catalogsJSON); err != nil {
+		data, err := mgr.MarshalJSON()
+		if err != nil {
+			log.Printf("[tts] Marshal voice catalogs error: %v", err)
+			http.Error(w, "failed to get voice catalogs", http.StatusInternalServerError)
+			return
+		}
+		if _, err := w.Write(data); err != nil {
 			log.Printf("[tts] Write voice catalogs error: %v", err)
 		}
 	}
 }
 
+func ttsSetDefaultHandler(mgr *voiceCatalogManager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, 4096)
+		
+		var req struct {
+			Engine string `json:"engine"`
+			Voice  string `json:"voice"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
+		
+		if req.Engine == "" || req.Voice == "" {
+			http.Error(w, "engine and voice are required", http.StatusBadRequest)
+			return
+		}
+		
+		if err := mgr.SetDefault(req.Engine, req.Voice); err != nil {
+			log.Printf("[tts] Set default voice error: %v", err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		
+		log.Printf("[tts] Set default voice for %s to %s", req.Engine, req.Voice)
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{
+			"status": "success",
+			"engine": req.Engine,
+			"default": req.Voice,
+		})
+	}
+}
+
+func ttsDeleteVoiceHandler(mgr *voiceCatalogManager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		engine := r.PathValue("engine")
+		voice := r.PathValue("voice...")
+		
+		if engine == "" || voice == "" {
+			http.Error(w, "engine and voice are required", http.StatusBadRequest)
+			return
+		}
+		
+		// URL decode the voice path (for voices with slashes like "vctk/p225.wav")
+		voice = strings.TrimSpace(voice)
+		
+		if err := mgr.DeleteVoice(engine, voice); err != nil {
+			log.Printf("[tts] Delete voice error: %v", err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		
+		log.Printf("[tts] Deleted voice %s from %s", voice, engine)
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{
+			"status": "success",
+			"engine": engine,
+			"deleted": voice,
+		})
+	}
+}
+
+// preencodeVoiceCatalogs is kept for backward compatibility but not used with the new manager.
 func preencodeVoiceCatalogs(catalogs map[string]ttsVoiceCatalog) []byte {
 	data, err := json.Marshal(catalogs)
 	if err != nil {

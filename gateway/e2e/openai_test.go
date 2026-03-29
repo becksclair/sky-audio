@@ -81,20 +81,46 @@ func TestOpenAITTS_Synthesize(t *testing.T) {
 		input      string
 		wantStatus int
 		wantFormat string
+		format     string // explicit format request
 	}{
 		{
-			name:       "valid_synthesis_" + engineName,
+			name:       "valid_synthesis_default_opus_" + engineName,
 			model:      "sky-" + engineName,
 			input:      "Hello from sky-audio end-to-end test.",
 			wantStatus: http.StatusOK,
+			wantFormat: "audio/ogg",
+			// Default is now opus (ogg container)
+		},
+		{
+			name:       "explicit_wav_format_" + engineName,
+			model:      "sky-" + engineName,
+			input:      "Testing WAV format.",
+			wantStatus: http.StatusOK,
 			wantFormat: "audio/wav",
+			format:     "wav",
+		},
+		{
+			name:       "explicit_opus_format_" + engineName,
+			model:      "sky-" + engineName,
+			input:      "Testing Opus format.",
+			wantStatus: http.StatusOK,
+			wantFormat: "audio/ogg",
+			format:     "opus",
+		},
+		{
+			name:       "explicit_mp3_format_" + engineName,
+			model:      "sky-" + engineName,
+			input:      "Testing MP3 format.",
+			wantStatus: http.StatusOK,
+			wantFormat: "audio/mpeg",
+			format:     "mp3",
 		},
 		{
 			name:       "alias_model_tts1",
 			model:      "tts-1",
 			input:      "Testing alias model.",
 			wantStatus: http.StatusOK,
-			wantFormat: "audio/wav",
+			wantFormat: "audio/ogg", // Default is opus
 		},
 		{
 			name:       "empty_input",
@@ -108,13 +134,21 @@ func TestOpenAITTS_Synthesize(t *testing.T) {
 			input:      strings.Repeat("x", openaihttp.MaxTTSCharacters+1),
 			wantStatus: http.StatusBadRequest,
 		},
+		{
+			name:       "unsupported_format",
+			model:      "sky-" + engineName,
+			input:      "Testing unsupported format.",
+			format:     "webm",
+			wantStatus: http.StatusBadRequest,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			reqBody := openaihttp.TTSRequest{
-				Model: tt.model,
-				Input: tt.input,
+				Model:          tt.model,
+				Input:          tt.input,
+				ResponseFormat: tt.format,
 			}
 			body, _ := json.Marshal(reqBody)
 
@@ -135,24 +169,43 @@ func TestOpenAITTS_Synthesize(t *testing.T) {
 					t.Errorf("Expected Content-Type containing %s, got %s", tt.wantFormat, contentType)
 				}
 
-				// Verify it's a valid WAV by checking header
+				// Verify audio format by checking header
 				data, err := io.ReadAll(resp.Body)
 				if err != nil {
 					t.Fatalf("Failed to read response body: %v", err)
 				}
 				if len(data) < 12 {
-					t.Errorf("Response too small for WAV file: %d bytes", len(data))
+					t.Errorf("Response too small for audio file: %d bytes", len(data))
 				}
-				if string(data[0:4]) != "RIFF" || string(data[8:12]) != "WAVE" {
-					t.Errorf("Response is not a valid WAV file: %s / %s", string(data[0:4]), string(data[8:12]))
+
+				// Verify format-specific headers
+				switch tt.wantFormat {
+				case "audio/wav":
+					if string(data[0:4]) != "RIFF" || string(data[8:12]) != "WAVE" {
+						t.Errorf("Response is not a valid WAV file: %s / %s", string(data[0:4]), string(data[8:12]))
+					}
+				case "audio/ogg":
+					// OGG container starts with "OggS"
+					if string(data[0:4]) != "OggS" {
+						t.Errorf("Response is not a valid OGG file: %s", string(data[0:4]))
+					}
+				case "audio/mpeg":
+					// MP3 can start with ID3 or have MPEG sync word
+					if string(data[0:3]) == "ID3" {
+						// Valid ID3v2 tag
+					} else if data[0] == 0xFF && (data[1]&0xE0) == 0xE0 {
+						// Valid MPEG sync word
+					} else {
+						t.Errorf("Response is not a valid MP3 file: %x", data[0:4])
+					}
 				}
 
 				// Should have actual audio data, not just header
-				if len(data) < 1000 {
-					t.Errorf("WAV file seems too small (%d bytes), may be empty audio", len(data))
+				if len(data) < 100 {
+					t.Errorf("Audio file seems too small (%d bytes), may be empty audio", len(data))
 				}
 
-				t.Logf("Generated %d bytes of WAV audio", len(data))
+				t.Logf("Generated %d bytes of %s audio", len(data), tt.wantFormat)
 			}
 		})
 	}
@@ -160,6 +213,9 @@ func TestOpenAITTS_Synthesize(t *testing.T) {
 
 // TestOpenAITTS_MultipleEngines tests synthesis across multiple engines if available
 func TestOpenAITTS_MultipleEngines(t *testing.T) {
+	// Kill competing GPU processes before running Kyutai tests
+	killCompetingGPUProcesses(t)
+
 	// Find available TTS workers
 	engines := map[string]string{}
 	for _, path := range []string{

@@ -160,7 +160,8 @@ func TestTTSHandlerWithSynthUsesDefaultEngineAndWritesWAV(t *testing.T) {
 		"pocket": mock,
 	})
 
-	reqBody := TTSRequest{Model: "sky-pocket", Input: "Hello world"}
+	// Test explicitly requesting WAV format (backward compatibility)
+	reqBody := TTSRequest{Model: "sky-pocket", Input: "Hello world", ResponseFormat: "wav"}
 	body, _ := json.Marshal(reqBody)
 	req := httptest.NewRequest(http.MethodPost, "/v1/audio/speech", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
