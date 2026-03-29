@@ -14,3 +14,7 @@ __pycache__/
 
 # uv lock (optional, uncomment if desired)
 # workers/python-nemo/uv.lock
+
+
+voice_pitch*.json
+

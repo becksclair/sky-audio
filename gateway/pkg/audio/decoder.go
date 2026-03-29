@@ -213,13 +213,13 @@ func newBoundedBuffer(cap int) *boundedBuffer {
 }
 
 func (b *boundedBuffer) Write(p []byte) (n int, err error) {
-	originalLen := len(p)
-	
 	if b.size >= b.cap {
-		// Silently drop data beyond cap, but report full write to avoid io.ErrShortWrite
-		return originalLen, nil
+		// Buffer is full - still report success to prevent io.Copy ErrShortWrite
+		// The buffer is explicitly lossy; io.Copy callers must not stall.
+		return len(p), nil
 	}
 	
+	originalLen := len(p)
 	remaining := b.cap - b.size
 	if len(p) > remaining {
 		p = p[:remaining]
