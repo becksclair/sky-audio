@@ -21,9 +21,10 @@ type SpawnConfig struct {
 }
 
 type worker struct {
-	cmd  *exec.Cmd
-	done chan struct{}
-	err  error
+	cmd    *exec.Cmd
+	done   chan struct{}
+	err    error
+	killed bool // set if Kill() was called during spawn
 }
 
 type Manager struct {
@@ -59,6 +60,7 @@ func (m *Manager) Spawn(ctx context.Context, cfg SpawnConfig) error {
 		m.mu.Lock()
 		delete(m.workers, cfg.Name)
 		m.mu.Unlock()
+		close(placeholder.done)
 		return fmt.Errorf("stdout pipe: %w", err)
 	}
 
@@ -67,6 +69,8 @@ func (m *Manager) Spawn(ctx context.Context, cfg SpawnConfig) error {
 		m.mu.Lock()
 		delete(m.workers, cfg.Name)
 		m.mu.Unlock()
+		stdout.Close()
+		close(placeholder.done)
 		return fmt.Errorf("stderr pipe: %w", err)
 	}
 
@@ -74,16 +78,48 @@ func (m *Manager) Spawn(ctx context.Context, cfg SpawnConfig) error {
 		m.mu.Lock()
 		delete(m.workers, cfg.Name)
 		m.mu.Unlock()
+		stdout.Close()
+		stderr.Close()
+		close(placeholder.done)
 		return fmt.Errorf("start %s: %w", cfg.Name, err)
 	}
 
+	// Check if Kill() was called during spawn (before cmd was set)
+	m.mu.Lock()
 	placeholder.cmd = cmd
+	wasKilled := placeholder.killed
+	m.mu.Unlock()
+	if wasKilled {
+		// Kill the process we just started and clean up properly
+		if cmd.Process != nil {
+			if err := cmd.Process.Kill(); err != nil {
+				log.Printf("[process/%s] Error killing process during spawn abort: %v", cfg.Name, err)
+			}
+		}
+		// Close pipes to prevent leaks
+		stdout.Close()
+		stderr.Close()
+		// Wait for process to exit (reap zombie)
+		_ = cmd.Wait()
+		// Clean up from map and close done channel
+		m.mu.Lock()
+		delete(m.workers, cfg.Name)
+		m.mu.Unlock()
+		close(placeholder.done)
+		return fmt.Errorf("worker %s was killed during spawn", cfg.Name)
+	}
 
 	var scanWg sync.WaitGroup
 	scanWg.Add(2)
 
 	go func() {
-		defer scanWg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[process/%s] OnStdout panic: %v", cfg.Name, r)
+				stdout.Close() // prevent child from blocking on write
+			}
+			scanWg.Done()
+		}()
 		scanner := bufio.NewScanner(stdout)
 		for scanner.Scan() {
 			if cfg.OnStdout != nil {
@@ -96,7 +132,13 @@ func (m *Manager) Spawn(ctx context.Context, cfg SpawnConfig) error {
 	}()
 
 	go func() {
-		defer scanWg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[process/%s] OnStderr panic: %v", cfg.Name, r)
+				stderr.Close() // prevent child from blocking on write
+			}
+			scanWg.Done()
+		}()
 		scanner := bufio.NewScanner(stderr)
 		for scanner.Scan() {
 			if cfg.OnStderr != nil {
@@ -109,11 +151,27 @@ func (m *Manager) Spawn(ctx context.Context, cfg SpawnConfig) error {
 	}()
 
 	go func() {
+		var exitCode int
+		var waitErr error
+
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[process/%s] OnExit panic: %v", cfg.Name, r)
+			}
+			// Clean up worker from map after exit, but only if we still own this slot
+			m.mu.Lock()
+			if m.workers[cfg.Name] == placeholder {
+				delete(m.workers, cfg.Name)
+			}
+			m.mu.Unlock()
+			close(placeholder.done)
+		}()
+
 		scanWg.Wait()
-		waitErr := cmd.Wait()
+		waitErr = cmd.Wait()
 		placeholder.err = waitErr
 
-		exitCode := 0
+		exitCode = 0
 		if waitErr != nil {
 			if exitErr, ok := waitErr.(*exec.ExitError); ok {
 				exitCode = exitErr.ExitCode()
@@ -125,7 +183,6 @@ func (m *Manager) Spawn(ctx context.Context, cfg SpawnConfig) error {
 		if cfg.OnExit != nil {
 			cfg.OnExit(exitCode)
 		}
-		close(placeholder.done)
 	}()
 
 	return nil
@@ -142,13 +199,78 @@ func (m *Manager) Wait(name string) error {
 	return w.err
 }
 
-func (m *Manager) KillAll() error {
+func (m *Manager) Kill(name string) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	for _, w := range m.workers {
-		if w.cmd.Process != nil {
-			_ = w.cmd.Process.Kill()
+	w, ok := m.workers[name]
+	if !ok {
+		m.mu.Unlock()
+		return fmt.Errorf("unknown worker: %s", name)
+	}
+
+	// If cmd is nil, worker is still spawning. Set killed flag so Spawn() will clean up.
+	if w.cmd == nil {
+		w.killed = true
+		m.mu.Unlock()
+		// Wait for spawn to complete and clean up
+		<-w.done
+		return nil
+	}
+	m.mu.Unlock()
+
+	if w.cmd.Process != nil {
+		if err := w.cmd.Process.Kill(); err != nil {
+			// Wait for the exit goroutine to clean up even if Kill failed
+			<-w.done
+			return fmt.Errorf("kill %s: %w", name, err)
 		}
 	}
+	// Wait for the exit goroutine to reap the process and remove it from the map
+	<-w.done
 	return nil
+}
+
+func (m *Manager) IsRunning(name string) bool {
+	m.mu.Lock()
+	w, ok := m.workers[name]
+	if !ok || w == nil {
+		m.mu.Unlock()
+		return false
+	}
+	// Copy cmd reference while holding lock to avoid data race
+	cmd := w.cmd
+	m.mu.Unlock()
+
+	// Check if process is still running by sending signal 0
+	if cmd != nil && cmd.Process != nil {
+		return cmd.Process.Signal(syscall.Signal(0)) == nil
+	}
+	return false
+}
+
+func (m *Manager) KillAll() error {
+	m.mu.Lock()
+	var firstErr error
+	var toWait []*worker
+
+	for name, w := range m.workers {
+		toWait = append(toWait, w)
+		if w.cmd == nil {
+			// Worker is still spawning, set killed flag
+			w.killed = true
+			continue
+		}
+		if w.cmd.Process != nil {
+			if err := w.cmd.Process.Kill(); err != nil && firstErr == nil {
+				firstErr = fmt.Errorf("kill %s: %w", name, err)
+			}
+		}
+	}
+	m.mu.Unlock()
+
+	// Wait for all workers to exit and be reaped
+	for _, w := range toWait {
+		<-w.done
+	}
+
+	return firstErr
 }

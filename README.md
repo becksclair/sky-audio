@@ -45,3 +45,36 @@ Kyutai and PocketTTS voice assets are intentionally vendored into this repo so t
 ## Build notes
 
 `build.sh` and the `mise` tasks export the CGO and runtime linker settings needed for the Silero/ONNX-backed gateway build. If Go builds fail with missing `onnxruntime_c_api.h` or linker errors around `libonnxruntime.so`, the ONNX Runtime include/library paths are the first thing to check.
+
+## OpenAI-Compatible API (OpenClaw Integration)
+
+The gateway exposes OpenAI-compatible endpoints for TTS/STT, enabling integration with [OpenClaw](https://openclaw.ai) and other OpenAI-compatible clients.
+
+**Endpoints:**
+- `POST /v1/audio/speech` - Text-to-speech synthesis
+- `POST /v1/audio/transcriptions` - Speech-to-text transcription  
+- `GET /v1/models` - List available models
+
+**Quick start with OpenClaw:**
+```json
+{
+  "messages": {
+    "tts": {
+      "provider": "openai",
+      "openai": {
+        "model": "sky-kyutai",
+        "baseUrl": "http://localhost:8585/v1"
+      }
+    }
+  },
+  "tools": {
+    "media": {
+      "audio": {
+        "models": [{"provider": "openai", "model": "whisper-1", "baseUrl": "http://localhost:8585/v1"}]
+      }
+    }
+  }
+}
+```
+
+See [docs/openclaw-integration.md](docs/openclaw-integration.md) for detailed setup instructions.

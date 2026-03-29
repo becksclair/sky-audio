@@ -6,6 +6,65 @@ export interface VoiceGroup {
   voices: string[];
 }
 
+// Gender mapping from pitch analysis + manual corrections
+const VOICE_GENDER_MAP: Record<string, 'male' | 'female' | 'ambiguous'> = {
+  // PocketTTS - with corrections
+  'alba': 'male',
+  'anna': 'female',
+  'azelma': 'female',
+  'bill_boerst': 'male',
+  'caro_davy': 'female',
+  'charles': 'male',
+  'cosette': 'female',
+  'eponine': 'female',
+  'eve': 'female',
+  'fantine': 'female',
+  'george': 'male',
+  'jane': 'female',
+  'javert': 'male',
+  'jean': 'male',
+  'marius': 'male',
+  'mary': 'female',
+  'michael': 'male',
+  'paul': 'male',
+  'peter_yearsley': 'male',
+  'stuart_bell': 'male',
+  'vera': 'female',
+};
+
+// Kyutai voices from pitch analysis (680 voices analyzed)
+// Using pitch-based classification: male < 155 Hz, female > 185 Hz, ambiguous in between
+const KYUTAI_VOICE_GENDER_MAP: Record<string, 'male' | 'female' | 'ambiguous'> = {};
+
+// Add gender from pitch analysis (this would be generated from the analysis results)
+// For now, using a subset of clear classifications
+const KYUTAI_GENDER_DATA: [string, 'male' | 'female' | 'ambiguous'][] = [
+  // Alba-Mackenna (confirmed male)
+  ['alba-mackenna/a-moment-by.wav', 'male'],
+  ['alba-mackenna/announcer.wav', 'male'],
+  ['alba-mackenna/casual.wav', 'male'],
+  ['alba-mackenna/merchant.wav', 'male'],
+  // Some French voices
+  ['cml-tts/fr/4193_3103_000004-0001.wav', 'male'],
+  ['cml-tts/fr/4193_3103_000004-0001_enhanced.wav', 'male'],
+  ['cml-tts/fr/577_394_000070-0001.wav', 'female'],
+  ['cml-tts/fr/577_394_000070-0001_enhanced.wav', 'female'],
+  // Expresso voices
+  ['expresso/ex03-ex01_happy_001_channel1_334s.wav', 'female'],
+  ['expresso/ex03-ex01_happy_001_channel2_257s.wav', 'male'],
+];
+
+for (const [voice, gender] of KYUTAI_GENDER_DATA) {
+  KYUTAI_VOICE_GENDER_MAP[voice] = gender;
+}
+
+function getVoiceGender(voice: string, engine: TTSEngine): 'male' | 'female' | 'ambiguous' | null {
+  if (engine === 'pocket') {
+    return VOICE_GENDER_MAP[voice] || null;
+  }
+  return KYUTAI_VOICE_GENDER_MAP[voice] || null;
+}
+
 export interface VoicePreset {
   key: string;
   label: string;
@@ -53,9 +112,22 @@ function formatGroupLabel(groupKey: string) {
   }
 }
 
+function getGenderEmoji(gender: string): string {
+  switch (gender) {
+    case 'male': return '♂';
+    case 'female': return '♀';
+    case 'ambiguous': return '⚥';
+    default: return '';
+  }
+}
+
 export function formatVoiceLabel(engine: TTSEngine, voice: string) {
+  // Get gender from map
+  const gender = getVoiceGender(voice, engine);
+  const genderLabel = gender ? ` ${getGenderEmoji(gender)}` : '';
+  
   if (engine === "pocket") {
-    return humanizeToken(voice);
+    return humanizeToken(voice) + genderLabel;
   }
 
   const groupKey = getKyutaiGroupKey(voice);
@@ -68,7 +140,8 @@ export function formatVoiceLabel(engine: TTSEngine, voice: string) {
     : withoutExtension;
   const label = humanizeToken(baseName.replaceAll(/[()]+/g, " "));
   const groupLabel = formatGroupLabel(groupKey);
-  return isEnhanced ? `${label} — ${groupLabel} · Enhanced` : `${label} — ${groupLabel}`;
+  const enhancedLabel = isEnhanced ? " · Enhanced" : "";
+  return `${label} — ${groupLabel}${enhancedLabel}${genderLabel}`;
 }
 
 export function buildVoiceGroups(

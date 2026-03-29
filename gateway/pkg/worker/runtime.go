@@ -61,19 +61,28 @@ func (r *Runtime) SpawnAll(ctx context.Context, specs []Spec) error {
 	return nil
 }
 
+func (r *Runtime) Kill(name string) error {
+	return r.manager.Kill(name)
+}
+
+func (r *Runtime) IsRunning(name string) bool {
+	return r.manager.IsRunning(name)
+}
+
 func WaitForSocket(ctx context.Context, path string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
 	for time.Now().Before(deadline) {
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("interrupted while waiting for socket: %s", path)
-		default:
-		}
 		if _, err := os.Stat(path); err == nil {
 			return nil
 		}
-		if err := wait(ctx, 500*time.Millisecond); err != nil {
+		select {
+		case <-ctx.Done():
 			return fmt.Errorf("interrupted while waiting for socket: %s", path)
+		case <-ticker.C:
+			// Continue polling
 		}
 	}
 	return fmt.Errorf("timed out waiting for socket: %s", path)

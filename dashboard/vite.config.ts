@@ -5,6 +5,7 @@ import tailwindcss from '@tailwindcss/vite';
 export default defineConfig({
   plugins: [preact(), tailwindcss()],
   root: '.',
+  base: '/dashboard/',
   build: {
     outDir: 'dist',
     emptyOutDir: true,

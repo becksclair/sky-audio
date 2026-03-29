@@ -10,9 +10,14 @@ const MAX_TRANSCRIPTS = 200;
 export type ConnectionStatus = "disconnected" | "connecting" | "connected";
 export type TTSEngine = "pocket" | "kyutai";
 
+export interface TTSVoice {
+  name: string;
+  gender: 'male' | 'female' | 'ambiguous' | 'unknown';
+}
+
 export interface TTSVoiceCatalog {
   default: string;
-  voices: string[];
+  voices: (string | TTSVoice)[];
 }
 
 type TTSVoiceCatalogMap = Partial<Record<TTSEngine, TTSVoiceCatalog>>;

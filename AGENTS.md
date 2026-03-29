@@ -40,6 +40,8 @@ mise run check
   - Runs the environment-dependent end-to-end suite in `gateway/e2e`.
   - Requires worker sockets under `/tmp/sky-audio-*.sock`.
   - Some tests also expect local assets such as `/tmp/test-speech.wav`.
+  - New OpenAI-compatible endpoint tests are in `gateway/e2e/openai_test.go`.
+  - Set `TTS_WORKER_SOCKET` env var to test specific TTS engines.
 - `mise run check`
   - Runs vet, local tests, and production build.
   - This is the default validation path for ordinary code changes.
@@ -50,3 +52,5 @@ mise run check
 - If Go builds fail with missing `onnxruntime_c_api.h` or `libonnxruntime.so`, check the ONNX Runtime paths first.
 - For Go diagnostics and vet/build validation in this repo, prefer `mise run check`, `mise run check:vet`, or an equivalent custom command that preserves the ONNX CGO environment. Bare `go vet ./...` or `go build ./...` can false-fail on ONNX-backed packages.
 - Do not treat `gateway/e2e` failures as ordinary unit-test regressions unless the worker sockets and test assets are present.
+- **Voice catalogs**: The gateway loads TTS voice catalog files (`workers/python-pocket-tts/voices.json`, `workers/python-kyutai-tts/voices.json`) at startup. These must be present or the gateway will fail to start with a fatal error. Run `mise run tts:prefetch` to download voices and generate catalogs if needed.
+- **Security defaults**: The gateway binds to `127.0.0.1:8585` by default (loopback only). To bind to all interfaces or a non-loopback address, you MUST set `SKY_AUDIO_API_KEY` environment variable for authentication. The OpenAI-compatible `/v1/` endpoints enforce this requirement.

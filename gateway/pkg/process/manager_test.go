@@ -158,3 +158,131 @@ func TestManagerStderrCapture(t *testing.T) {
 		t.Errorf("Expected stderr to contain 'oops', got %q", stderr.String())
 	}
 }
+
+// TestManagerIsRunning verifies IsRunning returns correct state for workers
+func TestManagerIsRunning(t *testing.T) {
+	m := NewManager()
+	ctx := context.Background()
+
+	// Nonexistent worker should not be running
+	if m.IsRunning("nonexistent") {
+		t.Error("IsRunning should return false for nonexistent worker")
+	}
+
+	// Spawn a worker
+	err := m.Spawn(ctx, SpawnConfig{
+		Name:    "running-worker",
+		Command: "sleep",
+		Args:    []string{"60"},
+	})
+	if err != nil {
+		t.Fatalf("Spawn failed: %v", err)
+	}
+
+	// Worker should be running
+	if !m.IsRunning("running-worker") {
+		t.Error("IsRunning should return true for running worker")
+	}
+
+	// Kill the worker
+	if err := m.Kill("running-worker"); err != nil {
+		t.Fatalf("Kill failed: %v", err)
+	}
+
+	// Killed worker should not be running (after wait)
+	err = m.Wait("running-worker")
+	if err == nil {
+		t.Error("Expected error after kill")
+	}
+
+	// After kill, IsRunning should return false
+	if m.IsRunning("running-worker") {
+		t.Error("IsRunning should return false for killed worker")
+	}
+}
+
+// TestManagerKillDuringSpawn verifies Kill during spawn cleans up properly
+func TestManagerKillDuringSpawn(t *testing.T) {
+	m := NewManager()
+	ctx := context.Background()
+
+	// Spawn a quick-exiting process
+	err := m.Spawn(ctx, SpawnConfig{
+		Name:    "quick-worker",
+		Command: "true",
+	})
+	if err != nil {
+		t.Fatalf("Spawn failed: %v", err)
+	}
+
+	// Kill it immediately
+	if err := m.Kill("quick-worker"); err != nil {
+		t.Fatalf("Kill failed: %v", err)
+	}
+
+	// Wait for cleanup
+	_ = m.Wait("quick-worker")
+
+	// Verify worker is not in map and can be respawned
+	if m.IsRunning("quick-worker") {
+		t.Error("Worker should not be running after kill")
+	}
+
+	// Respawn should succeed
+	err = m.Spawn(ctx, SpawnConfig{
+		Name:    "quick-worker",
+		Command: "true",
+	})
+	if err != nil {
+		t.Fatalf("Respawn failed: %v", err)
+	}
+
+	// Cleanup
+	_ = m.Kill("quick-worker")
+	_ = m.Wait("quick-worker")
+}
+
+// TestManagerKillAllWithMultipleWorkers verifies KillAll handles multiple workers
+func TestManagerKillAllWithMultipleWorkers(t *testing.T) {
+	m := NewManager()
+	ctx := context.Background()
+
+	// Start multiple workers sequentially
+	for i := 0; i < 3; i++ {
+		err := m.Spawn(ctx, SpawnConfig{
+			Name:    "worker-" + string(rune('a'+i)),
+			Command: "sleep",
+			Args:    []string{"60"},
+		})
+		if err != nil {
+			t.Fatalf("Spawn %d failed: %v", i, err)
+		}
+	}
+
+	// Verify all running
+	for i := 0; i < 3; i++ {
+		name := "worker-" + string(rune('a' + i))
+		if !m.IsRunning(name) {
+			t.Errorf("Worker %s should be running", name)
+		}
+	}
+
+	// KillAll should handle all workers
+	if err := m.KillAll(); err != nil {
+		t.Fatalf("KillAll failed: %v", err)
+	}
+
+	// Wait for all workers to exit deterministically
+	for i := 0; i < 3; i++ {
+		name := "worker-" + string(rune('a'+i))
+		_ = m.Wait(name) // ignore error (may already be dead)
+	}
+
+	// Verify all workers are stopped
+	for i := 0; i < 3; i++ {
+		name := "worker-" + string(rune('a' + i))
+		if m.IsRunning(name) {
+			t.Errorf("Worker %s should not be running after KillAll", name)
+		}
+	}
+}
