@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -37,28 +38,113 @@ const (
 	maxTTSBodyBytes = 25600
 )
 
-// ---------------------------------------------------------------------------
-// SSE transcript broadcaster
-// ---------------------------------------------------------------------------
-
 type sseClient struct {
 	ch chan string
 }
 
-var (
-	sseMu      sync.Mutex
-	sseClients []*sseClient
-)
+type transcriptEvent struct {
+	Text    string `json:"text"`
+	IsFinal bool   `json:"isFinal"`
+}
 
-func broadcastTranscript(text string) {
-	sseMu.Lock()
-	defer sseMu.Unlock()
-	for _, c := range sseClients {
+type transcriptHub struct {
+	mu      sync.Mutex
+	active  map[string]struct{}
+	clients map[string]map[*sseClient]struct{}
+}
+
+func newTranscriptHub() *transcriptHub {
+	return &transcriptHub{
+		active:  make(map[string]struct{}),
+		clients: make(map[string]map[*sseClient]struct{}),
+	}
+}
+
+func (h *transcriptHub) OpenSession(sessionID string) {
+	h.mu.Lock()
+	h.active[sessionID] = struct{}{}
+	h.mu.Unlock()
+}
+
+func (h *transcriptHub) IsActive(sessionID string) bool {
+	h.mu.Lock()
+	_, ok := h.active[sessionID]
+	h.mu.Unlock()
+	return ok
+}
+
+func (h *transcriptHub) Subscribe(sessionID string) *sseClient {
+	client := &sseClient{ch: make(chan string, 64)}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if _, ok := h.active[sessionID]; !ok {
+		close(client.ch)
+		return client
+	}
+	if h.clients[sessionID] == nil {
+		h.clients[sessionID] = make(map[*sseClient]struct{})
+	}
+	h.clients[sessionID][client] = struct{}{}
+	return client
+}
+
+func (h *transcriptHub) Unsubscribe(sessionID string, client *sseClient) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	clients := h.clients[sessionID]
+	if clients == nil {
+		return
+	}
+	if _, ok := clients[client]; !ok {
+		return
+	}
+	delete(clients, client)
+	close(client.ch)
+	if len(clients) == 0 {
+		delete(h.clients, sessionID)
+	}
+}
+
+func (h *transcriptHub) Publish(sessionID string, transcript *pb.Transcript) {
+	if transcript == nil || transcript.Text == "" {
+		return
+	}
+
+	payload, err := json.Marshal(transcriptEvent{
+		Text:    transcript.Text,
+		IsFinal: transcript.IsFinal,
+	})
+	if err != nil {
+		log.Printf("[stt] transcript marshal error: %v", err)
+		return
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for client := range h.clients[sessionID] {
 		select {
-		case c.ch <- text:
+		case client.ch <- string(payload):
 		default:
 		}
 	}
+}
+
+func (h *transcriptHub) CloseSession(sessionID string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	delete(h.active, sessionID)
+
+	clients := h.clients[sessionID]
+	if clients == nil {
+		return
+	}
+	for client := range clients {
+		close(client.ch)
+	}
+	delete(h.clients, sessionID)
 }
 
 func writeSSEData(w http.ResponseWriter, text string) error {
@@ -73,50 +159,174 @@ func writeSSEData(w http.ResponseWriter, text string) error {
 	return err
 }
 
-func sseHandler(w http.ResponseWriter, r *http.Request) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	flusher.Flush()
-
-	client := &sseClient{ch: make(chan string, 64)}
-	sseMu.Lock()
-	sseClients = append(sseClients, client)
-	sseMu.Unlock()
-
-	defer func() {
-		sseMu.Lock()
-		for i, c := range sseClients {
-			if c == client {
-				sseClients = append(sseClients[:i], sseClients[i+1:]...)
-				break
-			}
-		}
-		sseMu.Unlock()
-	}()
-
-	for {
-		select {
-		case <-r.Context().Done():
+func sseHandler(hub *transcriptHub) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		sessionID := strings.TrimSpace(r.URL.Query().Get("session"))
+		if sessionID == "" {
+			http.Error(w, "session is required", http.StatusBadRequest)
 			return
-		case text := <-client.ch:
-			if err := writeSSEData(w, text); err != nil {
+		}
+
+		if !hub.IsActive(sessionID) {
+			http.Error(w, "session not found", http.StatusNotFound)
+			return
+		}
+
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+			return
+		}
+
+		client := hub.Subscribe(sessionID)
+		defer hub.Unsubscribe(sessionID, client)
+		if !hub.IsActive(sessionID) {
+			http.Error(w, "session closed", http.StatusGone)
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		flusher.Flush()
+
+		for {
+			select {
+			case <-r.Context().Done():
 				return
+			case text, ok := <-client.ch:
+				if !ok {
+					return
+				}
+				if err := writeSSEData(w, text); err != nil {
+					return
+				}
+				flusher.Flush()
 			}
-			flusher.Flush()
 		}
 	}
 }
 
-// ---------------------------------------------------------------------------
-// main
-// ---------------------------------------------------------------------------
+type audioSession struct {
+	id           string
+	ctx          context.Context
+	hub          *transcriptHub
+	cancel       context.CancelFunc
+	streamCancel context.CancelFunc
+	sttClient    *skywebrtc.STTClient
+	pipeline     *speech.Pipeline
+	onFatal      func()
+	startOnce    sync.Once
+	closeOnce    sync.Once
+	closed       atomic.Bool
+}
+
+func newAudioSession(
+	ctx context.Context,
+	peerID string,
+	socketPath string,
+	cfg speech.Config,
+	hub *transcriptHub,
+	onFatal func(),
+) (*audioSession, error) {
+	sessionCtx, cancel := context.WithCancel(ctx)
+	streamCtx, streamCancel := context.WithCancel(context.Background())
+
+	sttClient, err := worker.ConnectSTT(streamCtx, socketPath, 10, 500*time.Millisecond)
+	if err != nil {
+		cancel()
+		streamCancel()
+		return nil, err
+	}
+
+	pipeline, err := speech.NewPipeline(sessionCtx, sttClient, cfg)
+	if err != nil {
+		cancel()
+		streamCancel()
+		_ = sttClient.Close()
+		return nil, err
+	}
+
+	hub.OpenSession(peerID)
+
+	session := &audioSession{
+		id:           peerID,
+		ctx:          sessionCtx,
+		hub:          hub,
+		cancel:       cancel,
+		streamCancel: streamCancel,
+		sttClient:    sttClient,
+		pipeline:     pipeline,
+		onFatal:      onFatal,
+	}
+
+	pipeline.StartTranscriptLoop(func(transcript *pb.Transcript) {
+		if transcript == nil {
+			return
+		}
+		log.Printf(
+			"[stt] Session %s transcript received (final=%v, chars=%d)",
+			peerID,
+			transcript.IsFinal,
+			utf8.RuneCountInString(transcript.Text),
+		)
+		hub.Publish(peerID, transcript)
+	})
+
+	return session, nil
+}
+
+func (s *audioSession) Start() {
+	s.startOnce.Do(func() {
+		go func() {
+			select {
+			case err := <-s.pipeline.Errors():
+				log.Printf("[stt] Session %s pipeline failed: %v", s.id, err)
+				s.Close()
+				if s.onFatal != nil {
+					s.onFatal()
+				}
+			case <-s.ctx.Done():
+			}
+		}()
+	})
+}
+
+func (s *audioSession) HandlePCM(pcm []byte) {
+	if s.closed.Load() {
+		return
+	}
+	s.pipeline.HandlePCM(pcm)
+}
+
+func (s *audioSession) HandleTrackEnded() {
+	if s.closed.Load() {
+		return
+	}
+	s.pipeline.HandleTrackEnded()
+}
+
+func (s *audioSession) Close() {
+	s.closeOnce.Do(func() {
+		s.closed.Store(true)
+		s.pipeline.HandleTrackEnded()
+		s.cancel()
+		select {
+		case <-s.pipeline.SenderDone():
+		case <-time.After(500 * time.Millisecond):
+			s.streamCancel()
+			<-s.pipeline.SenderDone()
+		}
+		if err := s.sttClient.Close(); err != nil {
+			log.Printf("[WARN] Session %s STT close failed: %v", s.id, err)
+		}
+		s.streamCancel()
+		if err := s.pipeline.Destroy(); err != nil {
+			log.Printf("[WARN] Session %s pipeline destroy failed: %v", s.id, err)
+		}
+		s.hub.CloseSession(s.id)
+	})
+}
 
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -173,75 +383,45 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// STT gRPC client — retry until the worker is accepting connections.
-	sttClient, err := worker.ConnectSTT(ctx, sttSpec.SocketPath, 30, time.Second)
-	if err != nil {
-		log.Fatalf("Failed to connect to STT worker after retries: %v", err)
-	}
-	defer sttClient.Close()
-	log.Println("[INFO] STT stream established")
-
-	// TTS gRPC clients — retry until each worker is accepting connections.
 	ttsClients, err := worker.ConnectTTS(ctx, ttsSpecs, 30, time.Second, 2*time.Second)
 	if err != nil {
 		log.Fatalf("Failed to connect to TTS workers after retries: %v", err)
 	}
 	defer func() {
 		for _, c := range ttsClients {
-			c.Close()
+			_ = c.Close()
 		}
 	}()
 
-	pipeline, err := speech.NewPipeline(ctx, sttClient, speech.Config{
+	transcripts := newTranscriptHub()
+	peerRegistry := skywebrtc.NewPeerRegistry()
+	speechCfg := speech.Config{
 		ModelPath:            "gateway/models/silero_vad.onnx",
 		Threshold:            0.5,
 		MinSilenceDurationMs: 800,
 		SpeechPadMs:          30,
-	})
-	if err != nil {
-		log.Fatalf("Failed to init speech pipeline: %v", err)
 	}
-	defer func() {
-		if err := pipeline.Destroy(); err != nil {
-			log.Printf("[WARN] Pipeline destroy failed: %v", err)
-		}
-	}()
-	log.Println("[INFO] Silero VAD initialized")
-
-	pipeline.StartTranscriptLoop(func(transcript *pb.Transcript) {
-		log.Printf("[stt] Transcript received (final=%v, chars=%d)", transcript.IsFinal, utf8.RuneCountInString(transcript.Text))
-		if transcript.Text != "" {
-			broadcastTranscript(transcript.Text)
-		}
-	})
-	go func() {
-		select {
-		case err := <-pipeline.Errors():
-			log.Printf("[ERROR] Speech pipeline failed: %v", err)
-			cancel()
-		case <-ctx.Done():
-		}
-	}()
+	log.Println("[INFO] Per-session speech pipeline enabled")
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
+		if _, err := w.Write([]byte("ok")); err != nil {
+			log.Printf("[WARN] health check write error: %v", err)
+		}
 	})
 
-	peerRegistry := skywebrtc.NewPeerRegistry()
 	mux.HandleFunc("/webrtc/offer", skywebrtc.OfferHandler(skywebrtc.PeerConfig{
-		OnPCMAudio:   pipeline.HandlePCM,
-		OnTrackEnded: pipeline.HandleTrackEnded,
+		NewSession: func(peerID string) (skywebrtc.PeerSession, error) {
+			return newAudioSession(ctx, peerID, sttSpec.SocketPath, speechCfg, transcripts, func() {
+				peerRegistry.Close(peerID)
+			})
+		},
 	}, peerRegistry))
 
-	// SSE endpoint for live transcripts
-	mux.HandleFunc("/api/stt/stream", sseHandler)
-
-	// TTS synthesize endpoint
+	mux.HandleFunc("/api/stt/stream", sseHandler(transcripts))
 	mux.HandleFunc("POST /api/tts/synthesize", ttsHandler(ttsClients))
 
-	// Serve the embedded dashboard at /dashboard/
 	dashFS, err := fs.Sub(dashboard.Assets, "dist")
 	if err != nil {
 		log.Fatalf("Failed to mount dashboard: %v", err)
