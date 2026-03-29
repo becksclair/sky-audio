@@ -72,7 +72,7 @@ export function Button({
       type={type}
       class={cx(resolveButtonClass(variant, size), className)}
       disabled={disabled || loading}
-      aria-busy={loading || undefined}
+      aria-busy={loading ? true : undefined}
     >
       {loading ? (
         <span class="inline-flex items-center gap-2">

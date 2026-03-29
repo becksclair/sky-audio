@@ -27,7 +27,7 @@ export function ToolResultCard({
     <Panel
       className={cx('htk-tool-result', className)}
       title={title}
-      description={summary}
+      {...(summary && { description: summary })}
       actions={
         <span class={cx('text-xs font-medium uppercase tracking-[0.12em]', statusTone[status])}>
           {status}
