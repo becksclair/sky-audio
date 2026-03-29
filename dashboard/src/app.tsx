@@ -210,6 +210,35 @@ export function App() {
                 {model.isTTSVoiceFavorite(model.ttsVoice.value) ? "★ Favorited" : "☆ Add to favorites"}
               </Button>
             </div>
+            <div class="flex flex-wrap items-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={!model.ttsVoice.value || model.ttsCatalogBusy.value || !voiceCatalog || model.ttsVoice.value === voiceCatalog?.default}
+                onClick={() => {
+                  if (confirm(`Set "${formatVoiceLabel(model.ttsEngine.value, model.ttsVoice.value)}" as the default voice for ${model.ttsEngine.value}?`)) {
+                    void model.setDefaultVoice(model.ttsEngine.value, model.ttsVoice.value);
+                  }
+                }}
+                title={model.ttsVoice.value === voiceCatalog?.default ? "Already the default voice" : "Set as default voice"}
+              >
+                Set as Default
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                class="text-red-600 hover:text-red-700 hover:bg-red-50"
+                disabled={!model.ttsVoice.value || model.ttsCatalogBusy.value || !voiceCatalog || model.ttsVoice.value === voiceCatalog?.default}
+                onClick={() => {
+                  if (confirm(`Permanently delete "${formatVoiceLabel(model.ttsEngine.value, model.ttsVoice.value)}" from ${model.ttsEngine.value}?\n\nThis will remove the voice from the catalog and cannot be undone.`)) {
+                    void model.deleteVoice(model.ttsEngine.value, model.ttsVoice.value);
+                  }
+                }}
+                title={model.ttsVoice.value === voiceCatalog?.default ? "Cannot delete the default voice" : "Permanently delete this voice"}
+              >
+                Delete Voice
+              </Button>
+            </div>
             <select
               id="tts-voice"
               class="border-input bg-background ring-offset-background focus-visible:ring-ring flex h-9 w-full rounded-md border px-3 py-1 text-sm focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:outline-none"

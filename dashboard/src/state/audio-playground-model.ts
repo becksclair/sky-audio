@@ -91,6 +91,10 @@ export interface AudioPlaygroundController {
   synthesize(): Promise<void>;
   clearError(): void;
   dispose(): void;
+  // Voice management
+  setDefaultVoice(engine: TTSEngine, voice: string): Promise<void>;
+  deleteVoice(engine: TTSEngine, voice: string): Promise<void>;
+  refreshVoiceCatalog(): Promise<void>;
 }
 
 export const AudioPlaygroundModel = createModel(
@@ -146,6 +150,8 @@ export const AudioPlaygroundModel = createModel(
     let transcriptStreamDisconnected = true;
     let connectSeq = 0;
     let voiceCatalogPromise: Promise<void> | null = null;
+    let currentTTSSource: AudioBufferSourceNode | null = null;
+    let currentSynthesisAbort: AbortController | null = null;
 
     function addTranscript(text: string) {
       const next = [...transcripts.value, text];
@@ -398,6 +404,23 @@ export const AudioPlaygroundModel = createModel(
       );
 
       try {
+        // Cancel any in-flight synthesis request
+        if (currentSynthesisAbort) {
+          currentSynthesisAbort.abort();
+        }
+        currentSynthesisAbort = new AbortController();
+        const thisAbort = currentSynthesisAbort;
+
+        // Stop any currently playing TTS audio before starting new playback
+        if (currentTTSSource) {
+          try {
+            currentTTSSource.stop();
+          } catch {
+            // Ignore errors if already stopped
+          }
+          currentTTSSource = null;
+        }
+
         const resp = await fetch("/api/tts/synthesize", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -406,18 +429,40 @@ export const AudioPlaygroundModel = createModel(
             engine: ttsEngine.value,
             voice: selectedVoice,
           }),
+          signal: thisAbort.signal,
         });
+        
+        // If this request was aborted (superseded by a newer request), don't continue
+        if (thisAbort.signal.aborted) {
+          return;
+        }
+        
         if (!resp.ok) {
           const body = await resp.text();
           throw new Error(`TTS failed (${resp.status}): ${body}`);
         }
 
         const arrayBuffer = await resp.arrayBuffer();
+        
+        // Check again if aborted before decoding
+        if (thisAbort.signal.aborted) {
+          return;
+        }
+        
         const ctx = getAudioContext();
         const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
         const source = ctx.createBufferSource();
         source.buffer = audioBuffer;
         source.connect(ctx.destination);
+        
+        // Track the current source and clean up when done
+        currentTTSSource = source;
+        source.onended = () => {
+          if (currentTTSSource === source) {
+            currentTTSSource = null;
+          }
+        };
+        
         source.start();
 
         addTranscript(
@@ -437,10 +482,83 @@ export const AudioPlaygroundModel = createModel(
 
     function dispose() {
       disconnectInternal(false);
+      // Abort any in-flight synthesis request
+      if (currentSynthesisAbort) {
+        currentSynthesisAbort.abort();
+        currentSynthesisAbort = null;
+      }
+      // Stop any playing TTS audio
+      if (currentTTSSource) {
+        try {
+          currentTTSSource.stop();
+        } catch {
+          // Ignore errors if already stopped
+        }
+        currentTTSSource = null;
+      }
       if (audioContext && audioContext.state !== "closed") {
         void audioContext.close();
       }
       audioContext = null;
+    }
+
+    // Voice management functions
+    async function setDefaultVoice(engine: TTSEngine, voice: string): Promise<void> {
+      try {
+        const resp = await fetch("/api/tts/voices/default", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ engine, voice }),
+        });
+        if (!resp.ok) {
+          const body = await resp.text();
+          throw new Error(`Failed to set default voice (${resp.status}): ${body}`);
+        }
+        // Refresh catalog to get updated default
+        await refreshVoiceCatalog();
+        addTranscript(`[Voice] Set ${engine} default to ${voice}`);
+      } catch (caught) {
+        error.value = caught instanceof Error ? caught.message : String(caught);
+        throw caught;
+      }
+    }
+
+    async function deleteVoice(engine: TTSEngine, voice: string): Promise<void> {
+      // Don't allow deleting the default voice
+      const catalog = ttsCatalogs.value[engine];
+      if (catalog?.default === voice) {
+        throw new Error(`Cannot delete the default voice. Set a different default first.`);
+      }
+
+      try {
+        const resp = await fetch(`/api/tts/voices/${encodeURIComponent(engine)}/${encodeURIComponent(voice)}`, {
+          method: "DELETE",
+        });
+        if (!resp.ok) {
+          const body = await resp.text();
+          throw new Error(`Failed to delete voice (${resp.status}): ${body}`);
+        }
+        // Refresh catalog to get updated list
+        await refreshVoiceCatalog();
+        // If we deleted the currently selected voice, clear it
+        if (ttsVoiceSelections.value[engine] === voice) {
+          setTTSVoice("");
+        }
+        // Remove from favorites if it was there
+        if (isTTSVoiceFavorite(voice)) {
+          toggleTTSVoiceFavorite(voice);
+        }
+        addTranscript(`[Voice] Deleted ${voice} from ${engine}`);
+      } catch (caught) {
+        error.value = caught instanceof Error ? caught.message : String(caught);
+        throw caught;
+      }
+    }
+
+    async function refreshVoiceCatalog(): Promise<void> {
+      voiceCatalogPromise = null; // Reset cache
+      ttsCatalogs.value = {}; // Clear current catalogs
+      await ensureTTSVoicesLoaded();
     }
 
     void ensureTTSVoicesLoaded();
@@ -470,6 +588,9 @@ export const AudioPlaygroundModel = createModel(
       synthesize,
       clearError,
       dispose,
+      setDefaultVoice,
+      deleteVoice,
+      refreshVoiceCatalog,
     };
   },
 );

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/heliasar/sky-audio/gateway/pkg/audio"
 	skywebrtc "github.com/heliasar/sky-audio/gateway/pkg/webrtc"
 )
 
@@ -197,7 +198,10 @@ func handleTranscription(w http.ResponseWriter, r *http.Request, transcriber STT
 	}
 
 	// Decode audio to PCM16 at 16kHz (required by NeMo/Parakeet)
-	pcmData, sampleRate, err := decodeAudioToPCM(req.File)
+	// Use a shorter timeout for decode to prevent resource exhaustion
+	decodeCtx, decodeCancel := context.WithTimeout(r.Context(), 35*time.Second)
+	defer decodeCancel()
+	pcmData, sampleRate, err := decodeAudioToPCM(decodeCtx, req.File)
 	if err != nil {
 		writeTTSError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("Failed to decode audio: %v", err))
 		return
@@ -327,54 +331,30 @@ func isValidSTTModel(model string) bool {
 	}
 }
 
-// decodeAudioToPCM decodes uploaded audio to PCM16 at 16kHz
-// This is a placeholder - real implementation would use ffmpeg or audio library
-func decodeAudioToPCM(data []byte) ([]byte, int32, error) {
+// decodeAudioToPCM decodes uploaded audio to PCM16 at 16kHz mono.
+// It supports multiple input formats: WAV, MP3, OGG, FLAC, M4A, WebM, Opus, 3GP.
+// Uses native decoder for WAV and ffmpeg for other formats.
+func decodeAudioToPCM(ctx context.Context, data []byte) ([]byte, int32, error) {
 	// Detect format from magic bytes
-	format := detectAudioFormat(data)
+	format := audio.DetectFormat(data)
 
-	switch format {
-	case "wav":
+	// Use native WAV decoder for pure WAV files (fast path)
+	if format == audio.FormatWAV {
 		return decodeWAV(data)
-	case "mp3":
-		return nil, 0, errors.New("MP3 decoding not yet implemented, please use WAV format")
-	case "ogg":
-		return nil, 0, errors.New("OGG/Opus decoding not yet implemented, please use WAV format")
-	case "flac":
-		return nil, 0, errors.New("FLAC decoding not yet implemented, please use WAV format")
-	case "unknown":
-		return nil, 0, errors.New("unrecognized audio format; supported formats: wav")
-	default:
-		return nil, 0, errors.New("unsupported audio format; supported formats: wav")
-	}
-}
-
-func detectAudioFormat(data []byte) string {
-	if len(data) < 12 {
-		return "unknown"
 	}
 
-	// WAV: RIFF....WAVE
-	if bytes.Equal(data[0:4], []byte("RIFF")) && bytes.Equal(data[8:12], []byte("WAVE")) {
-		return "wav"
+	// For all other formats, use ffmpeg
+	decoder := &audio.FFmpegDecoder{}
+	if !decoder.Supports(format) {
+		return nil, 0, fmt.Errorf("unsupported audio format: %s (supported: wav, mp3, ogg, flac, m4a, webm, opus, 3gp)", format)
 	}
 
-	// MP3: ID3 or MPEG sync word
-	if bytes.Equal(data[0:3], []byte("ID3")) || (data[0] == 0xFF && (data[1]&0xE0) == 0xE0) {
-		return "mp3"
+	result, err := decoder.Decode(ctx, data, format)
+	if err != nil {
+		return nil, 0, fmt.Errorf("audio decode failed: %w", err)
 	}
 
-	// OGG: OggS
-	if bytes.Equal(data[0:4], []byte("OggS")) {
-		return "ogg"
-	}
-
-	// FLAC: fLaC
-	if bytes.Equal(data[0:4], []byte("fLaC")) {
-		return "flac"
-	}
-
-	return "unknown"
+	return result.PCM, result.SampleRate, nil
 }
 
 // decodeWAV parses simple WAV files and extracts PCM data

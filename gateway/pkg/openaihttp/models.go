@@ -2,6 +2,7 @@ package openaihttp
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 	"time"
 )
@@ -77,7 +78,9 @@ func ModelsHandler() http.HandlerFunc {
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(resp)
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			log.Printf("[models] failed to encode response: %v", err)
+		}
 	}
 }
 
@@ -110,7 +113,9 @@ func ModelsRetrieveHandler() http.HandlerFunc {
 			if model.ID == modelID {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusOK)
-				_ = json.NewEncoder(w).Encode(model)
+				if err := json.NewEncoder(w).Encode(model); err != nil {
+					log.Printf("[models] failed to encode model: %v", err)
+				}
 				return
 			}
 		}

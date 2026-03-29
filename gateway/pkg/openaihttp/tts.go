@@ -2,7 +2,7 @@
 // This allows OpenClaw and other OpenAI-compatible clients to use sky-audio.
 //
 // OpenAI Compatibility:
-//   - POST /v1/audio/speech - TTS synthesis (returns WAV audio)
+//   - POST /v1/audio/speech - TTS synthesis (returns OGG/Opus audio by default)
 //   - POST /v1/audio/transcriptions - STT transcription (multipart upload)
 //   - GET /v1/models - List available models
 //
@@ -11,11 +11,14 @@
 //   - sky-pocket, tts-1 -> PocketTTS (fast)
 //   - whisper-1, sky-nemo-parakeet -> NeMo Parakeet STT
 //
+// Audio Formats:
+//   - Default: opus (Ogg/Opus container)
+//   - Supported: opus, mp3, aac, flac, wav, pcm
+//
 // See docs/openclaw-integration.md for detailed setup instructions.
 package openaihttp
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -53,11 +56,16 @@ type TTSError struct {
 type TTSResponseFormat string
 
 const (
-	FormatWAV  TTSResponseFormat = "wav"
-	FormatMP3  TTSResponseFormat = "mp3"
-	FormatOpus TTSResponseFormat = "opus"
-	FormatPCM  TTSResponseFormat = "pcm"
+	FormatOpus TTSResponseFormat = "opus"  // Default: Ogg/Opus, best for voice
+	FormatMP3  TTSResponseFormat = "mp3"   // Widely compatible
+	FormatAAC  TTSResponseFormat = "aac"  // AAC in ADTS
+	FormatFLAC TTSResponseFormat = "flac" // Lossless compression
+	FormatWAV  TTSResponseFormat = "wav"  // Uncompressed PCM in WAV
+	FormatPCM  TTSResponseFormat = "pcm"  // Raw PCM s16le
 )
+
+// DefaultResponseFormat is the default audio format for TTS.
+const DefaultResponseFormat = FormatOpus
 
 // Model mapping from OpenAI-style model IDs to internal engine names
 var modelToEngine = map[string]string{
@@ -143,10 +151,23 @@ func TTSHandlerWithSynth(synthesizers map[string]TTSSynthesizer) http.HandlerFun
 			return
 		}
 
-		// Determine response format
+		// Determine response format (default is opus per OpenAI best practices for voice)
+		// Fall back to WAV if ffmpeg is not available
 		format := TTSResponseFormat(strings.ToLower(req.ResponseFormat))
 		if format == "" {
-			format = FormatWAV // We only support WAV (OpenAI default is MP3, but we deviate)
+			if audio.IsFfmpegAvailable() {
+				format = DefaultResponseFormat
+			} else {
+				format = FormatWAV
+			}
+		}
+
+		// Validate format
+		encoder := &audio.FFmpegEncoder{}
+		if !encoder.Supports(string(format)) {
+			writeTTSError(w, http.StatusBadRequest, "invalid_request_error",
+				fmt.Sprintf("Unsupported response_format: '%s'. Supported: opus, mp3, aac, flac, wav, pcm", format))
+			return
 		}
 
 		// Synthesize
@@ -163,37 +184,26 @@ func TTSHandlerWithSynth(synthesizers map[string]TTSSynthesizer) http.HandlerFun
 			return
 		}
 
-		// Encode response based on format
-		var body []byte
-		contentType := "audio/wav"
-		switch format {
-		case FormatWAV:
-			var buf bytes.Buffer
-			if err := audio.WriteWAV(&buf, pcm, sampleRate); err != nil {
-				writeTTSError(w, http.StatusInternalServerError, "api_error", fmt.Sprintf("WAV encoding failed: %v", err))
-				return
-			}
-			body = buf.Bytes()
-			contentType = "audio/wav"
-		case FormatPCM:
-			body = pcm
-			contentType = "audio/pcm; rate=" + strconv.Itoa(int(sampleRate))
-		case FormatMP3, FormatOpus:
-			// MP3 and Opus are not supported - return error instead of silent fallback
-			// This is clearer for clients than returning WAV when MP3 was requested
-			writeTTSError(w, http.StatusNotImplemented, "api_error",
-				fmt.Sprintf("Format '%s' is not supported. Supported formats: wav, pcm", format))
-			return
-		default:
-			writeTTSError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("Unsupported response_format: '%s'", format))
+		// Encode to requested format
+		encodeCtx, encodeCancel := context.WithTimeout(r.Context(), 35*time.Second)
+		defer encodeCancel()
+
+		result, err := encoder.Encode(encodeCtx, pcm, sampleRate, string(format))
+		if err != nil {
+			log.Printf("[tts] encode error: %v", err)
+			writeTTSError(w, http.StatusInternalServerError, "api_error", "Audio encoding failed")
 			return
 		}
+
+		body := result.Body
+		contentType := result.ContentType
 
 		w.Header().Set("Content-Type", contentType)
 		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 		w.WriteHeader(http.StatusOK)
 		if _, err := w.Write(body); err != nil {
 			// Client disconnected or write failed - log but don't try to write error
+			log.Printf("[tts] write response error: %v", err)
 			return
 		}
 	}
@@ -234,7 +244,9 @@ func writeError(w http.ResponseWriter, status int, errType, message string) {
 	err.Error.Type = errType
 	err.Error.Message = message
 	err.Error.Code = strconv.Itoa(status)
-	_ = json.NewEncoder(w).Encode(err)
+	if encodeErr := json.NewEncoder(w).Encode(err); encodeErr != nil {
+		log.Printf("[openaihttp] failed to encode error response: %v", encodeErr)
+	}
 }
 
 // writeTTSError is an alias for writeError for backward compatibility

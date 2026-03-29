@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"testing"
@@ -16,6 +17,33 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 )
+
+// killCompetingGPUProcesses kills other audio workers that might be using GPU memory.
+// This prevents CUDA out-of-memory errors when Kyutai TTS tries to allocate memory.
+// Call this before running TTS tests that require GPU when other workers may be running.
+func killCompetingGPUProcesses(t *testing.T) {
+	t.Helper()
+
+	// Patterns for processes to kill - only GPU-using workers
+	// Note: We don't kill pocket-tts as it's CPU-based
+	patterns := []string{
+		"python.*nemo",
+		"python.*stt-worker",
+	}
+
+	killedAny := false
+	for _, pattern := range patterns {
+		cmd := exec.Command("pkill", "-9", "-f", pattern)
+		if err := cmd.Run(); err == nil {
+			killedAny = true
+		}
+	}
+
+	if killedAny {
+		t.Log("Killed competing GPU processes, waiting for memory release...")
+		time.Sleep(2 * time.Second)
+	}
+}
 
 type ttsVoiceCatalog struct {
 	Default string   `json:"default"`
@@ -199,6 +227,7 @@ func TestTTSWorkerDirectPocket(t *testing.T) {
 }
 
 func TestTTSWorkerDirectKyutai(t *testing.T) {
+	killCompetingGPUProcesses(t)
 	assertTTSVoiceSynthesizes(t, "/tmp/sky-audio-tts-kyutai.sock", "KyutaiTTS", "")
 }
 
@@ -241,6 +270,7 @@ func TestTTSWorkerPocketVoiceSynthesisSubset(t *testing.T) {
 }
 
 func TestTTSWorkerKyutaiVoiceSynthesisSubset(t *testing.T) {
+	killCompetingGPUProcesses(t)
 	catalog := loadTTSVoiceCatalog(t, "workers/python-kyutai-tts/voices.json")
 	for _, voice := range pickVoiceSamples(catalog, 3) {
 		voice := voice
