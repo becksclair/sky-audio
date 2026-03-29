@@ -50,7 +50,7 @@ func (m *Manager) Spawn(ctx context.Context, cfg SpawnConfig) error {
 	m.mu.Unlock()
 
 	cmd := exec.CommandContext(ctx, cfg.Command, cfg.Args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL, Setpgid: true}
 	if cfg.Dir != "" {
 		cmd.Dir = cfg.Dir
 	}
@@ -218,10 +218,14 @@ func (m *Manager) Kill(name string) error {
 	m.mu.Unlock()
 
 	if w.cmd.Process != nil {
-		if err := w.cmd.Process.Kill(); err != nil {
-			// Wait for the exit goroutine to clean up even if Kill failed
-			<-w.done
-			return fmt.Errorf("kill %s: %w", name, err)
+		// Kill the entire process group to also reap torch compile workers and other subprocesses
+		pgid := w.cmd.Process.Pid
+		if killErr := syscall.Kill(-pgid, syscall.SIGKILL); killErr != nil {
+			// Fallback to killing just the direct process
+			if err := w.cmd.Process.Kill(); err != nil {
+				<-w.done
+				return fmt.Errorf("kill %s: %w", name, err)
+			}
 		}
 	}
 	// Wait for the exit goroutine to reap the process and remove it from the map

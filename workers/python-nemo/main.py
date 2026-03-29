@@ -30,17 +30,20 @@ def load_model() -> torch.nn.Module:
     import nemo.collections.asr as nemo_asr  # type: ignore[import-unresolved]
 
     logger.info("Loading model %s...", MODEL_NAME)
-    loaded = nemo_asr.models.ASRModel.from_pretrained(model_name=MODEL_NAME)
+    # Force CPU loading to avoid NeMo auto-placing on CUDA (which doubles
+    # peak VRAM because from_pretrained loads fp32 on GPU, then .half()
+    # must convert in-place).  Loading on CPU first lets us move only the
+    # fp16 weights to the GPU, cutting peak VRAM from ~2.4 GiB to ~1.2 GiB.
+    loaded = nemo_asr.models.ASRModel.from_pretrained(
+        model_name=MODEL_NAME, map_location="cpu"
+    )
     assert isinstance(loaded, torch.nn.Module), f"Expected Module, got {type(loaded)}"
     model: torch.nn.Module = loaded
     model.eval()
 
-    if torch.cuda.is_available():
-        model = model.cuda()
-        model = model.half()
-        logger.info("Model loaded on CUDA with float16")
-    else:
-        logger.warning("CUDA not available, running on CPU (float32)")
+    # Run on CPU to avoid competing for VRAM with TTS models (Kyutai uses ~4.4 GiB).
+    # Parakeet is fast enough on CPU for transcription latency requirements.
+    logger.info("Model loaded on CPU (float32) — VRAM reserved for TTS")
 
     return model
 
