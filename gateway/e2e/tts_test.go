@@ -2,17 +2,89 @@ package e2e
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"os"
+	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
 	pb "github.com/heliasar/sky-audio/gateway/pkg/pb"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
-func testTTSWorkerDirect(t *testing.T, socketPath, engineName string) {
+type ttsVoiceCatalog struct {
+	Default string   `json:"default"`
+	Voices  []string `json:"voices"`
+}
+
+func repoRoot(t *testing.T) string {
+	t.Helper()
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("failed to locate test file")
+	}
+	return filepath.Clean(filepath.Join(filepath.Dir(file), "../.."))
+}
+
+func loadTTSVoiceCatalog(t *testing.T, relativePath string) ttsVoiceCatalog {
+	t.Helper()
+	catalogPath := filepath.Join(repoRoot(t), relativePath)
+	data, err := os.ReadFile(catalogPath)
+	if err != nil {
+		t.Fatalf("read voice catalog %s: %v", catalogPath, err)
+	}
+	var catalog ttsVoiceCatalog
+	if err := json.Unmarshal(data, &catalog); err != nil {
+		t.Fatalf("decode voice catalog %s: %v", catalogPath, err)
+	}
+	if catalog.Default == "" || len(catalog.Voices) == 0 {
+		t.Fatalf("voice catalog %s is empty", catalogPath)
+	}
+	return catalog
+}
+
+func pickVoiceSamples(catalog ttsVoiceCatalog, count int) []string {
+	if count <= 0 {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	out := make([]string, 0, count)
+	appendVoice := func(voice string) {
+		if len(out) >= count || voice == "" {
+			return
+		}
+		if _, ok := seen[voice]; ok {
+			return
+		}
+		seen[voice] = struct{}{}
+		out = append(out, voice)
+	}
+
+	appendVoice(catalog.Default)
+	for _, idx := range []int{0, len(catalog.Voices) / 2, len(catalog.Voices) - 1} {
+		if idx >= 0 && idx < len(catalog.Voices) {
+			appendVoice(catalog.Voices[idx])
+		}
+	}
+	for _, voice := range catalog.Voices {
+		appendVoice(voice)
+		if len(out) >= count {
+			break
+		}
+	}
+	return out
+}
+
+func allTTSVoicesEnabled() bool {
+	return os.Getenv("SKY_AUDIO_E2E_ALL_TTS_VOICES") == "1"
+}
+
+func runTTSWorkerDirect(t *testing.T, socketPath, engineName, text, voice string) (int, int32, bool, error) {
 	t.Helper()
 
 	if _, err := os.Stat(socketPath); err != nil {
@@ -37,7 +109,7 @@ func testTTSWorkerDirect(t *testing.T, socketPath, engineName string) {
 		t.Skipf("SynthesizeStream: %v", err)
 	}
 
-	if err := stream.Send(&pb.TextToken{Text: "Hello, this is a test.", IsEos: true}); err != nil {
+	if err := stream.Send(&pb.TextToken{Text: text, IsEos: true, Voice: voice}); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 	if err := stream.CloseSend(); err != nil {
@@ -50,22 +122,50 @@ func testTTSWorkerDirect(t *testing.T, socketPath, engineName string) {
 	for {
 		chunk, err := stream.Recv()
 		if err == io.EOF {
-			break
+			return totalPCM, sampleRate, gotEOS, nil
 		}
 		if err != nil {
-			t.Fatalf("Recv: %v", err)
+			return totalPCM, sampleRate, gotEOS, err
 		}
 		if chunk.IsEndOfSpeech {
 			gotEOS = true
 			sampleRate = chunk.SampleRate
-			break
+			return totalPCM, sampleRate, gotEOS, nil
 		}
 		totalPCM += len(chunk.PcmData)
 		sampleRate = chunk.SampleRate
 	}
+}
 
-	t.Logf("[%s] PCM: %d bytes, sample_rate=%d, EOS=%v", engineName, totalPCM, sampleRate, gotEOS)
+func assertTTSVoiceAccepted(t *testing.T, socketPath, engineName, voice string) {
+	t.Helper()
+	totalPCM, sampleRate, gotEOS, err := runTTSWorkerDirect(t, socketPath, engineName, "", voice)
+	if err != nil {
+		t.Fatalf("voice %q rejected: %v", voice, err)
+	}
+	if totalPCM != 0 {
+		t.Fatalf("voice %q returned %d PCM bytes for empty text, want 0", voice, totalPCM)
+	}
+	if sampleRate == 0 {
+		t.Fatalf("voice %q returned zero sample rate", voice)
+	}
+	if !gotEOS {
+		t.Fatalf("voice %q did not end stream", voice)
+	}
+}
 
+func assertTTSVoiceSynthesizes(t *testing.T, socketPath, engineName, voice string) {
+	t.Helper()
+	totalPCM, sampleRate, gotEOS, err := runTTSWorkerDirect(
+		t,
+		socketPath,
+		engineName,
+		"Hello, this is a test.",
+		voice,
+	)
+	if err != nil {
+		t.Fatalf("voice %q synth failed: %v", voice, err)
+	}
 	if totalPCM == 0 {
 		t.Fatal("Expected non-empty PCM audio")
 	}
@@ -77,16 +177,83 @@ func testTTSWorkerDirect(t *testing.T, socketPath, engineName string) {
 	}
 
 	durationSec := float64(totalPCM) / float64(sampleRate*2)
-	t.Logf("[%s] Audio duration: %.2fs", engineName, durationSec)
+	t.Logf("[%s] voice=%s PCM=%d sample_rate=%d duration=%.2fs", engineName, voice, totalPCM, sampleRate, durationSec)
 	if durationSec < 0.1 {
 		t.Errorf("Audio too short: %.2fs", durationSec)
 	}
 }
 
+func assertTTSVoiceRejected(t *testing.T, socketPath, engineName, voice string) {
+	t.Helper()
+	_, _, _, err := runTTSWorkerDirect(t, socketPath, engineName, "hello", voice)
+	if err == nil {
+		t.Fatalf("voice %q unexpectedly succeeded", voice)
+	}
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("voice %q error code = %s, want %s (%v)", voice, status.Code(err), codes.InvalidArgument, err)
+	}
+}
+
 func TestTTSWorkerDirectPocket(t *testing.T) {
-	testTTSWorkerDirect(t, "/tmp/sky-audio-tts-pocket.sock", "PocketTTS")
+	assertTTSVoiceSynthesizes(t, "/tmp/sky-audio-tts-pocket.sock", "PocketTTS", "")
 }
 
 func TestTTSWorkerDirectKyutai(t *testing.T) {
-	testTTSWorkerDirect(t, "/tmp/sky-audio-tts-kyutai.sock", "KyutaiTTS")
+	assertTTSVoiceSynthesizes(t, "/tmp/sky-audio-tts-kyutai.sock", "KyutaiTTS", "")
+}
+
+func TestTTSWorkerPocketVoiceCatalog(t *testing.T) {
+	catalog := loadTTSVoiceCatalog(t, "workers/python-pocket-tts/voices.json")
+	voices := pickVoiceSamples(catalog, 4)
+	if allTTSVoicesEnabled() {
+		voices = catalog.Voices
+	}
+	for _, voice := range voices {
+		voice := voice
+		t.Run(voice, func(t *testing.T) {
+			assertTTSVoiceAccepted(t, "/tmp/sky-audio-tts-pocket.sock", "PocketTTS", voice)
+		})
+	}
+}
+
+func TestTTSWorkerKyutaiVoiceCatalog(t *testing.T) {
+	catalog := loadTTSVoiceCatalog(t, "workers/python-kyutai-tts/voices.json")
+	voices := pickVoiceSamples(catalog, 4)
+	if allTTSVoicesEnabled() {
+		voices = catalog.Voices
+	}
+	for _, voice := range voices {
+		voice := voice
+		t.Run(voice, func(t *testing.T) {
+			assertTTSVoiceAccepted(t, "/tmp/sky-audio-tts-kyutai.sock", "KyutaiTTS", voice)
+		})
+	}
+}
+
+func TestTTSWorkerPocketVoiceSynthesisSubset(t *testing.T) {
+	catalog := loadTTSVoiceCatalog(t, "workers/python-pocket-tts/voices.json")
+	for _, voice := range pickVoiceSamples(catalog, 3) {
+		voice := voice
+		t.Run(voice, func(t *testing.T) {
+			assertTTSVoiceSynthesizes(t, "/tmp/sky-audio-tts-pocket.sock", "PocketTTS", voice)
+		})
+	}
+}
+
+func TestTTSWorkerKyutaiVoiceSynthesisSubset(t *testing.T) {
+	catalog := loadTTSVoiceCatalog(t, "workers/python-kyutai-tts/voices.json")
+	for _, voice := range pickVoiceSamples(catalog, 3) {
+		voice := voice
+		t.Run(voice, func(t *testing.T) {
+			assertTTSVoiceSynthesizes(t, "/tmp/sky-audio-tts-kyutai.sock", "KyutaiTTS", voice)
+		})
+	}
+}
+
+func TestTTSWorkerPocketRejectsUnknownVoice(t *testing.T) {
+	assertTTSVoiceRejected(t, "/tmp/sky-audio-tts-pocket.sock", "PocketTTS", "not-a-real-pocket-voice")
+}
+
+func TestTTSWorkerKyutaiRejectsUnknownVoice(t *testing.T) {
+	assertTTSVoiceRejected(t, "/tmp/sky-audio-tts-kyutai.sock", "KyutaiTTS", "not/a/real/kyutai.wav")
 }

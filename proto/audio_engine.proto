@@ -29,6 +29,7 @@ message Transcript {
 message TextToken {
   string text = 1;
   bool is_eos = 2;
+  string voice = 3;
 }
 
 message WorkerStatus {

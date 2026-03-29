@@ -10,6 +10,14 @@ const MAX_TRANSCRIPTS = 200;
 export type ConnectionStatus = "disconnected" | "connecting" | "connected";
 export type TTSEngine = "pocket" | "kyutai";
 
+export interface TTSVoiceCatalog {
+  default: string;
+  voices: string[];
+}
+
+type TTSVoiceCatalogMap = Partial<Record<TTSEngine, TTSVoiceCatalog>>;
+type TTSVoiceSelectionMap = Record<TTSEngine, string>;
+
 interface OfferResponse {
   sdp: string;
   type: RTCSdpType;
@@ -21,6 +29,38 @@ interface TranscriptPayload {
   isFinal?: boolean;
 }
 
+type TTSVoiceFavoritesMap = Record<TTSEngine, Set<string>>;
+
+const FAVORITES_STORAGE_KEY = "sky-audio:tts-favorites:v1";
+
+function loadFavoritesFromStorage(): TTSVoiceFavoritesMap {
+  try {
+    const raw = localStorage.getItem(FAVORITES_STORAGE_KEY);
+    if (!raw) {
+      return { pocket: new Set(), kyutai: new Set() };
+    }
+    const parsed = JSON.parse(raw) as Record<TTSEngine, string[]>;
+    return {
+      pocket: new Set(parsed.pocket ?? []),
+      kyutai: new Set(parsed.kyutai ?? []),
+    };
+  } catch {
+    return { pocket: new Set(), kyutai: new Set() };
+  }
+}
+
+function saveFavoritesToStorage(favorites: TTSVoiceFavoritesMap) {
+  try {
+    const serializable = {
+      pocket: [...favorites.pocket],
+      kyutai: [...favorites.kyutai],
+    };
+    localStorage.setItem(FAVORITES_STORAGE_KEY, JSON.stringify(serializable));
+  } catch {
+    // Ignore storage errors (e.g., private mode)
+  }
+}
+
 export interface AudioPlaygroundController {
   readonly status: ReadonlySignal<ConnectionStatus>;
   readonly transcripts: ReadonlySignal<string[]>;
@@ -28,12 +68,21 @@ export interface AudioPlaygroundController {
   readonly sessionId: ReadonlySignal<string | null>;
   readonly ttsInput: ReadonlySignal<string>;
   readonly ttsEngine: ReadonlySignal<TTSEngine>;
+  readonly ttsVoice: ReadonlySignal<string>;
+  readonly ttsCatalog: ReadonlySignal<TTSVoiceCatalog | null>;
+  readonly ttsCatalogBusy: ReadonlySignal<boolean>;
+  readonly ttsCatalogError: ReadonlySignal<string | null>;
   readonly ttsBusy: ReadonlySignal<boolean>;
+  readonly ttsVoiceFavorites: ReadonlySignal<Set<string>>;
   readonly canSynthesize: ReadonlySignal<boolean>;
   connect(): Promise<void>;
   disconnect(): void;
   setTTSInput(value: string): void;
-  setTTSEngine(value: TTSEngine): void;
+  setTTSEngine(value: TTSEngine): Promise<void>;
+  setTTSVoice(value: string): void;
+  toggleTTSVoiceFavorite(voice: string): void;
+  isTTSVoiceFavorite(voice: string): boolean;
+  ensureTTSVoicesLoaded(): Promise<void>;
   synthesize(): Promise<void>;
   clearError(): void;
   dispose(): void;
@@ -47,6 +96,39 @@ export const AudioPlaygroundModel = createModel(
     const sessionId = signal<string | null>(null);
     const ttsInput = signal("");
     const ttsEngine = signal<TTSEngine>("pocket");
+    const ttsCatalogs = signal<TTSVoiceCatalogMap>({});
+    const ttsCatalogBusy = signal(false);
+    const ttsCatalogError = signal<string | null>(null);
+    const ttsVoiceSelections = signal<TTSVoiceSelectionMap>({
+      pocket: "",
+      kyutai: "",
+    });
+    const ttsVoice = computed(() => ttsVoiceSelections.value[ttsEngine.value] ?? "");
+    const ttsCatalog = computed(() => ttsCatalogs.value[ttsEngine.value] ?? null);
+
+    const ttsVoiceFavoritesMap = signal<TTSVoiceFavoritesMap>(loadFavoritesFromStorage());
+    const ttsVoiceFavorites = computed(() => ttsVoiceFavoritesMap.value[ttsEngine.value] ?? new Set());
+
+    function isTTSVoiceFavorite(voice: string) {
+      return ttsVoiceFavoritesMap.value[ttsEngine.value]?.has(voice) ?? false;
+    }
+
+    function toggleTTSVoiceFavorite(voice: string) {
+      const currentEngine = ttsEngine.value;
+      const currentFavorites = ttsVoiceFavoritesMap.value[currentEngine] ?? new Set();
+      const nextFavorites = new Set(currentFavorites);
+      if (nextFavorites.has(voice)) {
+        nextFavorites.delete(voice);
+      } else {
+        nextFavorites.add(voice);
+      }
+      ttsVoiceFavoritesMap.value = {
+        ...ttsVoiceFavoritesMap.value,
+        [currentEngine]: nextFavorites,
+      };
+      saveFavoritesToStorage(ttsVoiceFavoritesMap.value);
+    }
+
     const ttsBusy = signal(false);
     const canSynthesize = computed(
       () => !ttsBusy.value && ttsInput.value.trim().length > 0,
@@ -58,6 +140,7 @@ export const AudioPlaygroundModel = createModel(
     let audioContext: AudioContext | null = null;
     let transcriptStreamDisconnected = true;
     let connectSeq = 0;
+    let voiceCatalogPromise: Promise<void> | null = null;
 
     function addTranscript(text: string) {
       const next = [...transcripts.value, text];
@@ -73,8 +156,60 @@ export const AudioPlaygroundModel = createModel(
       ttsInput.value = value;
     }
 
-    function setTTSEngine(value: TTSEngine) {
+    async function ensureTTSVoicesLoaded() {
+      if (ttsCatalogs.value.pocket && ttsCatalogs.value.kyutai) {
+        return;
+      }
+      if (voiceCatalogPromise) {
+        return voiceCatalogPromise;
+      }
+
+      voiceCatalogPromise = (async () => {
+        ttsCatalogBusy.value = true;
+        ttsCatalogError.value = null;
+        try {
+          const resp = await fetch("/api/tts/voices");
+          if (!resp.ok) {
+            throw new Error(`voice catalog request failed (${resp.status})`);
+          }
+
+          const payload = (await resp.json()) as TTSVoiceCatalogMap;
+          const pocketCatalog = payload.pocket;
+          const kyutaiCatalog = payload.kyutai;
+          if (!pocketCatalog || !kyutaiCatalog) {
+            throw new Error("voice catalog response was incomplete");
+          }
+
+          ttsCatalogs.value = {
+            pocket: pocketCatalog,
+            kyutai: kyutaiCatalog,
+          };
+          ttsVoiceSelections.value = {
+            pocket: ttsVoiceSelections.value.pocket || pocketCatalog.default || "",
+            kyutai: ttsVoiceSelections.value.kyutai || kyutaiCatalog.default || "",
+          };
+        } catch (caught) {
+          const message = caught instanceof Error ? caught.message : String(caught);
+          ttsCatalogError.value = message;
+        } finally {
+          ttsCatalogBusy.value = false;
+          voiceCatalogPromise = null;
+        }
+      })();
+
+      return voiceCatalogPromise;
+    }
+
+    async function setTTSEngine(value: TTSEngine) {
       ttsEngine.value = value;
+      await ensureTTSVoicesLoaded();
+    }
+
+    function setTTSVoice(value: string) {
+      ttsVoiceSelections.value = {
+        ...ttsVoiceSelections.value,
+        [ttsEngine.value]: value,
+      };
     }
 
     function getAudioContext() {
@@ -244,15 +379,28 @@ export const AudioPlaygroundModel = createModel(
         return;
       }
 
+      await ensureTTSVoicesLoaded();
+      if (ttsCatalogError.value) {
+        error.value = ttsCatalogError.value;
+        return;
+      }
+
       ttsBusy.value = true;
       error.value = null;
-      addTranscript(`[TTS:${ttsEngine.value}] "${text}"`);
+      const selectedVoice = ttsVoice.value.trim();
+      addTranscript(
+        `[TTS:${ttsEngine.value}${selectedVoice ? `:${selectedVoice}` : ""}] "${text}"`,
+      );
 
       try {
         const resp = await fetch("/api/tts/synthesize", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text, engine: ttsEngine.value }),
+          body: JSON.stringify({
+            text,
+            engine: ttsEngine.value,
+            voice: selectedVoice,
+          }),
         });
         if (!resp.ok) {
           const body = await resp.text();
@@ -268,7 +416,7 @@ export const AudioPlaygroundModel = createModel(
         source.start();
 
         addTranscript(
-          `[TTS:${ttsEngine.value}] ▶ Playing ${audioBuffer.duration.toFixed(1)}s audio`,
+          `[TTS:${ttsEngine.value}${selectedVoice ? `:${selectedVoice}` : ""}] ▶ Playing ${audioBuffer.duration.toFixed(1)}s audio`,
         );
         ttsInput.value = "";
       } catch (caught) {
@@ -290,6 +438,8 @@ export const AudioPlaygroundModel = createModel(
       audioContext = null;
     }
 
+    void ensureTTSVoicesLoaded();
+
     return {
       status,
       transcripts,
@@ -297,12 +447,21 @@ export const AudioPlaygroundModel = createModel(
       sessionId,
       ttsInput,
       ttsEngine,
+      ttsVoice,
+      ttsCatalog,
+      ttsCatalogBusy,
+      ttsCatalogError,
       ttsBusy,
+      ttsVoiceFavorites,
       canSynthesize,
       connect,
       disconnect,
       setTTSInput,
       setTTSEngine,
+      setTTSVoice,
+      toggleTTSVoiceFavorite,
+      isTTSVoiceFavorite,
+      ensureTTSVoicesLoaded,
       synthesize,
       clearError,
       dispose,

@@ -38,6 +38,11 @@ const (
 	maxTTSBodyBytes = 25600
 )
 
+var ttsVoiceCatalogPaths = map[string]string{
+	"pocket": "workers/python-pocket-tts/voices.json",
+	"kyutai": "workers/python-kyutai-tts/voices.json",
+}
+
 type sseClient struct {
 	ch chan string
 }
@@ -420,6 +425,7 @@ func main() {
 	}, peerRegistry))
 
 	mux.HandleFunc("/api/stt/stream", sseHandler(transcripts))
+	mux.HandleFunc("GET /api/tts/voices", ttsVoicesHandler(ttsVoiceCatalogPaths))
 	mux.HandleFunc("POST /api/tts/synthesize", ttsHandler(ttsClients))
 
 	dashFS, err := fs.Sub(dashboard.Assets, "dist")
@@ -458,18 +464,24 @@ func main() {
 type ttsRequest struct {
 	Text   string `json:"text"`
 	Engine string `json:"engine"`
+	Voice  string `json:"voice"`
+}
+
+type ttsVoiceCatalog struct {
+	Default string   `json:"default"`
+	Voices  []string `json:"voices"`
 }
 
 type ttsSynthesizer interface {
-	Synthesize(ctx context.Context, text string) (pcm []byte, sampleRate int32, err error)
+	Synthesize(ctx context.Context, text, voice string) (pcm []byte, sampleRate int32, err error)
 }
 
 type ttsClientAdapter struct {
 	client *skywebrtc.TTSClient
 }
 
-func (a ttsClientAdapter) Synthesize(ctx context.Context, text string) ([]byte, int32, error) {
-	return a.client.Synthesize(ctx, text)
+func (a ttsClientAdapter) Synthesize(ctx context.Context, text, voice string) ([]byte, int32, error) {
+	return a.client.Synthesize(ctx, text, voice)
 }
 
 func ttsHandler(clients map[string]*skywebrtc.TTSClient) http.HandlerFunc {
@@ -478,6 +490,40 @@ func ttsHandler(clients map[string]*skywebrtc.TTSClient) http.HandlerFunc {
 		adapted[name] = ttsClientAdapter{client: client}
 	}
 	return ttsHandlerWithSynth(adapted)
+}
+
+func loadTTSVoiceCatalogs(paths map[string]string) (map[string]ttsVoiceCatalog, error) {
+	catalogs := make(map[string]ttsVoiceCatalog, len(paths))
+	for engine, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read %s catalog: %w", engine, err)
+		}
+		var catalog ttsVoiceCatalog
+		if err := json.Unmarshal(data, &catalog); err != nil {
+			return nil, fmt.Errorf("decode %s catalog: %w", engine, err)
+		}
+		if catalog.Default == "" || len(catalog.Voices) == 0 {
+			return nil, fmt.Errorf("%s catalog is empty", engine)
+		}
+		catalogs[engine] = catalog
+	}
+	return catalogs, nil
+}
+
+func ttsVoicesHandler(paths map[string]string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		catalogs, err := loadTTSVoiceCatalogs(paths)
+		if err != nil {
+			log.Printf("[tts] Load voice catalogs error: %v", err)
+			http.Error(w, "failed to load voice catalogs", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(catalogs); err != nil {
+			log.Printf("[tts] Write voice catalogs error: %v", err)
+		}
+	}
 }
 
 func ttsHandlerWithSynth(clients map[string]ttsSynthesizer) http.HandlerFunc {
@@ -512,7 +558,7 @@ func ttsHandlerWithSynth(clients map[string]ttsSynthesizer) http.HandlerFunc {
 			return
 		}
 
-		pcm, sampleRate, err := client.Synthesize(r.Context(), req.Text)
+		pcm, sampleRate, err := client.Synthesize(r.Context(), req.Text, req.Voice)
 		if err != nil {
 			log.Printf("[tts] Synthesize error (%s): %v", req.Engine, err)
 			http.Error(w, "synthesis failed", http.StatusInternalServerError)
