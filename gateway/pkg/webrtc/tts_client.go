@@ -12,6 +12,13 @@ import (
 
 const maxPCMBytes = 50 * 1024 * 1024 // 50MB
 
+// SynthesisOptions holds per-request TTS tuning parameters.
+type SynthesisOptions struct {
+	Temperature    float32
+	CfgCoef        float32
+	PaddingBetween int32
+}
+
 // TTSClient wraps a gRPC bidi stream to a TTS worker over a Unix socket.
 // Insecure credentials are intentional — transport is a Unix domain socket (local IPC only).
 type TTSClient struct {
@@ -44,13 +51,22 @@ func (c *TTSClient) GetStatus(ctx context.Context) (*pb.WorkerStatus, error) {
 	return status, nil
 }
 
-func (c *TTSClient) Synthesize(ctx context.Context, text, voice string) (pcm []byte, sampleRate int32, err error) {
+func (c *TTSClient) Synthesize(ctx context.Context, text, voice string, opts *SynthesisOptions) (pcm []byte, sampleRate int32, err error) {
 	stream, err := c.client.SynthesizeStream(ctx)
 	if err != nil {
 		return nil, 0, fmt.Errorf("start synthesize stream: %w", err)
 	}
 
-	if err := stream.Send(&pb.TextToken{Text: text, IsEos: true, Voice: voice}); err != nil {
+	token := &pb.TextToken{Text: text, IsEos: true, Voice: voice}
+	if opts != nil {
+		token.Options = &pb.SynthesisOptions{
+			Temperature:    opts.Temperature,
+			CfgCoef:        opts.CfgCoef,
+			PaddingBetween: opts.PaddingBetween,
+		}
+	}
+
+	if err := stream.Send(token); err != nil {
 		return nil, 0, fmt.Errorf("send text token: %w", err)
 	}
 	if err := stream.CloseSend(); err != nil {

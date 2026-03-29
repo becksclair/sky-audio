@@ -1,5 +1,8 @@
 {
   "default": "ears/p003/emo_amusement_freeform.wav",
+  "default_temperature": 0.75,
+  "default_cfg_coef": 1.5,
+  "default_padding": 0,
   "voices": [
     "alba-mackenna/a-moment-by.wav",
     "alba-mackenna/announcer.wav",

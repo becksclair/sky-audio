@@ -3,7 +3,7 @@ import { useEffect, useMemo, useState } from "preact/hooks";
 
 import { AppShell, Button, Panel, TextAreaField, TextField } from "../src";
 import { buildVoiceGroups, formatVoiceLabel, getVoicePresets } from "./lib/tts-voices";
-import { AudioPlaygroundModel } from "./state/audio-playground-model";
+import { AudioPlaygroundModel, SUPPORTED_EMOTIONS } from "./state/audio-playground-model";
 
 export function App() {
   const model = useModel(() => new AudioPlaygroundModel());
@@ -290,6 +290,112 @@ export function App() {
               model.setTTSInput((event.target as HTMLTextAreaElement).value);
             }}
           />
+
+          {/* Emotion and Synthesis Controls - Only show for Kyutai */}
+          {model.ttsEngine.value === "kyutai" && (
+            <div class="grid gap-4 border rounded-md p-3 bg-muted/30">
+              <div class="text-sm font-medium text-muted-foreground">Kyutai TTS Controls</div>
+              
+              {/* Emotion Selection */}
+              <div class="grid gap-1.5">
+                <label for="tts-emotion" class="text-sm font-medium">
+                  Emotion
+                </label>
+                <select
+                  id="tts-emotion"
+                  class="border-input bg-background ring-offset-background focus-visible:ring-ring flex h-9 w-full rounded-md border px-3 py-1 text-sm focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:outline-none"
+                  value={model.ttsEmotion.value}
+                  onChange={(event: Event) => {
+                    model.setTTSEmotion(
+                      (event.target as HTMLSelectElement).value as typeof SUPPORTED_EMOTIONS[number],
+                    );
+                  }}
+                >
+                  {SUPPORTED_EMOTIONS.map((emotion) => (
+                    <option key={emotion} value={emotion}>
+                      {emotion === "not-set" ? "Not Set" : emotion.charAt(0).toUpperCase() + emotion.slice(1)}
+                    </option>
+                  ))}
+                </select>
+                <p class="text-muted-foreground text-xs">
+                  Adds [emotion:label] tag to the text sent to TTS
+                </p>
+              </div>
+
+              {/* Synthesis Sliders */}
+              <div class="grid gap-3 md:grid-cols-3">
+                {/* Temperature */}
+                <div class="grid gap-1.5">
+                  <div class="flex items-center justify-between">
+                    <label for="tts-temperature" class="text-sm font-medium">
+                      Temperature
+                    </label>
+                    <span class="text-muted-foreground text-xs">{model.ttsTemperature.value.toFixed(2)}</span>
+                  </div>
+                  <input
+                    id="tts-temperature"
+                    type="range"
+                    min="0"
+                    max="2"
+                    step="0.05"
+                    value={model.ttsTemperature.value}
+                    onInput={(event: Event) => {
+                      model.setTTSTemperature(parseFloat((event.target as HTMLInputElement).value));
+                    }}
+                    class="w-full accent-primary"
+                  />
+                  <p class="text-muted-foreground text-xs">Default: 0.75</p>
+                </div>
+
+                {/* CFG Coef */}
+                <div class="grid gap-1.5">
+                  <div class="flex items-center justify-between">
+                    <label for="tts-cfg-coef" class="text-sm font-medium">
+                      CFG Coef
+                    </label>
+                    <span class="text-muted-foreground text-xs">{model.ttsCfgCoef.value.toFixed(2)}</span>
+                  </div>
+                  <input
+                    id="tts-cfg-coef"
+                    type="range"
+                    min="0"
+                    max="3"
+                    step="0.1"
+                    value={model.ttsCfgCoef.value}
+                    onInput={(event: Event) => {
+                      model.setTTSCfgCoef(parseFloat((event.target as HTMLInputElement).value));
+                    }}
+                    class="w-full accent-primary"
+                  />
+                  <p class="text-muted-foreground text-xs">Default: 1.5</p>
+                </div>
+
+                {/* Padding Between */}
+                <div class="grid gap-1.5">
+                  <div class="flex items-center justify-between">
+                    <label for="tts-padding" class="text-sm font-medium">
+                      Padding
+                    </label>
+                    <span class="text-muted-foreground text-xs">{model.ttsPaddingBetween.value}</span>
+                  </div>
+                  <input
+                    id="tts-padding"
+                    type="range"
+                    min="0"
+                    max="10"
+                    step="1"
+                    value={model.ttsPaddingBetween.value}
+                    onInput={(event: Event) => {
+                      model.setTTSPaddingBetween(parseInt((event.target as HTMLInputElement).value, 10));
+                    }}
+                    class="w-full accent-primary"
+                  />
+                  <p class="text-muted-foreground text-xs">Default: 0</p>
+                </div>
+              </div>
+            </div>
+          )}
+
           <Button disabled={!model.canSynthesize.value} onClick={() => void model.synthesize()}>
             {model.ttsBusy.value ? "Synthesizing..." : "Synthesize"}
           </Button>

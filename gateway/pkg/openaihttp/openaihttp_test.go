@@ -10,6 +10,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	skywebrtc "github.com/heliasar/sky-audio/gateway/pkg/webrtc"
 )
 
 // mockTTSSynthesizer implements TTSSynthesizer for testing
@@ -17,14 +19,16 @@ type mockTTSSynthesizer struct {
 	shouldFail bool
 	lastVoice  string
 	lastText   string
+	lastOpts   *skywebrtc.SynthesisOptions
 }
 
-func (m *mockTTSSynthesizer) Synthesize(ctx context.Context, text, voice string) ([]byte, int32, error) {
+func (m *mockTTSSynthesizer) Synthesize(ctx context.Context, text, voice string, opts *skywebrtc.SynthesisOptions) ([]byte, int32, error) {
 	if m.shouldFail {
 		return nil, 0, errors.New("synthesis failed")
 	}
 	m.lastText = text
 	m.lastVoice = voice
+	m.lastOpts = opts
 	// Return fake PCM data (sine wave-ish pattern)
 	pcm := make([]byte, 32000) // 1 second at 16kHz mono16
 	for i := range pcm {
@@ -866,5 +870,450 @@ func TestTranscriptionsHandlerWithEnsureRunningUnavailable(t *testing.T) {
 
 	if rr.Code != http.StatusServiceUnavailable {
 		t.Errorf("expected 503 when STT unavailable, got %d", rr.Code)
+	}
+}
+
+// TestParseEmotionTag verifies emotion tag parsing functionality
+func TestParseEmotionTag(t *testing.T) {
+	tests := []struct {
+		name          string
+		input         string
+		wantEmotion   string
+		wantStripped  string
+		wantFound     bool
+	}{
+		{
+			name:         "no tag",
+			input:        "Hello world",
+			wantEmotion:  "",
+			wantStripped: "Hello world",
+			wantFound:    false,
+		},
+		{
+			name:         "amusement tag",
+			input:        "[emotion:amusement] Hello world",
+			wantEmotion:  "amusement",
+			wantStripped: "Hello world",
+			wantFound:    true,
+		},
+		{
+			name:         "whisper tag",
+			input:        "[emotion:whisper] This is a secret",
+			wantEmotion:  "whisper",
+			wantStripped: "This is a secret",
+			wantFound:    true,
+		},
+		{
+			name:         "neutral tag",
+			input:        "[emotion:neutral] Just regular text",
+			wantEmotion:  "neutral",
+			wantStripped: "Just regular text",
+			wantFound:    true,
+		},
+		{
+			name:         "unknown emotion tag - soft fallback",
+			input:        "[emotion:unknown] Hello world",
+			wantEmotion:  "",
+			wantStripped: "Hello world",
+			wantFound:    false,
+		},
+		{
+			name:         "malformed tag - no closing bracket",
+			input:        "[emotion:amusement Hello world",
+			wantEmotion:  "",
+			wantStripped: "[emotion:amusement Hello world",
+			wantFound:    false,
+		},
+		{
+			name:         "empty emotion label",
+			input:        "[emotion:] Hello world",
+			wantEmotion:  "",
+			wantStripped: "Hello world",
+			wantFound:    false,
+		},
+		{
+			name:         "case insensitive",
+			input:        "[emotion:AMUSEMENT] Hello world",
+			wantEmotion:  "amusement",
+			wantStripped: "Hello world",
+			wantFound:    true,
+		},
+		{
+			name:         "all supported emotions",
+			input:        "[emotion:serenity] Peaceful text",
+			wantEmotion:  "serenity",
+			wantStripped: "Peaceful text",
+			wantFound:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			emotion, stripped, found := parseEmotionTag(tt.input)
+			if emotion != tt.wantEmotion {
+				t.Errorf("parseEmotionTag() emotion = %q, want %q", emotion, tt.wantEmotion)
+			}
+			if stripped != tt.wantStripped {
+				t.Errorf("parseEmotionTag() stripped = %q, want %q", stripped, tt.wantStripped)
+			}
+			if found != tt.wantFound {
+				t.Errorf("parseEmotionTag() found = %v, want %v", found, tt.wantFound)
+			}
+		})
+	}
+}
+
+// TestEmotionToKyutaiVoiceMap verifies all emotions have voice mappings
+func TestEmotionToKyutaiVoiceMap(t *testing.T) {
+	expectedEmotions := []string{
+		"neutral", "amusement", "interest", "desire", "adoration",
+		"contentment", "serenity", "pride", "whisper",
+	}
+
+	for _, emotion := range expectedEmotions {
+		voice, ok := emotionToKyutaiVoice[emotion]
+		if !ok {
+			t.Errorf("Missing voice mapping for emotion: %s", emotion)
+			continue
+		}
+		if voice == "" {
+			t.Errorf("Empty voice mapping for emotion: %s", emotion)
+		}
+	}
+
+	// Verify supportedEmotions matches emotionToKyutaiVoice keys
+	if len(supportedEmotions) != len(emotionToKyutaiVoice) {
+		t.Errorf("supportedEmotions (%d) and emotionToKyutaiVoice (%d) have different sizes",
+			len(supportedEmotions), len(emotionToKyutaiVoice))
+	}
+
+	for emotion := range supportedEmotions {
+		if _, ok := emotionToKyutaiVoice[emotion]; !ok {
+			t.Errorf("Emotion %s in supportedEmotions but not in emotionToKyutaiVoice", emotion)
+		}
+	}
+}
+
+// TestTTSHandlerWithSynthEmotionParsing verifies emotion tags are parsed and stripped
+func TestTTSHandlerWithSynthEmotionParsing(t *testing.T) {
+	mock := &mockTTSSynthesizer{}
+	handler := TTSHandlerWithSynth(map[string]TTSSynthesizer{
+		"kyutai": mock,
+	})
+
+	reqBody := TTSRequest{Model: "sky-kyutai", Input: "[emotion:amusement] Hello world"}
+	body, _ := json.Marshal(reqBody)
+	req := httptest.NewRequest(http.MethodPost, "/v1/audio/speech", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("Expected status %d, got %d", http.StatusOK, rr.Code)
+	}
+
+	// Verify the emotion tag was stripped from the text
+	if mock.lastText != "Hello world" {
+		t.Errorf("Expected text 'Hello world' with stripped tag, got '%s'", mock.lastText)
+	}
+
+	// Verify the emotion voice was selected
+	expectedVoice := "ears/p003/emo_amusement_freeform.wav"
+	if mock.lastVoice != expectedVoice {
+		t.Errorf("Expected voice '%s' for amusement emotion, got '%s'", expectedVoice, mock.lastVoice)
+	}
+}
+
+// TestTTSHandlerWithSynthExplicitVoiceOverridesEmotion verifies explicit voice takes precedence
+func TestTTSHandlerWithSynthExplicitVoiceOverridesEmotion(t *testing.T) {
+	mock := &mockTTSSynthesizer{}
+	handler := TTSHandlerWithSynth(map[string]TTSSynthesizer{
+		"kyutai": mock,
+	})
+
+	reqBody := TTSRequest{
+		Model: "sky-kyutai",
+		Input: "[emotion:amusement] Hello world",
+		Voice: "custom-voice-override",
+	}
+	body, _ := json.Marshal(reqBody)
+	req := httptest.NewRequest(http.MethodPost, "/v1/audio/speech", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("Expected status %d, got %d", http.StatusOK, rr.Code)
+	}
+
+	// Verify the emotion tag was stripped
+	if mock.lastText != "Hello world" {
+		t.Errorf("Expected text 'Hello world' with stripped tag, got '%s'", mock.lastText)
+	}
+
+	// Verify explicit voice overrides emotion
+	if mock.lastVoice != "custom-voice-override" {
+		t.Errorf("Expected explicit voice 'custom-voice-override', got '%s'", mock.lastVoice)
+	}
+}
+
+// TestTTSHandlerWithSynthUnknownEmotionSoftFallback verifies unknown emotions don't fail
+func TestTTSHandlerWithSynthUnknownEmotionSoftFallback(t *testing.T) {
+	mock := &mockTTSSynthesizer{}
+	handler := TTSHandlerWithSynth(map[string]TTSSynthesizer{
+		"kyutai": mock,
+	})
+
+	reqBody := TTSRequest{Model: "sky-kyutai", Input: "[emotion:unknown] Hello world"}
+	body, _ := json.Marshal(reqBody)
+	req := httptest.NewRequest(http.MethodPost, "/v1/audio/speech", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	// Should succeed with soft fallback
+	if rr.Code != http.StatusOK {
+		t.Errorf("Expected status %d for unknown emotion (soft fallback), got %d", http.StatusOK, rr.Code)
+	}
+
+	// Tag should be stripped even for unknown emotion
+	if mock.lastText != "Hello world" {
+		t.Errorf("Expected text 'Hello world' with stripped tag, got '%s'", mock.lastText)
+	}
+
+	// Should use empty voice (worker default) since emotion was unknown
+	if mock.lastVoice != "" {
+		t.Errorf("Expected empty voice for unknown emotion fallback, got '%s'", mock.lastVoice)
+	}
+}
+
+// TestTTSHandlerWithSynthSynthesisOptions verifies per-request tuning parameters
+func TestTTSHandlerWithSynthSynthesisOptions(t *testing.T) {
+	mock := &mockTTSSynthesizer{}
+	handler := TTSHandlerWithSynth(map[string]TTSSynthesizer{
+		"kyutai": mock,
+	})
+
+	reqBody := TTSRequest{
+		Model:           "sky-kyutai",
+		Input:           "Hello world",
+		Temperature:     0.95,
+		CfgCoef:         2.0,
+		PaddingBetween:  1,
+	}
+	body, _ := json.Marshal(reqBody)
+	req := httptest.NewRequest(http.MethodPost, "/v1/audio/speech", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("Expected status %d, got %d", http.StatusOK, rr.Code)
+	}
+
+	// Verify synthesis options were forwarded
+	if mock.lastOpts == nil {
+		t.Fatal("Expected synthesis options to be set")
+	}
+	if mock.lastOpts.Temperature != 0.95 {
+		t.Errorf("Expected temperature 0.95, got %f", mock.lastOpts.Temperature)
+	}
+	if mock.lastOpts.CfgCoef != 2.0 {
+		t.Errorf("Expected cfg_coef 2.0, got %f", mock.lastOpts.CfgCoef)
+	}
+	if mock.lastOpts.PaddingBetween != 1 {
+		t.Errorf("Expected padding_between 1, got %d", mock.lastOpts.PaddingBetween)
+	}
+}
+
+// TestTTSHandlerWithSynthSynthesisOptionsDefaults verifies defaults are applied
+func TestTTSHandlerWithSynthSynthesisOptionsDefaults(t *testing.T) {
+	mock := &mockTTSSynthesizer{}
+	handler := TTSHandlerWithSynth(map[string]TTSSynthesizer{
+		"kyutai": mock,
+	})
+
+	// Request without synthesis options
+	reqBody := TTSRequest{Model: "sky-kyutai", Input: "Hello world"}
+	body, _ := json.Marshal(reqBody)
+	req := httptest.NewRequest(http.MethodPost, "/v1/audio/speech", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("Expected status %d, got %d", http.StatusOK, rr.Code)
+	}
+
+	// Verify options were passed through (worker applies defaults, not gateway)
+	if mock.lastOpts == nil {
+		t.Fatal("Expected synthesis options to be set")
+	}
+	// Note: Gateway no longer overrides 0 values - worker applies defaults
+	// This allows explicit requests for temperature=0, cfg_coef=0
+	if mock.lastOpts.Temperature != 0 {
+		t.Errorf("Expected temperature 0 (passed through), got %f", mock.lastOpts.Temperature)
+	}
+	if mock.lastOpts.CfgCoef != 0 {
+		t.Errorf("Expected cfg_coef 0 (passed through), got %f", mock.lastOpts.CfgCoef)
+	}
+	if mock.lastOpts.PaddingBetween != 0 {
+		t.Errorf("Expected padding_between 0 (passed through), got %d", mock.lastOpts.PaddingBetween)
+	}
+}
+
+// TestTTSHandlerWithSynthPocketIgnoresOptions verifies pocket engine doesn't get options
+func TestTTSHandlerWithSynthPocketIgnoresOptions(t *testing.T) {
+	mock := &mockTTSSynthesizer{}
+	handler := TTSHandlerWithSynth(map[string]TTSSynthesizer{
+		"pocket": mock,
+	})
+
+	reqBody := TTSRequest{
+		Model:          "sky-pocket",
+		Input:          "Hello world",
+		Temperature:    0.95,
+		CfgCoef:        2.0,
+		PaddingBetween: 1,
+	}
+	body, _ := json.Marshal(reqBody)
+	req := httptest.NewRequest(http.MethodPost, "/v1/audio/speech", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("Expected status %d, got %d", http.StatusOK, rr.Code)
+	}
+
+	// Pocket should get nil options (options are Kyutai-only)
+	if mock.lastOpts != nil {
+		t.Errorf("Expected nil options for pocket engine, got %+v", mock.lastOpts)
+	}
+}
+
+// TestTTSHandlerWithSynthEmotionWithOptions verifies emotion and options work together
+func TestTTSHandlerWithSynthEmotionWithOptions(t *testing.T) {
+	mock := &mockTTSSynthesizer{}
+	handler := TTSHandlerWithSynth(map[string]TTSSynthesizer{
+		"kyutai": mock,
+	})
+
+	reqBody := TTSRequest{
+		Model:           "sky-kyutai",
+		Input:           "[emotion:desire] I want this",
+		Temperature:     0.85,
+		CfgCoef:         1.8,
+		PaddingBetween:  2,
+	}
+	body, _ := json.Marshal(reqBody)
+	req := httptest.NewRequest(http.MethodPost, "/v1/audio/speech", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("Expected status %d, got %d", http.StatusOK, rr.Code)
+	}
+
+	// Verify emotion was resolved
+	expectedVoice := "ears/p003/emo_desire_freeform.wav"
+	if mock.lastVoice != expectedVoice {
+		t.Errorf("Expected voice '%s' for desire emotion, got '%s'", expectedVoice, mock.lastVoice)
+	}
+
+	// Verify text was stripped
+	if mock.lastText != "I want this" {
+		t.Errorf("Expected text 'I want this', got '%s'", mock.lastText)
+	}
+
+	// Verify options were set
+	if mock.lastOpts == nil {
+		t.Fatal("Expected synthesis options to be set")
+	}
+	if mock.lastOpts.Temperature != 0.85 {
+		t.Errorf("Expected temperature 0.85, got %f", mock.lastOpts.Temperature)
+	}
+}
+
+// TestResolveEngineAndVoice verifies engine and voice resolution
+func TestResolveEngineAndVoice(t *testing.T) {
+	tests := []struct {
+		name        string
+		model       string
+		voice       string
+		emotion     string
+		wantEngine  string
+		wantVoice   string
+		wantErr     bool
+	}{
+		{
+			name:       "basic pocket",
+			model:      "sky-pocket",
+			voice:      "",
+			emotion:    "",
+			wantEngine: "pocket",
+			wantVoice:  "",
+		},
+		{
+			name:       "kyutai with emotion",
+			model:      "sky-kyutai",
+			voice:      "",
+			emotion:    "amusement",
+			wantEngine: "kyutai",
+			wantVoice:  "ears/p003/emo_amusement_freeform.wav",
+		},
+		{
+			name:       "explicit voice overrides emotion",
+			model:      "sky-kyutai",
+			voice:      "custom-voice",
+			emotion:    "amusement",
+			wantEngine: "kyutai",
+			wantVoice:  "custom-voice",
+		},
+		{
+			name:       "kyutai no emotion uses empty voice",
+			model:      "sky-kyutai",
+			voice:      "",
+			emotion:    "",
+			wantEngine: "kyutai",
+			wantVoice:  "",
+		},
+		{
+			name:    "unknown model",
+			model:   "sky-unknown",
+			voice:   "",
+			emotion: "",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			engine, voice, err := resolveEngineAndVoice(tt.model, tt.voice, tt.emotion)
+			if tt.wantErr {
+				if err == nil {
+					t.Error("Expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("Unexpected error: %v", err)
+				return
+			}
+			if engine != tt.wantEngine {
+				t.Errorf("Expected engine %q, got %q", tt.wantEngine, engine)
+			}
+			if voice != tt.wantVoice {
+				t.Errorf("Expected voice %q, got %q", tt.wantVoice, voice)
+			}
+		})
 	}
 }

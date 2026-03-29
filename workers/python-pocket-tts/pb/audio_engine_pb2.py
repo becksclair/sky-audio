@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x12\x61udio_engine.proto\x12\x0c\x61udio_engine\"M\n\nAudioChunk\x12\x10\n\x08pcm_data\x18\x01 \x01(\x0c\x12\x18\n\x10is_end_of_speech\x18\x02 \x01(\x08\x12\x13\n\x0bsample_rate\x18\x03 \x01(\x05\",\n\nTranscript\x12\x0c\n\x04text\x18\x01 \x01(\t\x12\x10\n\x08is_final\x18\x02 \x01(\x08\"8\n\tTextToken\x12\x0c\n\x04text\x18\x01 \x01(\t\x12\x0e\n\x06is_eos\x18\x02 \x01(\x08\x12\r\n\x05voice\x18\x03 \x01(\t\"L\n\x0cWorkerStatus\x12\x15\n\rvram_usage_mb\x18\x01 \x01(\x02\x12\x0f\n\x07is_busy\x18\x02 \x01(\x08\x12\x14\n\x0cloaded_model\x18\x03 \x01(\t\"\x07\n\x05\x45mpty2Z\n\x0cSpeechToText\x12J\n\x10TranscribeStream\x12\x18.audio_engine.AudioChunk\x1a\x18.audio_engine.Transcript(\x01\x30\x01\x32Y\n\x0cTextToSpeech\x12I\n\x10SynthesizeStream\x12\x17.audio_engine.TextToken\x1a\x18.audio_engine.AudioChunk(\x01\x30\x01\x32M\n\rWorkerControl\x12<\n\tGetStatus\x12\x13.audio_engine.Empty\x1a\x1a.audio_engine.WorkerStatusB.Z,github.com/heliasar/sky-audio/gateway/pkg/pbb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x12\x61udio_engine.proto\x12\x0c\x61udio_engine\"M\n\nAudioChunk\x12\x10\n\x08pcm_data\x18\x01 \x01(\x0c\x12\x18\n\x10is_end_of_speech\x18\x02 \x01(\x08\x12\x13\n\x0bsample_rate\x18\x03 \x01(\x05\",\n\nTranscript\x12\x0c\n\x04text\x18\x01 \x01(\t\x12\x10\n\x08is_final\x18\x02 \x01(\x08\"i\n\tTextToken\x12\x0c\n\x04text\x18\x01 \x01(\t\x12\x0e\n\x06is_eos\x18\x02 \x01(\x08\x12\r\n\x05voice\x18\x03 \x01(\t\x12/\n\x07options\x18\x04 \x01(\x0b\x32\x1e.audio_engine.SynthesisOptions\"R\n\x10SynthesisOptions\x12\x13\n\x0btemperature\x18\x01 \x01(\x02\x12\x10\n\x08\x63\x66g_coef\x18\x02 \x01(\x02\x12\x17\n\x0fpadding_between\x18\x03 \x01(\x05\"L\n\x0cWorkerStatus\x12\x15\n\rvram_usage_mb\x18\x01 \x01(\x02\x12\x0f\n\x07is_busy\x18\x02 \x01(\x08\x12\x14\n\x0cloaded_model\x18\x03 \x01(\t\"\x07\n\x05\x45mpty2Z\n\x0cSpeechToText\x12J\n\x10TranscribeStream\x12\x18.audio_engine.AudioChunk\x1a\x18.audio_engine.Transcript(\x01\x30\x01\x32Y\n\x0cTextToSpeech\x12I\n\x10SynthesizeStream\x12\x17.audio_engine.TextToken\x1a\x18.audio_engine.AudioChunk(\x01\x30\x01\x32M\n\rWorkerControl\x12<\n\tGetStatus\x12\x13.audio_engine.Empty\x1a\x1a.audio_engine.WorkerStatusB.Z,github.com/heliasar/sky-audio/gateway/pkg/pbb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -37,15 +37,17 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_TRANSCRIPT']._serialized_start=115
   _globals['_TRANSCRIPT']._serialized_end=159
   _globals['_TEXTTOKEN']._serialized_start=161
-  _globals['_TEXTTOKEN']._serialized_end=217
-  _globals['_WORKERSTATUS']._serialized_start=219
-  _globals['_WORKERSTATUS']._serialized_end=295
-  _globals['_EMPTY']._serialized_start=297
-  _globals['_EMPTY']._serialized_end=304
-  _globals['_SPEECHTOTEXT']._serialized_start=306
-  _globals['_SPEECHTOTEXT']._serialized_end=396
-  _globals['_TEXTTOSPEECH']._serialized_start=398
-  _globals['_TEXTTOSPEECH']._serialized_end=487
-  _globals['_WORKERCONTROL']._serialized_start=489
-  _globals['_WORKERCONTROL']._serialized_end=566
+  _globals['_TEXTTOKEN']._serialized_end=266
+  _globals['_SYNTHESISOPTIONS']._serialized_start=268
+  _globals['_SYNTHESISOPTIONS']._serialized_end=350
+  _globals['_WORKERSTATUS']._serialized_start=352
+  _globals['_WORKERSTATUS']._serialized_end=428
+  _globals['_EMPTY']._serialized_start=430
+  _globals['_EMPTY']._serialized_end=437
+  _globals['_SPEECHTOTEXT']._serialized_start=439
+  _globals['_SPEECHTOTEXT']._serialized_end=529
+  _globals['_TEXTTOSPEECH']._serialized_start=531
+  _globals['_TEXTTOSPEECH']._serialized_end=620
+  _globals['_WORKERCONTROL']._serialized_start=622
+  _globals['_WORKERCONTROL']._serialized_end=699
 # @@protoc_insertion_point(module_scope)

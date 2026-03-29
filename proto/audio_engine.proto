@@ -30,6 +30,13 @@ message TextToken {
   string text = 1;
   bool is_eos = 2;
   string voice = 3;
+  SynthesisOptions options = 4;
+}
+
+message SynthesisOptions {
+  float temperature = 1;
+  float cfg_coef = 2;
+  int32 padding_between = 3;
 }
 
 message WorkerStatus {

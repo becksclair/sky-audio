@@ -62,12 +62,17 @@ class TextToSpeechServicer(audio_engine_pb2_grpc.TextToSpeechServicer):
     _model: Any
     _default_voice: str
     _known_voices: set[str]
-    _voice_cache: dict[str, Any]
+    _voice_cache: dict[tuple[str, float], Any]
     _voice_cache_lock: threading.Lock
     _sample_rate: int
     _generate_lock: asyncio.Lock
     _busy: threading.Event
     _voice_suffix: str
+
+    # Default synthesis parameters (centralized and explicit)
+    DEFAULT_TEMPERATURE = 0.75
+    DEFAULT_CFG_COEF = 1.5
+    DEFAULT_PADDING_BETWEEN = 0
 
     def __init__(
         self,
@@ -95,6 +100,10 @@ class TextToSpeechServicer(audio_engine_pb2_grpc.TextToSpeechServicer):
     ) -> AsyncIterator[audio_engine_pb2.AudioChunk]:
         text_buf: list[str] = []
         selected_voice = ""
+        # Per-utterance synthesis options (extracted from first token with options)
+        temperature = self.DEFAULT_TEMPERATURE
+        cfg_coef = self.DEFAULT_CFG_COEF
+        padding_between = self.DEFAULT_PADDING_BETWEEN
 
         try:
             async for token in request_iterator:
@@ -106,11 +115,23 @@ class TextToSpeechServicer(audio_engine_pb2_grpc.TextToSpeechServicer):
                             "voice cannot change within a single utterance",
                         )
                     selected_voice = token_voice
+                # Extract synthesis options from the first token that has them
+                # Note: proto3 doesn't track presence for scalars, so we check for non-zero values
+                # Temperature of 0 is valid, so we check if options message itself is populated
+                if token.options.ByteSize() > 0 or (token.options.temperature != 0 or token.options.cfg_coef != 0 or token.options.padding_between != 0):
+                    # Use explicit values if provided (non-zero), otherwise keep defaults
+                    if token.options.temperature != 0:
+                        temperature = token.options.temperature
+                    if token.options.cfg_coef != 0:
+                        cfg_coef = token.options.cfg_coef
+                    # padding_between can be 0, so we use it directly if options are present
+                    if token.options.ByteSize() > 0 or token.options.padding_between != 0:
+                        padding_between = token.options.padding_between
                 text_buf.append(token.text)
                 if token.is_eos:
                     requested_voice = selected_voice or self._default_voice
                     voice_name, condition_attrs = await asyncio.get_running_loop().run_in_executor(
-                        None, self._get_condition_attributes, requested_voice
+                        None, self._get_condition_attributes, requested_voice, cfg_coef
                     )
                     full_text = "".join(text_buf)
                     if not full_text.strip():
@@ -124,7 +145,8 @@ class TextToSpeechServicer(audio_engine_pb2_grpc.TextToSpeechServicer):
                         continue
 
                     logger.info(
-                        "Synthesizing text (chars=%d, voice=%s)", len(full_text), voice_name
+                        "Synthesizing text (chars=%d, voice=%s, temp=%.2f, cfg=%.2f, pad=%d)",
+                        len(full_text), voice_name, temperature, cfg_coef, padding_between
                     )
 
                     async with self._generate_lock:
@@ -148,14 +170,20 @@ class TextToSpeechServicer(audio_engine_pb2_grpc.TextToSpeechServicer):
                             def _run_generate() -> None:
                                 try:
                                     entries: Any = model.prepare_script(
-                                        [full_text], padding_between=1
+                                        [full_text], padding_between=padding_between
                                     )
-                                    with model.mimi.streaming(1):
-                                        model.generate(
-                                            [entries],
-                                            [condition_attrs],
-                                            on_frame=_on_frame,
-                                        )
+                                    # Save original temperature, apply request override
+                                    original_temp = model.temp
+                                    model.temp = temperature
+                                    try:
+                                        with model.mimi.streaming(1):
+                                            model.generate(
+                                                [entries],
+                                                [condition_attrs],
+                                                on_frame=_on_frame,
+                                            )
+                                    finally:
+                                        model.temp = original_temp
                                 except Exception as err:
                                     frame_queue.put(err)
                                 finally:
@@ -236,16 +264,17 @@ class TextToSpeechServicer(audio_engine_pb2_grpc.TextToSpeechServicer):
 
         raise ValueError(f"unknown Kyutai voice: {voice_name}")
 
-    def _get_condition_attributes(self, voice_selector: str) -> tuple[str, Any]:
+    def _get_condition_attributes(self, voice_selector: str, cfg_coef: float) -> tuple[str, Any]:
         voice_name, voice_path = self._resolve_voice_path(voice_selector)
+        cache_key = (voice_name, cfg_coef)
         with self._voice_cache_lock:
-            cached = self._voice_cache.get(voice_name)
+            cached = self._voice_cache.get(cache_key)
         if cached is not None:
             return voice_name, cached
 
-        condition_attrs: Any = self._model.make_condition_attributes([voice_path], cfg_coef=2.0)
+        condition_attrs: Any = self._model.make_condition_attributes([voice_path], cfg_coef=cfg_coef)
         with self._voice_cache_lock:
-            self._voice_cache[voice_name] = condition_attrs
+            self._voice_cache[cache_key] = condition_attrs
         return voice_name, condition_attrs
 
 
@@ -284,7 +313,8 @@ async def serve() -> None:
     generate_lock = asyncio.Lock()
     busy = threading.Event()
     servicer = TextToSpeechServicer(model, default_voice, known_voices, generate_lock, busy)
-    servicer._get_condition_attributes(default_voice)
+    # Warm up voice cache with default voice and default CFG coefficient
+    servicer._get_condition_attributes(default_voice, servicer.DEFAULT_CFG_COEF)
     logger.info(
         "Kyutai voice catalog ready (default_voice=%s, catalog=%d, cache=%d)",
         default_voice,

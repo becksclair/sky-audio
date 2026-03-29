@@ -10,14 +10,35 @@ const MAX_TRANSCRIPTS = 200;
 export type ConnectionStatus = "disconnected" | "connecting" | "connected";
 export type TTSEngine = "pocket" | "kyutai";
 
-export interface TTSVoice {
-  name: string;
-  gender: 'male' | 'female' | 'ambiguous' | 'unknown';
+// Emotion labels supported for Kyutai TTS
+export const SUPPORTED_EMOTIONS = [
+  "not-set",
+  "neutral",
+  "amusement",
+  "interest",
+  "desire",
+  "adoration",
+  "contentment",
+  "serenity",
+  "pride",
+  "whisper",
+] as const;
+
+export type EmotionLabel = typeof SUPPORTED_EMOTIONS[number];
+
+// Synthesis tuning parameters for Kyutai TTS
+export interface SynthesisOptions {
+  temperature: number;    // 0.0 - 2.0, default 0.75
+  cfgCoef: number;        // 0.0 - 3.0, default 1.5
+  paddingBetween: number; // 0 - 10, default 0
 }
 
 export interface TTSVoiceCatalog {
   default: string;
-  voices: (string | TTSVoice)[];
+  voices: string[];
+  default_temperature?: number;
+  default_cfg_coef?: number;
+  default_padding?: number;
 }
 
 type TTSVoiceCatalogMap = Partial<Record<TTSEngine, TTSVoiceCatalog>>;
@@ -80,11 +101,20 @@ export interface AudioPlaygroundController {
   readonly ttsBusy: ReadonlySignal<boolean>;
   readonly ttsVoiceFavorites: ReadonlySignal<Set<string>>;
   readonly canSynthesize: ReadonlySignal<boolean>;
+  // Emotion and synthesis controls
+  readonly ttsEmotion: ReadonlySignal<EmotionLabel>;
+  readonly ttsTemperature: ReadonlySignal<number>;
+  readonly ttsCfgCoef: ReadonlySignal<number>;
+  readonly ttsPaddingBetween: ReadonlySignal<number>;
   connect(): Promise<void>;
   disconnect(): void;
   setTTSInput(value: string): void;
   setTTSEngine(value: TTSEngine): Promise<void>;
   setTTSVoice(value: string): void;
+  setTTSEmotion(value: EmotionLabel): void;
+  setTTSTemperature(value: number): void;
+  setTTSCfgCoef(value: number): void;
+  setTTSPaddingBetween(value: number): void;
   toggleTTSVoiceFavorite(voice: string): void;
   isTTSVoiceFavorite(voice: string): boolean;
   ensureTTSVoicesLoaded(): Promise<void>;
@@ -117,6 +147,12 @@ export const AudioPlaygroundModel = createModel(
 
     const ttsVoiceFavoritesMap = signal<TTSVoiceFavoritesMap>(loadFavoritesFromStorage());
     const ttsVoiceFavorites = computed(() => ttsVoiceFavoritesMap.value[ttsEngine.value] ?? new Set());
+
+    // Emotion and synthesis options signals
+    const ttsEmotion = signal<EmotionLabel>("not-set");
+    const ttsTemperature = signal<number>(0.75);
+    const ttsCfgCoef = signal<number>(1.5);
+    const ttsPaddingBetween = signal<number>(0);
 
     function isTTSVoiceFavorite(voice: string) {
       return ttsVoiceFavoritesMap.value[ttsEngine.value]?.has(voice) ?? false;
@@ -199,6 +235,16 @@ export const AudioPlaygroundModel = createModel(
             pocket: ttsVoiceSelections.value.pocket || pocketCatalog.default || "",
             kyutai: ttsVoiceSelections.value.kyutai || kyutaiCatalog.default || "",
           };
+          // Set synthesis defaults from Kyutai catalog (if not already set by user)
+          if (kyutaiCatalog.default_temperature !== undefined) {
+            ttsTemperature.value = kyutaiCatalog.default_temperature;
+          }
+          if (kyutaiCatalog.default_cfg_coef !== undefined) {
+            ttsCfgCoef.value = kyutaiCatalog.default_cfg_coef;
+          }
+          if (kyutaiCatalog.default_padding !== undefined) {
+            ttsPaddingBetween.value = kyutaiCatalog.default_padding;
+          }
         } catch (caught) {
           const message = caught instanceof Error ? caught.message : String(caught);
           ttsCatalogError.value = message;
@@ -221,6 +267,22 @@ export const AudioPlaygroundModel = createModel(
         ...ttsVoiceSelections.value,
         [ttsEngine.value]: value,
       };
+    }
+
+    function setTTSEmotion(value: EmotionLabel) {
+      ttsEmotion.value = value;
+    }
+
+    function setTTSTemperature(value: number) {
+      ttsTemperature.value = Math.max(0, Math.min(2, value));
+    }
+
+    function setTTSCfgCoef(value: number) {
+      ttsCfgCoef.value = Math.max(0, Math.min(3, value));
+    }
+
+    function setTTSPaddingBetween(value: number) {
+      ttsPaddingBetween.value = Math.max(0, Math.min(10, Math.floor(value)));
     }
 
     function getAudioContext() {
@@ -399,8 +461,13 @@ export const AudioPlaygroundModel = createModel(
       ttsBusy.value = true;
       error.value = null;
       const selectedVoice = ttsVoice.value.trim();
+      
+      // Build text with emotion tag if emotion is selected
+      const emotion = ttsEmotion.value;
+      const textToSend = emotion !== "not-set" ? `[emotion:${emotion}] ${text}` : text;
+      
       addTranscript(
-        `[TTS:${ttsEngine.value}${selectedVoice ? `:${selectedVoice}` : ""}] "${text}"`,
+        `[TTS:${ttsEngine.value}${selectedVoice ? `:${selectedVoice}` : ""}${emotion !== "not-set" ? `:${emotion}` : ""}] "${text}"`,
       );
 
       try {
@@ -421,14 +488,31 @@ export const AudioPlaygroundModel = createModel(
           currentTTSSource = null;
         }
 
+        // Build request body with synthesis options for Kyutai
+        const requestBody: {
+          text: string;
+          engine: TTSEngine;
+          voice: string;
+          temperature?: number;
+          cfg_coef?: number;
+          padding_between?: number;
+        } = {
+          text: textToSend,
+          engine: ttsEngine.value,
+          voice: selectedVoice,
+        };
+        
+        // Only include synthesis options for Kyutai engine
+        if (ttsEngine.value === "kyutai") {
+          requestBody.temperature = ttsTemperature.value;
+          requestBody.cfg_coef = ttsCfgCoef.value;
+          requestBody.padding_between = ttsPaddingBetween.value;
+        }
+
         const resp = await fetch("/api/tts/synthesize", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            text,
-            engine: ttsEngine.value,
-            voice: selectedVoice,
-          }),
+          body: JSON.stringify(requestBody),
           signal: thisAbort.signal,
         });
         
@@ -577,11 +661,20 @@ export const AudioPlaygroundModel = createModel(
       ttsBusy,
       ttsVoiceFavorites,
       canSynthesize,
+      // Emotion and synthesis controls
+      ttsEmotion,
+      ttsTemperature,
+      ttsCfgCoef,
+      ttsPaddingBetween,
       connect,
       disconnect,
       setTTSInput,
       setTTSEngine,
       setTTSVoice,
+      setTTSEmotion,
+      setTTSTemperature,
+      setTTSCfgCoef,
+      setTTSPaddingBetween,
       toggleTTSVoiceFavorite,
       isTTSVoiceFavorite,
       ensureTTSVoicesLoaded,
