@@ -35,8 +35,8 @@ export function MessageBubble({ message, className }: MessageBubbleProps) {
         {message.toolResult ? (
           <ToolResultCard
             title={message.toolResult.title}
-            status={message.toolResult.status}
-            summary={message.toolResult.summary}
+            {...(message.toolResult.status && { status: message.toolResult.status })}
+            {...(message.toolResult.summary && { summary: message.toolResult.summary })}
             payload={message.toolResult.payload}
           />
         ) : null}

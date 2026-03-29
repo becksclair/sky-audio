@@ -25,7 +25,7 @@ export function AppShell({
 
   return (
     <div
-      class={cx('htk-shell', sidebar && 'htk-shell--with-sidebar', className)}
+      class={cx('htk-shell', sidebar ? 'htk-shell--with-sidebar' : false, className)}
       style={style}
     >
       {sidebar ? <aside class="htk-sidebar">{sidebar}</aside> : null}
