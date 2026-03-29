@@ -795,7 +795,7 @@ type lazyTTSSynthesizer struct {
 	loader *lazyTTSPocketLoader
 }
 
-func (s *lazyTTSSynthesizer) Synthesize(ctx context.Context, text, voice string) ([]byte, int32, error) {
+func (s *lazyTTSSynthesizer) Synthesize(ctx context.Context, text, voice string, opts *skywebrtc.SynthesisOptions) ([]byte, int32, error) {
 	client, cleanup := s.loader.EnsureRunning()
 	if client == nil {
 		return nil, 0, fmt.Errorf("pocket TTS worker unavailable")
@@ -803,7 +803,7 @@ func (s *lazyTTSSynthesizer) Synthesize(ctx context.Context, text, voice string)
 	if cleanup != nil {
 		defer cleanup()
 	}
-	return client.Synthesize(ctx, text, voice)
+	return client.Synthesize(ctx, text, voice, opts)
 }
 
 func (l *lazySTTLoader) Stop() {
@@ -1020,8 +1020,15 @@ func main() {
 	}
 	// Only Kyutai starts eagerly at startup; Pocket is loaded on-demand to save VRAM
 	eagerTTSSpecs := []worker.Spec{ttsKyutaiSpec}
-	if err := workerRuntime.SpawnAll(ctx, eagerTTSSpecs); err != nil {
-		log.Fatalf("Failed to spawn TTS workers: %v", err)
+	
+	// Check if Kyutai socket already exists (worker manually started)
+	if _, err := os.Stat(ttsKyutaiSocketPath); err == nil {
+		log.Println("[INFO] Kyutai TTS worker socket already exists, skipping spawn")
+	} else {
+		if err := workerRuntime.SpawnAll(ctx, eagerTTSSpecs); err != nil {
+			log.Printf("[WARN] Failed to spawn Kyutai TTS worker: %v", err)
+			log.Println("[INFO] Continuing anyway - connect to manually started worker if socket exists")
+		}
 	}
 
 	log.Println("[INFO] Waiting for Kyutai TTS worker socket...")
@@ -1254,14 +1261,68 @@ func main() {
 }
 
 type ttsRequest struct {
-	Text   string `json:"text"`
-	Engine string `json:"engine"`
-	Voice  string `json:"voice"`
+	Text           string  `json:"text"`
+	Engine         string  `json:"engine"`
+	Voice          string  `json:"voice"`
+	Temperature    float32 `json:"temperature,omitempty"`
+	CfgCoef        float32 `json:"cfg_coef,omitempty"`
+	PaddingBetween int32   `json:"padding_between,omitempty"`
+}
+
+// Internal emotion mapping for dashboard/internal API (mirrors openaihttp package)
+var supportedEmotionsInternal = map[string]bool{
+	"neutral":     true,
+	"amusement":   true,
+	"interest":    true,
+	"desire":      true,
+	"adoration":   true,
+	"contentment": true,
+	"serenity":    true,
+	"pride":       true,
+	"whisper":     true,
+}
+
+var emotionToKyutaiVoiceInternal = map[string]string{
+	"neutral":     "ears/p003/emo_neutral_freeform.wav",
+	"amusement":   "ears/p003/emo_amusement_freeform.wav",
+	"interest":    "ears/p003/emo_interest_freeform.wav",
+	"desire":      "ears/p003/emo_desire_freeform.wav",
+	"adoration":   "ears/p003/emo_adoration_freeform.wav",
+	"contentment": "ears/p003/emo_contentment_freeform.wav",
+	"serenity":    "ears/p003/emo_serenity_freeform.wav",
+	"pride":       "ears/p003/emo_pride_freeform.wav",
+	"whisper":     "expresso/ex01-ex02_whisper_001_channel1_579s.wav",
+}
+
+// parseEmotionTagInternal checks if text starts with [emotion:<label>] and returns the
+// emotion label and the text with the tag stripped. Unknown emotions return empty emotion.
+func parseEmotionTagInternal(text string) (emotion, strippedText string) {
+	const prefix = "[emotion:"
+	if !strings.HasPrefix(text, prefix) {
+		return "", text
+	}
+
+	endIdx := strings.Index(text, "]")
+	if endIdx == -1 {
+		return "", text
+	}
+
+	label := strings.ToLower(strings.TrimSpace(text[len(prefix):endIdx]))
+	stripped := strings.TrimSpace(text[endIdx+1:])
+
+	if !supportedEmotionsInternal[label] {
+		return "", stripped
+	}
+
+	return label, stripped
 }
 
 type ttsVoiceCatalog struct {
-	Default string   `json:"default"`
-	Voices  []string `json:"voices"`
+	Default            string                 `json:"default"`
+	Voices             []string               `json:"voices"`
+	DefaultTemperature float32                `json:"default_temperature,omitempty"`
+	DefaultCfgCoef     float32                `json:"default_cfg_coef,omitempty"`
+	DefaultPadding     int32                  `json:"default_padding"`
 }
 
 // voiceCatalogManager handles mutable voice catalogs with thread-safe access.
@@ -1295,8 +1356,11 @@ func (m *voiceCatalogManager) Get() map[string]ttsVoiceCatalog {
 		voicesCopy := make([]string, len(catalog.Voices))
 		copy(voicesCopy, catalog.Voices)
 		result[engine] = ttsVoiceCatalog{
-			Default: catalog.Default,
-			Voices:  voicesCopy,
+			Default:            catalog.Default,
+			Voices:             voicesCopy,
+			DefaultTemperature: catalog.DefaultTemperature,
+			DefaultCfgCoef:     catalog.DefaultCfgCoef,
+			DefaultPadding:     catalog.DefaultPadding,
 		}
 	}
 	return result
@@ -1409,15 +1473,15 @@ func (m *voiceCatalogManager) MarshalJSON() ([]byte, error) {
 }
 
 type ttsSynthesizer interface {
-	Synthesize(ctx context.Context, text, voice string) (pcm []byte, sampleRate int32, err error)
+	Synthesize(ctx context.Context, text, voice string, opts *skywebrtc.SynthesisOptions) (pcm []byte, sampleRate int32, err error)
 }
 
 type ttsClientAdapter struct {
 	client *skywebrtc.TTSClient
 }
 
-func (a ttsClientAdapter) Synthesize(ctx context.Context, text, voice string) ([]byte, int32, error) {
-	return a.client.Synthesize(ctx, text, voice)
+func (a ttsClientAdapter) Synthesize(ctx context.Context, text, voice string, opts *skywebrtc.SynthesisOptions) ([]byte, int32, error) {
+	return a.client.Synthesize(ctx, text, voice, opts)
 }
 
 // ttsHandlerLazy is like ttsHandler but replaces the pocket engine with a lazy loader.
@@ -1437,7 +1501,7 @@ type lazyAPITTSSynthesizer struct {
 	loader *lazyTTSPocketLoader
 }
 
-func (s *lazyAPITTSSynthesizer) Synthesize(ctx context.Context, text, voice string) ([]byte, int32, error) {
+func (s *lazyAPITTSSynthesizer) Synthesize(ctx context.Context, text, voice string, opts *skywebrtc.SynthesisOptions) ([]byte, int32, error) {
 	client, cleanup := s.loader.EnsureRunning()
 	if client == nil {
 		return nil, 0, fmt.Errorf("pocket TTS worker unavailable")
@@ -1445,7 +1509,7 @@ func (s *lazyAPITTSSynthesizer) Synthesize(ctx context.Context, text, voice stri
 	if cleanup != nil {
 		defer cleanup()
 	}
-	return client.Synthesize(ctx, text, voice)
+	return client.Synthesize(ctx, text, voice, opts)
 }
 
 func loadTTSVoiceCatalogs(paths map[string]string) (map[string]ttsVoiceCatalog, error) {
@@ -1590,7 +1654,37 @@ func ttsHandlerWithSynth(clients map[string]ttsSynthesizer) http.HandlerFunc {
 			return
 		}
 
-		pcm, sampleRate, err := client.Synthesize(r.Context(), req.Text, req.Voice)
+		// Parse emotion tag from text (same logic as OpenAI handler)
+		emotion, strippedText := parseEmotionTagInternal(req.Text)
+
+		// Validate that text remains after emotion tag stripping
+		if strings.TrimSpace(strippedText) == "" {
+			http.Error(w, "text is required (empty after removing emotion tag)", http.StatusBadRequest)
+			return
+		}
+		
+		// Use voice from emotion if no explicit voice provided
+		textToUse := strippedText
+		voiceToUse := req.Voice
+		if voiceToUse == "" && emotion != "" && req.Engine == "kyutai" {
+			if emotionVoice, ok := emotionToKyutaiVoiceInternal[emotion]; ok {
+				voiceToUse = emotionVoice
+			}
+		}
+
+		// Build synthesis options for Kyutai
+		var opts *skywebrtc.SynthesisOptions
+		if req.Engine == "kyutai" {
+			opts = &skywebrtc.SynthesisOptions{
+				Temperature:    req.Temperature,
+				CfgCoef:        req.CfgCoef,
+				PaddingBetween: req.PaddingBetween,
+			}
+			// Note: We don't override zero values here - the worker will apply defaults.
+			// This allows explicit requests for temperature=0, cfg_coef=0, padding_between=0.
+		}
+
+		pcm, sampleRate, err := client.Synthesize(r.Context(), textToUse, voiceToUse, opts)
 		if err != nil {
 			log.Printf("[tts] Synthesize error (%s): %v", req.Engine, err)
 			http.Error(w, "synthesis failed", http.StatusInternalServerError)

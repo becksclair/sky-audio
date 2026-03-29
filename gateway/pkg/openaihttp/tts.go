@@ -36,11 +36,14 @@ import (
 
 // TTSRequest matches OpenAI's /v1/audio/speech request format
 type TTSRequest struct {
-	Model          string  `json:"model"`                     // e.g., "sky-kyutai", "sky-pocket"
-	Input          string  `json:"input"`                     // text to synthesize
-	Voice          string  `json:"voice,omitempty"`           // optional voice ID (uses worker default if empty)
-	ResponseFormat string  `json:"response_format,omitempty"` // "wav", "mp3", "opus", "pcm"
-	Speed          float64 `json:"speed,omitempty"`           // playback speed (not supported)
+	Model           string  `json:"model"`                      // e.g., "sky-kyutai", "sky-pocket"
+	Input           string  `json:"input"`                      // text to synthesize
+	Voice           string  `json:"voice,omitempty"`            // optional voice ID (uses worker default if empty)
+	ResponseFormat  string  `json:"response_format,omitempty"`  // "wav", "mp3", "opus", "pcm"
+	Speed           float64 `json:"speed,omitempty"`            // playback speed (not supported)
+	Temperature     float32 `json:"temperature,omitempty"`      // synthesis temperature (Kyutai only)
+	CfgCoef         float32 `json:"cfg_coef,omitempty"`         // classifier-free guidance coefficient (Kyutai only)
+	PaddingBetween  int32   `json:"padding_between,omitempty"`  // padding between segments (Kyutai only)
 }
 
 // TTSError is OpenAI-compatible error response
@@ -82,9 +85,68 @@ const MaxTTSCharacters = 4096
 // MaxTTSRequestBytes is the maximum request body size
 const MaxTTSRequestBytes = 51200 // 50KB
 
+// Emotion labels supported for Kyutai TTS voice selection
+var supportedEmotions = map[string]bool{
+	"neutral":     true,
+	"amusement":   true,
+	"interest":    true,
+	"desire":      true,
+	"adoration":   true,
+	"contentment": true,
+	"serenity":    true,
+	"pride":       true,
+	"whisper":     true,
+}
+
+// emotionToKyutaiVoice maps emotion labels to Kyutai voice paths.
+// The whisper emotion maps to an existing whisper voice from the expresso catalog.
+var emotionToKyutaiVoice = map[string]string{
+	"neutral":     "ears/p003/emo_neutral_freeform.wav",
+	"amusement":   "ears/p003/emo_amusement_freeform.wav",
+	"interest":    "ears/p003/emo_interest_freeform.wav",
+	"desire":      "ears/p003/emo_desire_freeform.wav",
+	"adoration":   "ears/p003/emo_adoration_freeform.wav",
+	"contentment": "ears/p003/emo_contentment_freeform.wav",
+	"serenity":    "ears/p003/emo_serenity_freeform.wav",
+	"pride":       "ears/p003/emo_pride_freeform.wav",
+	"whisper":     "expresso/ex01-ex02_whisper_001_channel1_579s.wav",
+}
+
+// defaultKyutaiVoice is the fallback voice when no emotion tag is present.
+const defaultKyutaiVoice = "ears/p003/emo_amusement_freeform.wav"
+
+// parseEmotionTag checks if text starts with [emotion:<label>] and returns the
+// emotion label, the text with the tag stripped, and a boolean indicating if a
+// valid tag was found. Only the nine supported emotion labels are recognized.
+// Unknown emotion labels are treated as if no tag was present (soft fallback).
+func parseEmotionTag(text string) (emotion, strippedText string, found bool) {
+	const prefix = "[emotion:"
+	if !strings.HasPrefix(text, prefix) {
+		return "", text, false
+	}
+
+	// Find the closing bracket
+	endIdx := strings.Index(text, "]")
+	if endIdx == -1 {
+		// Malformed tag, treat as literal text
+		return "", text, false
+	}
+
+	label := strings.ToLower(strings.TrimSpace(text[len(prefix):endIdx]))
+	stripped := strings.TrimSpace(text[endIdx+1:])
+
+	if !supportedEmotions[label] {
+		// Unknown emotion: soft fallback, strip the tag but return no emotion
+		log.Printf("[tts] unknown emotion label %q, using default voice", label)
+		return "", stripped, false
+	}
+
+	return label, stripped, true
+}
+
 // TTSSynthesizer is the interface for TTS clients
 type TTSSynthesizer interface {
-	Synthesize(ctx context.Context, text, voice string) (pcm []byte, sampleRate int32, err error)
+	Synthesize(ctx context.Context, text, voice string, opts *skywebrtc.SynthesisOptions) (pcm []byte, sampleRate int32, err error)
 }
 
 // ttsClientAdapter wraps skywebrtc.TTSClient to match our interface
@@ -92,8 +154,8 @@ type ttsClientAdapter struct {
 	client *skywebrtc.TTSClient
 }
 
-func (a ttsClientAdapter) Synthesize(ctx context.Context, text, voice string) ([]byte, int32, error) {
-	return a.client.Synthesize(ctx, text, voice)
+func (a ttsClientAdapter) Synthesize(ctx context.Context, text, voice string, opts *skywebrtc.SynthesisOptions) ([]byte, int32, error) {
+	return a.client.Synthesize(ctx, text, voice, opts)
 }
 
 // NewTTSSynthesizer creates a TTSSynthesizer from a TTSClient
@@ -139,8 +201,17 @@ func TTSHandlerWithSynth(synthesizers map[string]TTSSynthesizer) http.HandlerFun
 			return
 		}
 
+		// Parse emotion tag from input (gateway owns this)
+		emotion, strippedInput, _ := parseEmotionTag(req.Input)
+
+		// Validate that text remains after emotion tag stripping
+		if strings.TrimSpace(strippedInput) == "" {
+			writeTTSError(w, http.StatusBadRequest, "invalid_request_error", "input is required (empty after removing emotion tag)")
+			return
+		}
+
 		// Normalize and map model to engine
-		engineName, voice, err := resolveEngineAndVoice(req.Model, req.Voice)
+		engineName, voice, err := resolveEngineAndVoice(req.Model, req.Voice, emotion)
 		if err != nil {
 			writeTTSError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 			return
@@ -149,6 +220,18 @@ func TTSHandlerWithSynth(synthesizers map[string]TTSSynthesizer) http.HandlerFun
 		if !ok {
 			writeTTSError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("Model '%s' engine '%s' is not available", req.Model, engineName))
 			return
+		}
+
+		// Build synthesis options (nil for non-Kyutai engines)
+		var opts *skywebrtc.SynthesisOptions
+		if engineName == "kyutai" {
+			opts = &skywebrtc.SynthesisOptions{
+				Temperature:    req.Temperature,
+				CfgCoef:        req.CfgCoef,
+				PaddingBetween: req.PaddingBetween,
+			}
+			// Note: We don't override zero values here - the worker applies defaults.
+			// This allows explicit requests for temperature=0, cfg_coef=0.
 		}
 
 		// Determine response format (default is opus per OpenAI best practices for voice)
@@ -174,7 +257,7 @@ func TTSHandlerWithSynth(synthesizers map[string]TTSSynthesizer) http.HandlerFun
 		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 		defer cancel()
 
-		pcm, sampleRate, err := synth.Synthesize(ctx, req.Input, voice)
+		pcm, sampleRate, err := synth.Synthesize(ctx, strippedInput, voice, opts)
 		if err != nil {
 			// Log detailed error server-side, return generic message to client
 			// to avoid leaking internal paths and implementation details
@@ -225,15 +308,28 @@ func validateTTSRequest(req *TTSRequest) error {
 	return nil
 }
 
-func resolveEngineAndVoice(model, voice string) (engineName, resolvedVoice string, err error) {
+func resolveEngineAndVoice(model, voice, emotion string) (engineName, resolvedVoice string, err error) {
 	// Map model to engine
 	engine, ok := modelToEngine[strings.ToLower(model)]
 	if !ok {
 		return "", "", fmt.Errorf("unknown model: %s (available: sky-kyutai, sky-pocket, tts-1, tts-1-hd, whisper-1)", model)
 	}
 
-	// If voice is empty, let the worker use its default
-	return engine, strings.TrimSpace(voice), nil
+	// If explicit voice is provided, it takes precedence over emotion-derived voice
+	trimmedVoice := strings.TrimSpace(voice)
+	if trimmedVoice != "" {
+		return engine, trimmedVoice, nil
+	}
+
+	// For Kyutai, resolve emotion to voice if no explicit voice provided
+	if engine == "kyutai" && emotion != "" {
+		if emotionVoice, ok := emotionToKyutaiVoice[emotion]; ok {
+			return engine, emotionVoice, nil
+		}
+	}
+
+	// Return empty voice (worker will use its default)
+	return engine, "", nil
 }
 
 // writeError writes an OpenAI-compatible error response
