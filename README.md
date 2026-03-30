@@ -17,6 +17,7 @@ If your system package manager installed ONNX Runtime under `/usr/include/onnxru
 mise run dev
 mise run dev:dashboard
 mise run build
+mise run deploy
 mise run test
 mise run check
 mise run tts:prefetch
@@ -29,6 +30,18 @@ Kyutai and PocketTTS voice assets are intentionally vendored into this repo so t
 - Treat those assets as part of the product, not accidental cache cruft.
 - If a fresh clone, sparse checkout, or local cleanup leaves the voice directories incomplete, run `mise run tts:prefetch` to repopulate the local catalogs and manifests.
 - The vendored catalogs live in `workers/python-pocket-tts/voices.json` and `workers/python-kyutai-tts/voices.json`.
+
+## Deployment
+
+Run `mise run deploy` to rebuild the gateway, copy the runtime payload into `/home/bex/Apps/services/sky-audio`, install or update the `sky-audio.service` systemd user unit, recreate worker environments with `uv sync --frozen`, restart the service, and verify it is healthy.
+
+Operational notes:
+- The deployed service runs from `/home/bex/Apps/services/sky-audio`.
+- Optional overrides live in `~/.config/sky-audio/sky-audio.env`.
+- The deploy verification checks `http://127.0.0.1:<port>/health` and `http://127.0.0.1:<port>/api/tts/voices`, using `PORT` from the env file when set.
+- If `SKY_AUDIO_API_KEY` is set in the env file, the deploy verification uses it for the authenticated API probe.
+- The unit sets an explicit stable `PATH` so the gateway can spawn worker processes via `uv` under systemd without depending on a version-specific install directory.
+- Setting `PORT` makes the gateway bind to all interfaces (`:<port>`), so set `SKY_AUDIO_API_KEY` in the env file before doing that.
 
 ## Test split
 

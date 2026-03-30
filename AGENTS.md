@@ -27,6 +27,7 @@ Use `mise` tasks instead of inventing your own shell incantations when possible.
 mise run dev
 mise run dev:dashboard
 mise run build
+mise run deploy
 mise run test
 mise run check
 ```
