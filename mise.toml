@@ -16,6 +16,11 @@ run = "cd dashboard && bun run dev"
 description = "Full production build: dashboard → embed → Go binary"
 run = "./build.sh"
 
+[tasks.deploy]
+description = "Build, redeploy, and restart the local sky-audio user service"
+depends = ["build"]
+run = "python scripts/deploy.py"
+
 [tasks."build:dashboard"]
 description = "Build dashboard assets only"
 run = "cd dashboard && bun install --frozen-lockfile && bun run build"
