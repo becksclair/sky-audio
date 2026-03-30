@@ -18,3 +18,5 @@ __pycache__/
 
 voice_pitch*.json
 
+/dashboard/e2e-report
+/dashboard/test-results
