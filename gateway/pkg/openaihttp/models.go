@@ -63,8 +63,36 @@ var availableModels = []Model{
 	},
 }
 
-// ModelsHandler returns the list of available models in OpenAI format
+func filterModels(availableTTSEngines map[string]struct{}) []Model {
+	if len(availableTTSEngines) == 0 {
+		return availableModels
+	}
+
+	filtered := make([]Model, 0, len(availableModels))
+	for _, model := range availableModels {
+		switch model.ID {
+		case "sky-kyutai", "tts-1-hd":
+			if _, ok := availableTTSEngines["kyutai"]; ok {
+				filtered = append(filtered, model)
+			}
+		case "sky-pocket", "tts-1":
+			if _, ok := availableTTSEngines["pocket"]; ok {
+				filtered = append(filtered, model)
+			}
+		default:
+			filtered = append(filtered, model)
+		}
+	}
+	return filtered
+}
+
+// ModelsHandler returns the list of available models in OpenAI format.
 func ModelsHandler() http.HandlerFunc {
+	return ModelsHandlerWithAvailableTTSEngines(nil)
+}
+
+// ModelsHandlerWithAvailableTTSEngines filters TTS models to active engines.
+func ModelsHandlerWithAvailableTTSEngines(availableTTSEngines map[string]struct{}) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			writeTTSError(w, http.StatusMethodNotAllowed, "invalid_request_error", "Only GET requests are supported")
@@ -73,7 +101,7 @@ func ModelsHandler() http.HandlerFunc {
 
 		resp := ModelsListResponse{
 			Object: "list",
-			Data:   availableModels,
+			Data:   filterModels(availableTTSEngines),
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -84,8 +112,13 @@ func ModelsHandler() http.HandlerFunc {
 	}
 }
 
-// ModelsRetrieveHandler returns a specific model by ID
+// ModelsRetrieveHandler returns a specific model by ID.
 func ModelsRetrieveHandler() http.HandlerFunc {
+	return ModelsRetrieveHandlerWithAvailableTTSEngines(nil)
+}
+
+// ModelsRetrieveHandlerWithAvailableTTSEngines filters TTS models to active engines.
+func ModelsRetrieveHandlerWithAvailableTTSEngines(availableTTSEngines map[string]struct{}) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			writeTTSError(w, http.StatusMethodNotAllowed, "invalid_request_error", "Only GET requests are supported")
@@ -108,8 +141,7 @@ func ModelsRetrieveHandler() http.HandlerFunc {
 			return
 		}
 
-		// Find model
-		for _, model := range availableModels {
+		for _, model := range filterModels(availableTTSEngines) {
 			if model.ID == modelID {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusOK)

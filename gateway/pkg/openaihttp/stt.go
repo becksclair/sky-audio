@@ -221,6 +221,13 @@ func handleTranscription(w http.ResponseWriter, r *http.Request, transcriber STT
 		return
 	}
 
+	// Normalize empty transcripts so the caller can announce the result instead of silently swallowing it.
+	text = strings.TrimSpace(text)
+	if text == "" {
+		log.Printf("[stt] empty transcript returned by worker")
+		text = "[empty transcription]"
+	}
+
 	// Format response
 	format := strings.ToLower(req.ResponseFormat)
 	if format == "" {
