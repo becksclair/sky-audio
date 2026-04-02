@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -35,14 +37,10 @@ const (
 	ttsPocketSocketPath = "/tmp/sky-audio-tts-pocket.sock"
 	ttsKyutaiSocketPath = "/tmp/sky-audio-tts-kyutai.sock"
 
-	maxTTSTextLen   = 2000
-	maxTTSBodyBytes = 25600
+	defaultTTSEngine = "pocket"
+	maxTTSTextLen    = 2000
+	maxTTSBodyBytes  = 25600
 )
-
-var ttsVoiceCatalogPaths = map[string]string{
-	"pocket": "workers/python-pocket-tts/voices.json",
-	"kyutai": "workers/python-kyutai-tts/voices.json",
-}
 
 type sseClient struct {
 	ch chan string
@@ -53,10 +51,42 @@ type transcriptEvent struct {
 	IsFinal bool   `json:"isFinal"`
 }
 
+func newTraceID(prefix string) string {
+	var entropy [6]byte
+	if _, err := rand.Read(entropy[:]); err != nil {
+		return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
+	}
+	return fmt.Sprintf("%s-%s", prefix, hex.EncodeToString(entropy[:]))
+}
+
 type transcriptHub struct {
 	mu      sync.Mutex
 	active  map[string]struct{}
 	clients map[string]map[*sseClient]struct{}
+}
+
+func resolveTTSEngine() string {
+	engine := strings.ToLower(strings.TrimSpace(os.Getenv("TTS_ENGINE")))
+	if engine == "" {
+		return defaultTTSEngine
+	}
+	if engine != "pocket" && engine != "kyutai" {
+		log.Fatalf("[FATAL] Invalid TTS_ENGINE %q (expected pocket or kyutai)", engine)
+	}
+	return engine
+}
+
+func activeTTSVoiceCatalogPaths(engine string) map[string]string {
+	switch engine {
+	case "kyutai":
+		return map[string]string{
+			"kyutai": "workers/python-kyutai-tts/voices.json",
+		}
+	default:
+		return map[string]string{
+			"pocket": "workers/python-pocket-tts/voices.json",
+		}
+	}
 }
 
 func newTranscriptHub() *transcriptHub {
@@ -242,10 +272,10 @@ func (s *trackedSession) Close() {
 
 // lazySTTLoader manages on-demand STT worker spawning and idle shutdown
 type lazySTTLoader struct {
-	ctx          context.Context
-	runtime      *worker.Runtime
-	spec         worker.Spec
-	idleTimeout  time.Duration
+	ctx         context.Context
+	runtime     *worker.Runtime
+	spec        worker.Spec
+	idleTimeout time.Duration
 
 	mu           sync.Mutex
 	cond         *sync.Cond // signals when spawning completes
@@ -449,14 +479,15 @@ func (l *lazySTTLoader) shutdown() {
 	// If kill failed and process still running, we keep running=true
 	// so shutdown will be retried on next idle timeout
 	l.killing = false
-	l.idleTimer = nil // Clear the fired timer reference
+	l.idleTimer = nil  // Clear the fired timer reference
 	l.cond.Broadcast() // wake waiters while still holding lock
 	l.mu.Unlock()
 }
 
-// lazyTTSPocketLoader manages on-demand Pocket TTS worker spawning and idle shutdown.
-// Pocket is not started at startup; it spawns on the first request and shuts down after idle timeout.
-type lazyTTSPocketLoader struct {
+// lazyTTSLoader manages on-demand TTS worker spawning and idle shutdown.
+// The active TTS engine is not started at startup; it spawns on the first request and shuts down after idle timeout.
+type lazyTTSLoader struct {
+	engine      string
 	ctx         context.Context
 	runtime     *worker.Runtime
 	spec        worker.Spec
@@ -470,12 +501,14 @@ type lazyTTSPocketLoader struct {
 	reqCount    int
 	idleTimer   *time.Timer
 	inShutdown  bool
+	ownedWorker bool
 	// ttsClient is set once the worker is running and reused until shutdown
-	ttsClient   *skywebrtc.TTSClient
+	ttsClient *skywebrtc.TTSClient
 }
 
-func newLazyTTSPocketLoader(ctx context.Context, runtime *worker.Runtime, spec worker.Spec, idleTimeout time.Duration) *lazyTTSPocketLoader {
-	l := &lazyTTSPocketLoader{
+func newLazyTTSLoader(engine string, ctx context.Context, runtime *worker.Runtime, spec worker.Spec, idleTimeout time.Duration) *lazyTTSLoader {
+	l := &lazyTTSLoader{
+		engine:      engine,
 		ctx:         ctx,
 		runtime:     runtime,
 		spec:        spec,
@@ -485,9 +518,9 @@ func newLazyTTSPocketLoader(ctx context.Context, runtime *worker.Runtime, spec w
 	return l
 }
 
-// EnsureRunning spawns the Pocket TTS worker if not running.
+// EnsureRunning spawns the active TTS worker if not running.
 // Returns a cleanup func to call when the request completes, and the TTS client to use.
-func (l *lazyTTSPocketLoader) EnsureRunning() (*skywebrtc.TTSClient, func()) {
+func (l *lazyTTSLoader) EnsureRunning() (*skywebrtc.TTSClient, func()) {
 	l.mu.Lock()
 
 	if l.inShutdown {
@@ -506,7 +539,7 @@ func (l *lazyTTSPocketLoader) EnsureRunning() (*skywebrtc.TTSClient, func()) {
 		return nil, nil
 	}
 
-	if l.running && l.runtime.IsRunning(l.spec.Name) && l.ttsClient != nil {
+	if l.running && l.ttsClient != nil && (!l.ownedWorker || l.runtime.IsRunning(l.spec.Name)) {
 		l.reqCount++
 		if l.idleTimer != nil {
 			l.idleTimer.Stop()
@@ -522,7 +555,7 @@ func (l *lazyTTSPocketLoader) EnsureRunning() (*skywebrtc.TTSClient, func()) {
 		for l.spawning {
 			l.cond.Wait()
 		}
-		if l.running && l.runtime.IsRunning(l.spec.Name) && l.ttsClient != nil {
+		if l.running && l.ttsClient != nil && (!l.ownedWorker || l.runtime.IsRunning(l.spec.Name)) {
 			l.reqCount++
 			if l.idleTimer != nil {
 				l.idleTimer.Stop()
@@ -538,50 +571,62 @@ func (l *lazyTTSPocketLoader) EnsureRunning() (*skywebrtc.TTSClient, func()) {
 	}
 
 	l.spawning = true
-
-	// Clean up any stale socket file before spawning
-	if err := os.Remove(l.spec.SocketPath); err != nil && !os.IsNotExist(err) {
-		log.Printf("[WARN] Failed to remove stale Pocket TTS socket before spawn: %v", err)
+	attachOnly := false
+	if _, err := os.Stat(l.spec.SocketPath); err == nil {
+		attachOnly = true
+		log.Printf("[INFO] Found existing %s TTS socket, attempting attach...", l.engine)
+	} else if !os.IsNotExist(err) {
+		log.Printf("[WARN] Failed to stat %s TTS socket before spawn: %v", l.engine, err)
 	}
 
-	log.Println("[INFO] Spawning Pocket TTS worker on demand...")
-	if err := l.runtime.Spawn(l.ctx, l.spec); err != nil {
-		l.spawning = false
-		l.cond.Broadcast()
-		log.Printf("[ERROR] Failed to spawn Pocket TTS worker: %v", err)
-		l.mu.Unlock()
-		return nil, nil
+	if !attachOnly {
+		// Clean up any stale socket file before spawning
+		if err := os.Remove(l.spec.SocketPath); err != nil && !os.IsNotExist(err) {
+			log.Printf("[WARN] Failed to remove stale %s TTS socket before spawn: %v", l.engine, err)
+		}
+
+		log.Printf("[INFO] Spawning %s TTS worker on demand...", l.engine)
+		if err := l.runtime.Spawn(l.ctx, l.spec); err != nil {
+			l.spawning = false
+			l.cond.Broadcast()
+			log.Printf("[ERROR] Failed to spawn %s TTS worker: %v", l.engine, err)
+			l.mu.Unlock()
+			return nil, nil
+		}
+		l.ownedWorker = true
 	}
 
 	l.mu.Unlock()
-	socketErr := worker.WaitForSocket(l.ctx, l.spec.SocketPath, l.spec.SocketTimeout)
-	l.mu.Lock()
-
-	if l.inShutdown || l.killing {
-		l.spawning = false
-		// The goroutine that set killing=true or inShutdown=true is responsible for kill.
-		// We just clean up and return.
-		l.cond.Broadcast()
-		l.mu.Unlock()
-		return nil, nil
-	}
-
-	if socketErr != nil {
-		l.spawning = false
-		l.killing = true
-		log.Printf("[ERROR] Pocket TTS socket wait failed: %v", socketErr)
-		l.mu.Unlock()
-		if err := l.runtime.Kill(l.spec.Name); err != nil {
-			log.Printf("[WARN] Failed to kill Pocket TTS worker after socket error: %v", err)
-		}
-		if err := os.Remove(l.spec.SocketPath); err != nil && !os.IsNotExist(err) {
-			log.Printf("[WARN] Failed to remove Pocket TTS socket after socket error: %v", err)
-		}
+	if !attachOnly {
+		socketErr := worker.WaitForSocket(l.ctx, l.spec.SocketPath, l.spec.SocketTimeout)
 		l.mu.Lock()
-		l.killing = false
-		l.cond.Broadcast()
-		l.mu.Unlock()
-		return nil, nil
+
+		if l.inShutdown || l.killing {
+			l.spawning = false
+			l.cond.Broadcast()
+			l.mu.Unlock()
+			return nil, nil
+		}
+
+		if socketErr != nil {
+			l.spawning = false
+			l.killing = true
+			log.Printf("[ERROR] %s TTS socket wait failed: %v", l.engine, socketErr)
+			l.mu.Unlock()
+			if err := l.runtime.Kill(l.spec.Name); err != nil {
+				log.Printf("[WARN] Failed to kill %s TTS worker after socket error: %v", l.engine, err)
+			}
+			if err := os.Remove(l.spec.SocketPath); err != nil && !os.IsNotExist(err) {
+				log.Printf("[WARN] Failed to remove %s TTS socket after socket error: %v", l.engine, err)
+			}
+			l.mu.Lock()
+			l.killing = false
+			l.cond.Broadcast()
+			l.mu.Unlock()
+			return nil, nil
+		}
+	} else {
+		l.mu.Lock()
 	}
 
 	// Connect TTS client - release lock during potentially long operation
@@ -598,7 +643,7 @@ func (l *lazyTTSPocketLoader) EnsureRunning() (*skywebrtc.TTSClient, func()) {
 		l.mu.Unlock()
 		if clientToClose != nil {
 			if err := clientToClose.Close(); err != nil {
-				log.Printf("[WARN] Failed to close Pocket TTS client: %v", err)
+				log.Printf("[WARN] Failed to close %s TTS client: %v", l.engine, err)
 			}
 		}
 		l.mu.Lock()
@@ -609,14 +654,20 @@ func (l *lazyTTSPocketLoader) EnsureRunning() (*skywebrtc.TTSClient, func()) {
 
 	if err != nil {
 		l.spawning = false
+		if attachOnly {
+			log.Printf("[WARN] Failed to attach to existing %s TTS worker: %v", l.engine, err)
+			l.cond.Broadcast()
+			l.mu.Unlock()
+			return nil, nil
+		}
 		l.killing = true
-		log.Printf("[ERROR] Failed to connect Pocket TTS client: %v", err)
+		log.Printf("[ERROR] Failed to connect %s TTS client: %v", l.engine, err)
 		l.mu.Unlock()
 		if err := l.runtime.Kill(l.spec.Name); err != nil {
-			log.Printf("[WARN] Failed to kill Pocket TTS worker after connection failure: %v", err)
+			log.Printf("[WARN] Failed to kill %s TTS worker after connection failure: %v", l.engine, err)
 		}
 		if err := os.Remove(l.spec.SocketPath); err != nil && !os.IsNotExist(err) {
-			log.Printf("[WARN] Failed to remove Pocket TTS socket after connection failure: %v", err)
+			log.Printf("[WARN] Failed to remove %s TTS socket after connection failure: %v", l.engine, err)
 		}
 		l.mu.Lock()
 		l.killing = false
@@ -629,14 +680,20 @@ func (l *lazyTTSPocketLoader) EnsureRunning() (*skywebrtc.TTSClient, func()) {
 	// Defensive: ensure client was found in map
 	if client == nil {
 		l.spawning = false
+		if attachOnly {
+			log.Printf("[WARN] Existing %s TTS socket did not yield a client", l.engine)
+			l.cond.Broadcast()
+			l.mu.Unlock()
+			return nil, nil
+		}
 		l.killing = true
-		log.Printf("[ERROR] Pocket TTS client not found for readiness probe %q", l.spec.ReadinessProbe)
+		log.Printf("[ERROR] %s TTS client not found for readiness probe %q", l.engine, l.spec.ReadinessProbe)
 		l.mu.Unlock()
 		if err := l.runtime.Kill(l.spec.Name); err != nil {
-			log.Printf("[WARN] Failed to kill Pocket TTS worker after client not found: %v", err)
+			log.Printf("[WARN] Failed to kill %s TTS worker after client not found: %v", l.engine, err)
 		}
 		if err := os.Remove(l.spec.SocketPath); err != nil && !os.IsNotExist(err) {
-			log.Printf("[WARN] Failed to remove Pocket TTS socket after client not found: %v", err)
+			log.Printf("[WARN] Failed to remove %s TTS socket after client not found: %v", l.engine, err)
 		}
 		l.mu.Lock()
 		l.killing = false
@@ -648,7 +705,7 @@ func (l *lazyTTSPocketLoader) EnsureRunning() (*skywebrtc.TTSClient, func()) {
 	// Close stale client if we're respawning (worker crashed and restarted)
 	if l.ttsClient != nil {
 		if err := l.ttsClient.Close(); err != nil {
-			log.Printf("[WARN] Failed to close stale Pocket TTS client: %v", err)
+			log.Printf("[WARN] Failed to close stale %s TTS client: %v", l.engine, err)
 		}
 	}
 
@@ -656,7 +713,7 @@ func (l *lazyTTSPocketLoader) EnsureRunning() (*skywebrtc.TTSClient, func()) {
 	if l.killing || l.inShutdown {
 		l.spawning = false
 		if err := client.Close(); err != nil {
-			log.Printf("[WARN] Failed to close Pocket TTS client during abort: %v", err)
+			log.Printf("[WARN] Failed to close %s TTS client during abort: %v", l.engine, err)
 		}
 		l.cond.Broadcast()
 		l.mu.Unlock()
@@ -665,15 +722,20 @@ func (l *lazyTTSPocketLoader) EnsureRunning() (*skywebrtc.TTSClient, func()) {
 
 	l.spawning = false
 	l.running = true
+	l.ownedWorker = !attachOnly
 	l.ttsClient = client
 	l.reqCount++
 	l.cond.Broadcast()
 	l.mu.Unlock()
-	log.Println("[INFO] Pocket TTS worker ready")
+	if attachOnly {
+		log.Printf("[INFO] Attached to existing %s TTS worker", l.engine)
+	} else {
+		log.Printf("[INFO] %s TTS worker ready", l.engine)
+	}
 	return client, l.makeCleanup()
 }
 
-func (l *lazyTTSPocketLoader) makeCleanup() func() {
+func (l *lazyTTSLoader) makeCleanup() func() {
 	return func() {
 		l.mu.Lock()
 		defer l.mu.Unlock()
@@ -691,7 +753,7 @@ func (l *lazyTTSPocketLoader) makeCleanup() func() {
 	}
 }
 
-func (l *lazyTTSPocketLoader) shutdown() {
+func (l *lazyTTSLoader) shutdown() {
 	l.mu.Lock()
 	if l.reqCount > 0 || !l.running || l.inShutdown || l.spawning {
 		l.mu.Unlock()
@@ -700,31 +762,37 @@ func (l *lazyTTSPocketLoader) shutdown() {
 	l.killing = true // Prevent EnsureRunning from racing with kill
 	socketPath := l.spec.SocketPath
 	client := l.ttsClient
+	ownedWorker := l.ownedWorker
 	l.mu.Unlock()
 
-	log.Println("[INFO] Pocket TTS idle timeout reached, shutting down worker...")
+	log.Printf("[INFO] %s TTS idle timeout reached, shutting down worker...", l.engine)
 	if client != nil {
 		if err := client.Close(); err != nil {
-			log.Printf("[WARN] Failed to close Pocket TTS client: %v", err)
+			log.Printf("[WARN] Failed to close %s TTS client: %v", l.engine, err)
 		}
 	}
-	killErr := l.runtime.Kill(l.spec.Name)
-	if killErr != nil {
-		log.Printf("[WARN] Failed to kill Pocket TTS worker: %v", killErr)
-	}
-	if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
-		log.Printf("[WARN] Failed to remove Pocket TTS socket: %v", err)
+	killErr := error(nil)
+	if ownedWorker {
+		killErr = l.runtime.Kill(l.spec.Name)
+		if killErr != nil {
+			log.Printf("[WARN] Failed to kill %s TTS worker: %v", l.engine, killErr)
+		}
+		if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
+			log.Printf("[WARN] Failed to remove %s TTS socket: %v", l.engine, err)
+		}
 	}
 
 	// Update state: only mark as not running if kill succeeded
 	l.mu.Lock()
-	if killErr == nil {
+	if !ownedWorker || killErr == nil {
 		l.running = false
 		l.ttsClient = nil
+		l.ownedWorker = false
 	} else if !l.runtime.IsRunning(l.spec.Name) {
 		// Process is dead even though Kill returned error
 		l.running = false
 		l.ttsClient = nil
+		l.ownedWorker = false
 	}
 	// If kill failed and process still running, we keep running=true
 	// so shutdown will be retried on next idle timeout
@@ -734,7 +802,7 @@ func (l *lazyTTSPocketLoader) shutdown() {
 	l.mu.Unlock()
 }
 
-func (l *lazyTTSPocketLoader) Stop() {
+func (l *lazyTTSLoader) Stop() {
 	l.mu.Lock()
 	// Wait for any in-flight shutdown to complete before proceeding
 	for l.killing {
@@ -747,6 +815,7 @@ func (l *lazyTTSPocketLoader) Stop() {
 	wasRunning := l.running
 	wasSpawning := l.spawning
 	client := l.ttsClient
+	ownedWorker := l.ownedWorker
 	l.inShutdown = true
 	// Set killing to serialize with any in-flight spawn/kill operations
 	if wasRunning || wasSpawning {
@@ -758,29 +827,32 @@ func (l *lazyTTSPocketLoader) Stop() {
 
 	if wasRunning || wasSpawning {
 		if wasRunning {
-			log.Println("[INFO] Stopping Pocket TTS worker...")
+			log.Printf("[INFO] Stopping %s TTS worker...", l.engine)
 		}
 		if client != nil {
 			if err := client.Close(); err != nil {
-				log.Printf("[WARN] Failed to close Pocket TTS client on stop: %v", err)
+				log.Printf("[WARN] Failed to close %s TTS client on stop: %v", l.engine, err)
 			}
 		}
-		killErr := l.runtime.Kill(l.spec.Name)
-		if killErr != nil {
-			log.Printf("[WARN] Failed to kill Pocket TTS worker on stop: %v", killErr)
+		killErr := error(nil)
+		if ownedWorker {
+			killErr = l.runtime.Kill(l.spec.Name)
+			if killErr != nil {
+				log.Printf("[WARN] Failed to kill %s TTS worker on stop: %v", l.engine, killErr)
+			}
+			if err := os.Remove(l.spec.SocketPath); err != nil && !os.IsNotExist(err) {
+				log.Printf("[WARN] Failed to remove %s TTS socket on stop: %v", l.engine, err)
+			}
 		}
-		// Clean up socket file
-		if err := os.Remove(l.spec.SocketPath); err != nil && !os.IsNotExist(err) {
-			log.Printf("[WARN] Failed to remove Pocket TTS socket on stop: %v", err)
-		}
-		// Update state: only mark as not running if kill succeeded
 		l.mu.Lock()
-		if killErr == nil {
+		if !ownedWorker || killErr == nil {
 			l.running = false
 			l.ttsClient = nil
+			l.ownedWorker = false
 		} else if !l.runtime.IsRunning(l.spec.Name) {
 			l.running = false
 			l.ttsClient = nil
+			l.ownedWorker = false
 		}
 		l.killing = false
 		l.spawning = false
@@ -789,16 +861,16 @@ func (l *lazyTTSPocketLoader) Stop() {
 	}
 }
 
-// lazyTTSSynthesizer wraps the lazy Pocket loader as a TTSSynthesizer.
-// It ensures the Pocket worker is running before each synthesis call.
+// lazyTTSSynthesizer wraps the lazy TTS loader as a TTSSynthesizer.
+// It ensures the active TTS worker is running before each synthesis call.
 type lazyTTSSynthesizer struct {
-	loader *lazyTTSPocketLoader
+	loader *lazyTTSLoader
 }
 
 func (s *lazyTTSSynthesizer) Synthesize(ctx context.Context, text, voice string, opts *skywebrtc.SynthesisOptions) ([]byte, int32, error) {
 	client, cleanup := s.loader.EnsureRunning()
 	if client == nil {
-		return nil, 0, fmt.Errorf("pocket TTS worker unavailable")
+		return nil, 0, fmt.Errorf("%s TTS worker unavailable", s.loader.engine)
 	}
 	if cleanup != nil {
 		defer cleanup()
@@ -912,12 +984,10 @@ func newAudioSession(
 		if transcript == nil {
 			return
 		}
-		log.Printf(
-			"[stt] Session %s transcript received (final=%v, chars=%d)",
-			peerID,
-			transcript.IsFinal,
-			utf8.RuneCountInString(transcript.Text),
-		)
+		traceID := newTraceID("stt")
+		receivedAt := time.Now()
+		log.Printf("[trace=%s][stt][session=%s][final=%v][chars=%d] received", traceID, peerID, transcript.IsFinal, utf8.RuneCountInString(transcript.Text))
+		log.Printf("[trace=%s][stt][session=%s][publish_ms=%d] published", traceID, peerID, time.Since(receivedAt).Milliseconds())
 		hub.Publish(peerID, transcript)
 	})
 
@@ -990,6 +1060,8 @@ func main() {
 
 	mgr := process.NewManager()
 	workerRuntime := worker.NewRuntime(mgr)
+	ttsEngine := resolveTTSEngine()
+	log.Printf("[INFO] Active TTS engine: %s", ttsEngine)
 
 	sttSpec := worker.Spec{
 		Name:           "stt-worker",
@@ -1018,33 +1090,19 @@ func main() {
 		SocketTimeout:  180 * time.Second,
 		ReadinessProbe: "kyutai",
 	}
-	// Only Kyutai starts eagerly at startup; Pocket is loaded on-demand to save VRAM
-	eagerTTSSpecs := []worker.Spec{ttsKyutaiSpec}
-	
-	// Check if Kyutai socket already exists (worker manually started)
-	if _, err := os.Stat(ttsKyutaiSocketPath); err == nil {
-		log.Println("[INFO] Kyutai TTS worker socket already exists, skipping spawn")
-	} else {
-		if err := workerRuntime.SpawnAll(ctx, eagerTTSSpecs); err != nil {
-			log.Printf("[WARN] Failed to spawn Kyutai TTS worker: %v", err)
-			log.Println("[INFO] Continuing anyway - connect to manually started worker if socket exists")
-		}
+
+	var ttsLazy *lazyTTSLoader
+
+	var ttsSpec worker.Spec
+	switch ttsEngine {
+	case "kyutai":
+		ttsSpec = ttsKyutaiSpec
+	default:
+		ttsSpec = ttsPocketSpec
 	}
 
-	log.Println("[INFO] Waiting for Kyutai TTS worker socket...")
-	if err := worker.WaitForSockets(ctx, eagerTTSSpecs); err != nil {
-		log.Fatal(err)
-	}
-
-	ttsClients, err := worker.ConnectTTS(ctx, eagerTTSSpecs, 30, time.Second, 2*time.Second)
-	if err != nil {
-		log.Fatalf("Failed to connect to Kyutai TTS worker after retries: %v", err)
-	}
-
-	// Lazy Pocket TTS loader — spawns on demand, kills after 2 min idle
-	pocketLazy := newLazyTTSPocketLoader(ctx, workerRuntime, ttsPocketSpec, 2*time.Minute)
-	defer pocketLazy.Stop()
-	ttsClients["pocket"] = nil // placeholder; overridden below via lazyTTSSynthesizer
+	ttsLazy = newLazyTTSLoader(ttsEngine, ctx, workerRuntime, ttsSpec, 2*time.Minute)
+	defer ttsLazy.Stop()
 
 	// Check ffmpeg availability - required for OpenAI TTS endpoint (default is OGG/Opus)
 	if !audio.IsFfmpegAvailable() {
@@ -1054,14 +1112,6 @@ func main() {
 	}
 
 	defer func() {
-		for _, c := range ttsClients {
-			if c == nil {
-				continue
-			}
-			if err := c.Close(); err != nil {
-				log.Printf("[WARN] TTS client close failed: %v", err)
-			}
-		}
 		// Ensure all worker processes are killed on exit
 		log.Println("[INFO] Cleaning up worker processes...")
 		if err := mgr.KillAll(); err != nil {
@@ -1069,9 +1119,15 @@ func main() {
 		}
 	}()
 
-	// Lazy STT loader - spawns on demand, kills after idle timeout
+	// STT loader - preloaded at startup, then managed with the existing idle timeout
 	sttLazy := newLazySTTLoader(ctx, workerRuntime, sttSpec, 60*time.Minute)
 	defer sttLazy.Stop()
+	sttPreloadCleanup := sttLazy.EnsureRunning()
+	if sttPreloadCleanup == nil {
+		log.Fatal("Failed to preload STT worker")
+	}
+	sttPreloadCleanup()
+	log.Println("[INFO] STT worker preloaded")
 
 	transcripts := newTranscriptHub()
 	peerRegistry := skywebrtc.NewPeerRegistry()
@@ -1092,12 +1148,14 @@ func main() {
 	})
 
 	// Load voice catalogs with manager (supports runtime updates)
-	voiceCatalogMgr, err := newVoiceCatalogManager(ttsVoiceCatalogPaths)
+	voiceCatalogMgr, err := newVoiceCatalogManager(activeTTSVoiceCatalogPaths(ttsEngine))
 	if err != nil {
 		log.Fatalf("Failed to load TTS voice catalogs: %v", err)
 	}
-	log.Printf("[INFO] Loaded voice catalogs: pocket=%d voices, kyutai=%d voices",
-		len(voiceCatalogMgr.Get()["pocket"].Voices), len(voiceCatalogMgr.Get()["kyutai"].Voices))
+	catalogs := voiceCatalogMgr.Get()
+	for engine, catalog := range catalogs {
+		log.Printf("[INFO] Loaded %s voice catalog: %d voices (default=%s)", engine, len(catalog.Voices), catalog.Default)
+	}
 
 	// WebRTC endpoint - require auth when binding to non-loopback
 	webrtcHandler := skywebrtc.OfferHandler(skywebrtc.PeerConfig{
@@ -1130,23 +1188,20 @@ func main() {
 	apiMux.HandleFunc("GET /api/tts/voices", ttsVoicesHandler(voiceCatalogMgr))
 	apiMux.HandleFunc("POST /api/tts/voices/default", ttsSetDefaultHandler(voiceCatalogMgr))
 	apiMux.HandleFunc("DELETE /api/tts/voices/{engine}/{voice...}", ttsDeleteVoiceHandler(voiceCatalogMgr))
-	apiMux.HandleFunc("POST /api/tts/synthesize", ttsHandlerLazy(ttsClients, pocketLazy))
+	apiMux.HandleFunc("POST /api/tts/synthesize", ttsHandlerLazy(ttsLazy, ttsEngine))
 	mux.Handle("/api/", openaihttp.OptionalAuthMiddleware(apiMux))
 
 	// OpenAI-compatible endpoints for OpenClaw integration
 	// These provide /v1/audio/speech, /v1/audio/transcriptions, and /v1/models
 	openaiMux := http.NewServeMux()
-	openaiMux.HandleFunc("GET /v1/models", openaihttp.ModelsHandler())
-	openaiMux.HandleFunc("GET /v1/models/{model}", openaihttp.ModelsRetrieveHandler())
-	// Build synthesizer map — Pocket uses lazy loader, Kyutai uses direct client
-	synthesizers := make(map[string]openaihttp.TTSSynthesizer)
-	for name, client := range ttsClients {
-		if name == "pocket" {
-			continue
-		}
-		synthesizers[name] = openaihttp.NewTTSSynthesizer(client)
+	availableTTSEngines := map[string]struct{}{ttsEngine: {}}
+	openaiMux.HandleFunc("GET /v1/models", openaihttp.ModelsHandlerWithAvailableTTSEngines(availableTTSEngines))
+	openaiMux.HandleFunc("GET /v1/models/{model}", openaihttp.ModelsRetrieveHandlerWithAvailableTTSEngines(availableTTSEngines))
+	// Build synthesizer map for the active TTS engine
+	synthesizers := make(map[string]openaihttp.TTSSynthesizer, 1)
+	if ttsLazy != nil {
+		synthesizers[ttsEngine] = &lazyTTSSynthesizer{loader: ttsLazy}
 	}
-	synthesizers["pocket"] = &lazyTTSSynthesizer{loader: pocketLazy}
 	openaiMux.HandleFunc("POST /v1/audio/speech", openaihttp.TTSHandlerWithSynth(synthesizers))
 	openaiMux.HandleFunc("POST /v1/audio/transcriptions", openaihttp.TranscriptionsHandlerWithEnsureRunning(sttSpec.SocketPath, sttLazy.EnsureRunning))
 	// Apply optional auth middleware (requires SKY_AUDIO_API_KEY env var to enable)
@@ -1204,16 +1259,8 @@ func main() {
 				log.Printf("[INFO] %s requested via API - initiating graceful shutdown...", action)
 				// Stop lazy loaders first to prevent new worker spawns
 				sttLazy.Stop()
-				pocketLazy.Stop()
-				// Close TTS clients
-				for name, c := range ttsClients {
-					if c == nil {
-						continue
-					}
-					if err := c.Close(); err != nil {
-						log.Printf("[WARN] TTS client close failed during %s: %v", action, err)
-					}
-					delete(ttsClients, name)
+				if ttsLazy != nil {
+					ttsLazy.Stop()
 				}
 				// Shutdown HTTP server
 				shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -1264,6 +1311,7 @@ type ttsRequest struct {
 	Text           string  `json:"text"`
 	Engine         string  `json:"engine"`
 	Voice          string  `json:"voice"`
+	TraceID        string  `json:"trace_id,omitempty"`
 	Temperature    float32 `json:"temperature,omitempty"`
 	CfgCoef        float32 `json:"cfg_coef,omitempty"`
 	PaddingBetween int32   `json:"padding_between,omitempty"`
@@ -1318,11 +1366,11 @@ func parseEmotionTagInternal(text string) (emotion, strippedText string) {
 }
 
 type ttsVoiceCatalog struct {
-	Default            string                 `json:"default"`
-	Voices             []string               `json:"voices"`
-	DefaultTemperature float32                `json:"default_temperature,omitempty"`
-	DefaultCfgCoef     float32                `json:"default_cfg_coef,omitempty"`
-	DefaultPadding     int32                  `json:"default_padding"`
+	Default            string   `json:"default"`
+	Voices             []string `json:"voices"`
+	DefaultTemperature float32  `json:"default_temperature,omitempty"`
+	DefaultCfgCoef     float32  `json:"default_cfg_coef,omitempty"`
+	DefaultPadding     int32    `json:"default_padding"`
 }
 
 // voiceCatalogManager handles mutable voice catalogs with thread-safe access.
@@ -1350,7 +1398,7 @@ func newVoiceCatalogManager(paths map[string]string) (*voiceCatalogManager, erro
 func (m *voiceCatalogManager) Get() map[string]ttsVoiceCatalog {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	
+
 	result := make(map[string]ttsVoiceCatalog, len(m.catalogs))
 	for engine, catalog := range m.catalogs {
 		voicesCopy := make([]string, len(catalog.Voices))
@@ -1370,12 +1418,12 @@ func (m *voiceCatalogManager) Get() map[string]ttsVoiceCatalog {
 func (m *voiceCatalogManager) SetDefault(engine, voice string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	
+
 	catalog, ok := m.catalogs[engine]
 	if !ok {
 		return fmt.Errorf("unknown engine: %s", engine)
 	}
-	
+
 	// Verify the voice exists in the catalog
 	voiceExists := false
 	for _, v := range catalog.Voices {
@@ -1387,15 +1435,15 @@ func (m *voiceCatalogManager) SetDefault(engine, voice string) error {
 	if !voiceExists {
 		return fmt.Errorf("voice not found: %s", voice)
 	}
-	
+
 	catalog.Default = voice
 	m.catalogs[engine] = catalog
-	
+
 	// Persist to disk while holding lock (low-frequency admin operation)
 	if err := m.saveCatalog(engine, catalog); err != nil {
 		return fmt.Errorf("failed to save catalog: %w", err)
 	}
-	
+
 	return nil
 }
 
@@ -1404,12 +1452,12 @@ func (m *voiceCatalogManager) SetDefault(engine, voice string) error {
 func (m *voiceCatalogManager) DeleteVoice(engine, voice string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	
+
 	catalog, ok := m.catalogs[engine]
 	if !ok {
 		return fmt.Errorf("unknown engine: %s", engine)
 	}
-	
+
 	// Find and remove the voice
 	newVoices := make([]string, 0, len(catalog.Voices)-1)
 	found := false
@@ -1423,9 +1471,9 @@ func (m *voiceCatalogManager) DeleteVoice(engine, voice string) error {
 	if !found {
 		return fmt.Errorf("voice not found: %s", voice)
 	}
-	
+
 	catalog.Voices = newVoices
-	
+
 	// If we deleted the default voice, pick a new default (or clear if empty)
 	if catalog.Default == voice {
 		if len(catalog.Voices) > 0 {
@@ -1434,14 +1482,14 @@ func (m *voiceCatalogManager) DeleteVoice(engine, voice string) error {
 			catalog.Default = ""
 		}
 	}
-	
+
 	m.catalogs[engine] = catalog
-	
+
 	// Persist to disk while holding lock (low-frequency admin operation)
 	if err := m.saveCatalog(engine, catalog); err != nil {
 		return fmt.Errorf("failed to save catalog: %w", err)
 	}
-	
+
 	return nil
 }
 
@@ -1453,17 +1501,17 @@ func (m *voiceCatalogManager) saveCatalog(engine string, catalog ttsVoiceCatalog
 	if !ok {
 		return fmt.Errorf("unknown engine path: %s", engine)
 	}
-	
+
 	data, err := json.MarshalIndent(catalog, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal catalog: %w", err)
 	}
 	data = append(data, '\n')
-	
+
 	if err := os.WriteFile(path, data, 0644); err != nil {
 		return fmt.Errorf("write catalog file: %w", err)
 	}
-	
+
 	return nil
 }
 
@@ -1484,27 +1532,24 @@ func (a ttsClientAdapter) Synthesize(ctx context.Context, text, voice string, op
 	return a.client.Synthesize(ctx, text, voice, opts)
 }
 
-// ttsHandlerLazy is like ttsHandler but replaces the pocket engine with a lazy loader.
-func ttsHandlerLazy(clients map[string]*skywebrtc.TTSClient, pocketLazy *lazyTTSPocketLoader) http.HandlerFunc {
-	adapted := make(map[string]ttsSynthesizer, len(clients)+1)
-	for name, client := range clients {
-		if name != "pocket" {
-			adapted[name] = ttsClientAdapter{client: client}
-		}
+// ttsHandlerLazy is like ttsHandler but replaces the active engine with a lazy loader.
+func ttsHandlerLazy(ttsLazy *lazyTTSLoader, defaultEngine string) http.HandlerFunc {
+	adapted := make(map[string]ttsSynthesizer, 1)
+	if ttsLazy != nil {
+		adapted[defaultEngine] = &lazyAPITTSSynthesizer{loader: ttsLazy}
 	}
-	adapted["pocket"] = &lazyAPITTSSynthesizer{loader: pocketLazy}
-	return ttsHandlerWithSynth(adapted)
+	return ttsHandlerWithSynth(adapted, defaultEngine)
 }
 
-// lazyAPITTSSynthesizer adapts lazyTTSPocketLoader to the internal ttsSynthesizer interface.
+// lazyAPITTSSynthesizer adapts lazyTTSLoader to the internal ttsSynthesizer interface.
 type lazyAPITTSSynthesizer struct {
-	loader *lazyTTSPocketLoader
+	loader *lazyTTSLoader
 }
 
 func (s *lazyAPITTSSynthesizer) Synthesize(ctx context.Context, text, voice string, opts *skywebrtc.SynthesisOptions) ([]byte, int32, error) {
 	client, cleanup := s.loader.EnsureRunning()
 	if client == nil {
-		return nil, 0, fmt.Errorf("pocket TTS worker unavailable")
+		return nil, 0, fmt.Errorf("%s TTS worker unavailable", s.loader.engine)
 	}
 	if cleanup != nil {
 		defer cleanup()
@@ -1622,7 +1667,7 @@ func preencodeVoiceCatalogs(catalogs map[string]ttsVoiceCatalog) []byte {
 	return data
 }
 
-func ttsHandlerWithSynth(clients map[string]ttsSynthesizer) http.HandlerFunc {
+func ttsHandlerWithSynth(clients map[string]ttsSynthesizer, defaultEngine string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, maxTTSBodyBytes)
 
@@ -1645,7 +1690,7 @@ func ttsHandlerWithSynth(clients map[string]ttsSynthesizer) http.HandlerFunc {
 			return
 		}
 		if req.Engine == "" {
-			req.Engine = "pocket"
+			req.Engine = defaultEngine
 		}
 
 		client, ok := clients[req.Engine]
@@ -1653,6 +1698,12 @@ func ttsHandlerWithSynth(clients map[string]ttsSynthesizer) http.HandlerFunc {
 			http.Error(w, "unknown engine", http.StatusBadRequest)
 			return
 		}
+
+		traceID := req.TraceID
+		if traceID == "" {
+			traceID = newTraceID("tts")
+		}
+		startAt := time.Now()
 
 		// Parse emotion tag from text (same logic as OpenAI handler)
 		emotion, strippedText := parseEmotionTagInternal(req.Text)
@@ -1662,7 +1713,7 @@ func ttsHandlerWithSynth(clients map[string]ttsSynthesizer) http.HandlerFunc {
 			http.Error(w, "text is required (empty after removing emotion tag)", http.StatusBadRequest)
 			return
 		}
-		
+
 		// Use voice from emotion if no explicit voice provided
 		textToUse := strippedText
 		voiceToUse := req.Voice
@@ -1684,24 +1735,26 @@ func ttsHandlerWithSynth(clients map[string]ttsSynthesizer) http.HandlerFunc {
 			// This allows explicit requests for temperature=0, cfg_coef=0, padding_between=0.
 		}
 
+		log.Printf("[trace=%s][tts][engine=%s][voice=%s][chars=%d] synth_start", traceID, req.Engine, voiceToUse, utf8.RuneCountInString(textToUse))
 		pcm, sampleRate, err := client.Synthesize(r.Context(), textToUse, voiceToUse, opts)
 		if err != nil {
-			log.Printf("[tts] Synthesize error (%s): %v", req.Engine, err)
+			log.Printf("[trace=%s][tts][engine=%s] error=%v", traceID, req.Engine, err)
 			http.Error(w, "synthesis failed", http.StatusInternalServerError)
 			return
 		}
 
 		var wav bytes.Buffer
 		if err := audio.WriteWAV(&wav, pcm, sampleRate); err != nil {
-			log.Printf("[tts] WriteWAV error: %v", err)
+			log.Printf("[trace=%s][tts] write_wav_error=%v", traceID, err)
 			http.Error(w, "synthesis failed", http.StatusInternalServerError)
 			return
 		}
 
+		log.Printf("[trace=%s][tts][engine=%s][total_ms=%d][wav_bytes=%d] synth_complete", traceID, req.Engine, time.Since(startAt).Milliseconds(), wav.Len())
 		w.Header().Set("Content-Type", "audio/wav")
 		w.Header().Set("Content-Length", strconv.Itoa(wav.Len()))
 		if _, err := wav.WriteTo(w); err != nil {
-			log.Printf("[tts] Write response error: %v", err)
+			log.Printf("[trace=%s][tts] write_response_error=%v", traceID, err)
 			return
 		}
 	}
