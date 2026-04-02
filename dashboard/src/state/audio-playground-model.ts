@@ -195,6 +195,13 @@ export const AudioPlaygroundModel = createModel(
         next.length > MAX_TRANSCRIPTS ? next.slice(-MAX_TRANSCRIPTS) : next;
     }
 
+    function newTraceId(prefix: string): string {
+      if (crypto?.randomUUID) {
+        return `${prefix}-${crypto.randomUUID().slice(0, 8)}`;
+      }
+      return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    }
+
     function clearError() {
       error.value = null;
     }
@@ -420,10 +427,10 @@ export const AudioPlaygroundModel = createModel(
           try {
             const payload = JSON.parse(event.data) as TranscriptPayload;
             if (payload.text) {
-              addTranscript(payload.text);
+              addTranscript(`[trace:${newTraceId("stt")}][sse] ${payload.text}`);
             }
           } catch {
-            addTranscript(event.data);
+            addTranscript(`[trace:${newTraceId("stt")}][sse] ${event.data}`);
           }
         };
 
@@ -461,13 +468,14 @@ export const AudioPlaygroundModel = createModel(
       ttsBusy.value = true;
       error.value = null;
       const selectedVoice = ttsVoice.value.trim();
-      
+      const traceId = newTraceId("tts");
+
       // Build text with emotion tag if emotion is selected
       const emotion = ttsEmotion.value;
       const textToSend = emotion !== "not-set" ? `[emotion:${emotion}] ${text}` : text;
-      
+
       addTranscript(
-        `[TTS:${ttsEngine.value}${selectedVoice ? `:${selectedVoice}` : ""}${emotion !== "not-set" ? `:${emotion}` : ""}] "${text}"`,
+        `[trace:${traceId}][TTS:${ttsEngine.value}${selectedVoice ? `:${selectedVoice}` : ""}${emotion !== "not-set" ? `:${emotion}` : ""}] "${text}"`,
       );
 
       try {
@@ -493,6 +501,7 @@ export const AudioPlaygroundModel = createModel(
           text: string;
           engine: TTSEngine;
           voice: string;
+          trace_id: string;
           temperature?: number;
           cfg_coef?: number;
           padding_between?: number;
@@ -500,6 +509,7 @@ export const AudioPlaygroundModel = createModel(
           text: textToSend,
           engine: ttsEngine.value,
           voice: selectedVoice,
+          trace_id: traceId,
         };
         
         // Only include synthesis options for Kyutai engine
@@ -534,6 +544,7 @@ export const AudioPlaygroundModel = createModel(
         }
         
         const ctx = getAudioContext();
+        const decodeStartedAt = performance.now();
         const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
         const source = ctx.createBufferSource();
         source.buffer = audioBuffer;
@@ -545,12 +556,13 @@ export const AudioPlaygroundModel = createModel(
           if (currentTTSSource === source) {
             currentTTSSource = null;
           }
+          addTranscript(`[trace:${traceId}][TTS:${ttsEngine.value}${selectedVoice ? `:${selectedVoice}` : ""}] playback ended`);
         };
         
         source.start();
 
         addTranscript(
-          `[TTS:${ttsEngine.value}${selectedVoice ? `:${selectedVoice}` : ""}] ▶ Playing ${audioBuffer.duration.toFixed(1)}s audio`,
+          `[trace:${traceId}][TTS:${ttsEngine.value}${selectedVoice ? `:${selectedVoice}` : ""}] ▶ Playing ${audioBuffer.duration.toFixed(1)}s audio (decode ${Math.round(performance.now() - decodeStartedAt)}ms)`,
         );
         ttsInput.value = "";
       } catch (caught) {

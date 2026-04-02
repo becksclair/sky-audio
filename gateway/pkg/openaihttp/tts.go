@@ -28,6 +28,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/heliasar/sky-audio/gateway/pkg/audio"
@@ -144,6 +145,35 @@ func parseEmotionTag(text string) (emotion, strippedText string, found bool) {
 	return label, stripped, true
 }
 
+// sanitizeTTSInput normalizes text before synthesis to avoid sentence-tail artifacts.
+func sanitizeTTSInput(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return text
+	}
+
+	// Normalize line breaks and collapse excessive whitespace.
+	text = strings.ReplaceAll(text, "\r\n", " ")
+	text = strings.ReplaceAll(text, "\n", " ")
+	text = strings.ReplaceAll(text, "\t", " ")
+	text = strings.Join(strings.Fields(text), " ")
+
+	// Strip common markdown wrappers that sound terrible aloud.
+	text = strings.Trim(text, "`*_~")
+
+	// Remove trailing punctuation and symbol noise that often causes TTS glitches.
+	for len(text) > 0 {
+		r, size := utf8.DecodeLastRuneInString(text)
+		if unicode.IsPunct(r) || unicode.IsSymbol(r) || unicode.IsSpace(r) {
+			text = strings.TrimSpace(text[:len(text)-size])
+			continue
+		}
+		break
+	}
+
+	return text
+}
+
 // TTSSynthesizer is the interface for TTS clients
 type TTSSynthesizer interface {
 	Synthesize(ctx context.Context, text, voice string, opts *skywebrtc.SynthesisOptions) (pcm []byte, sampleRate int32, err error)
@@ -207,6 +237,12 @@ func TTSHandlerWithSynth(synthesizers map[string]TTSSynthesizer) http.HandlerFun
 		// Validate that text remains after emotion tag stripping
 		if strings.TrimSpace(strippedInput) == "" {
 			writeTTSError(w, http.StatusBadRequest, "invalid_request_error", "input is required (empty after removing emotion tag)")
+			return
+		}
+
+		strippedInput = sanitizeTTSInput(strippedInput)
+		if strippedInput == "" {
+			writeTTSError(w, http.StatusBadRequest, "invalid_request_error", "input is required after cleanup")
 			return
 		}
 
