@@ -1,0 +1,29 @@
+services:
+  sky-audio:
+    build: .
+    image: sky-audio:latest
+    container_name: sky-audio
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8686}:${PORT:-8686}"
+    environment:
+      - TTS_ENGINE=${TTS_ENGINE:-pocket}
+      - PORT=${PORT:-8686}
+      - SKY_AUDIO_API_KEY=${SKY_AUDIO_API_KEY:-}
+    # volumes:
+    #   # Optional: mount custom voices
+    #   - ./custom-voices:/app/workers/python-pocket-tts/voices
+    # healthcheck:
+    #   test: ["CMD", "curl", "-f", "http://localhost:${PORT:-8585}/health"]
+    #   interval: 30s
+    #   timeout: 10s
+    #   retries: 3
+
+    ## --- GPU support (uncomment for Kyutai with NVIDIA GPU) ---
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]

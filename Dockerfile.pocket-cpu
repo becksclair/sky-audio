@@ -1,0 +1,97 @@
+# sky-audio: Pocket TTS only — CPU-only PyTorch, no CUDA, no Kyutai
+#
+# Target: ~3-4GB image (vs 40GB full image)
+# Usage:
+#   docker build -f Dockerfile.pocket-cpu -t sky-audio-pocket .
+#   docker run -p 8686:8686 sky-audio-pocket
+#
+# Environment variables:
+#   PORT              - API port (default: 8686)
+#   SKY_AUDIO_API_KEY - Optional API key for authentication
+
+# ============================================================
+# Stage 1: Build the Go gateway binary
+# ============================================================
+FROM golang:1.26-bookworm AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    wget ca-certificates pkg-config libopus-dev libopusfile-dev && \
+    wget -qL https://github.com/microsoft/onnxruntime/releases/download/v1.24.4/onnxruntime-linux-x64-1.24.4.tgz && \
+    tar xzf onnxruntime-linux-x64-1.24.4.tgz && \
+    mkdir -p /usr/local/lib/onnxruntime /usr/local/include/onnxruntime && \
+    cp -r onnxruntime-linux-x64-1.24.4/lib/* /usr/local/lib/onnxruntime/ && \
+    cp -r onnxruntime-linux-x64-1.24.4/include/* /usr/local/include/onnxruntime/ && \
+    ldconfig && \
+    rm -rf onnxruntime-linux-x64-1.24.4*
+
+WORKDIR /src
+COPY go.work go.work.sum ./
+COPY gateway/go.mod gateway/go.sum ./gateway/
+RUN cd gateway && go mod download
+COPY dashboard/dist/ ./gateway/pkg/dashboard/dist/
+COPY gateway/ ./gateway/
+ENV CGO_LDFLAGS='-L/usr/local/lib/onnxruntime -lonnxruntime -Wl,-rpath,/usr/local/lib/onnxruntime'
+ENV CGO_CFLAGS='-I/usr/local/include/onnxruntime'
+RUN cd gateway && go build -o /sky-audio ./cmd/sky-audio
+
+# ============================================================
+# Stage 2: Runtime — Pocket TTS with CPU-only PyTorch
+# ============================================================
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates python3 python3-dev build-essential curl \
+    libopus0 libopusfile0 ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+# ONNX Runtime (for Silero VAD)
+COPY --from=builder /usr/local/lib/onnxruntime/ /usr/local/lib/onnxruntime/
+RUN echo "/usr/local/lib/onnxruntime" > /etc/ld.so.conf.d/onnxruntime.conf && ldconfig
+
+# uv package manager — copy from official image to avoid flaky CDN downloads
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+WORKDIR /app
+
+# Gateway binary + models
+COPY --from=builder /sky-audio ./sky-audio
+COPY gateway/models/ ./gateway/models/
+
+# Proto files (worker needs these)
+COPY proto/ ./proto/
+
+# ---- Pocket TTS worker ----
+COPY workers/python-pocket-tts/ ./workers/python-pocket-tts/
+
+# Patch pyproject.toml to use CPU-only PyTorch index.
+# - `explicit = true` means only packages explicitly mapped via [tool.uv.sources]
+#   are pulled from the PyTorch index; everything else comes from PyPI.
+# - This avoids the setuptools version shadowing problem.
+RUN cd workers/python-pocket-tts && \
+    cat >> pyproject.toml <<'UVEOF'
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+UVEOF
+
+# Remove lockfile so uv resolves fresh with CPU torch
+RUN cd workers/python-pocket-tts && rm -f uv.lock
+
+# Install deps — CPU torch from pytorch-cpu index, everything else from PyPI
+RUN cd workers/python-pocket-tts && uv sync --python 3.13
+
+# Entrypoint
+COPY docker-entrypoint.sh /docker-entrypoint.sh
+RUN chmod +x /docker-entrypoint.sh
+
+ENV TTS_ENGINE=pocket
+ENV PORT=8686
+ENV LD_LIBRARY_PATH=/usr/local/lib/onnxruntime
+
+EXPOSE 8686
+ENTRYPOINT ["/docker-entrypoint.sh"]

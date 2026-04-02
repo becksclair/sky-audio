@@ -1,0 +1,29 @@
+# Git
+.git
+.gitignore
+
+# Build artifacts
+gateway/sky-audio
+dashboard/node_modules
+dashboard/src
+
+# Python venvs (rebuilt in container)
+workers/python-pocket-tts/.venv
+workers/python-kyutai-tts/.venv
+workers/python-nemo/.venv
+workers/rust-candle/target
+
+# Dev files
+*.log
+*.sock
+.mise.*
+mise.toml
+scripts/
+docs/
+*.json.bak
+
+# Analysis scripts
+analyze_*.py
+continue_*.py
+voice_pitch_analysis*.json
+PRODUCTION_READINESS_REVIEW.md
