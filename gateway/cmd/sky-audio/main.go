@@ -37,9 +37,11 @@ const (
 	ttsPocketSocketPath = "/tmp/sky-audio-tts-pocket.sock"
 	ttsKyutaiSocketPath = "/tmp/sky-audio-tts-kyutai.sock"
 
-	defaultTTSEngine = "pocket"
-	maxTTSTextLen    = 2000
-	maxTTSBodyBytes  = 25600
+	defaultTTSEngine         = "pocket"
+	defaultSTTEndOfSpeechMs  = 150
+	maxTTSTextLen            = 2000
+	maxTTSBodyBytes          = 25600
+	sttEndOfSpeechEnvVarName = "STT_END_OF_SPEECH_MS"
 )
 
 type sseClient struct {
@@ -74,6 +76,18 @@ func resolveTTSEngine() string {
 		log.Fatalf("[FATAL] Invalid TTS_ENGINE %q (expected pocket or kyutai)", engine)
 	}
 	return engine
+}
+
+func resolveSTTEndOfSpeechMs() (int, string) {
+	value := strings.TrimSpace(os.Getenv(sttEndOfSpeechEnvVarName))
+	if value == "" {
+		return defaultSTTEndOfSpeechMs, "default"
+	}
+	ms, err := strconv.Atoi(value)
+	if err != nil || ms < 0 {
+		log.Fatalf("[FATAL] Invalid %s %q (expected non-negative integer milliseconds)", sttEndOfSpeechEnvVarName, value)
+	}
+	return ms, sttEndOfSpeechEnvVarName
 }
 
 func activeTTSVoiceCatalogPaths(engine string) map[string]string {
@@ -1131,13 +1145,14 @@ func main() {
 
 	transcripts := newTranscriptHub()
 	peerRegistry := skywebrtc.NewPeerRegistry()
+	sttEndOfSpeechMs, sttEndOfSpeechSource := resolveSTTEndOfSpeechMs()
 	speechCfg := speech.Config{
 		ModelPath:            "gateway/models/silero_vad.onnx",
 		Threshold:            0.5,
-		MinSilenceDurationMs: 800,
+		MinSilenceDurationMs: sttEndOfSpeechMs,
 		SpeechPadMs:          30,
 	}
-	log.Println("[INFO] Per-session speech pipeline enabled")
+	log.Printf("[INFO] Per-session speech pipeline enabled (stt_end_of_speech_ms=%d source=%s)", sttEndOfSpeechMs, sttEndOfSpeechSource)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {

@@ -42,6 +42,7 @@ Operational notes:
 - If `SKY_AUDIO_API_KEY` is set in the env file, the deploy verification uses it for the authenticated API probe.
 - The unit sets an explicit stable `PATH` so the gateway can spawn worker processes via `uv` under systemd without depending on a version-specific install directory.
 - Setting `PORT` makes the gateway bind to all interfaces (`:<port>`), so set `SKY_AUDIO_API_KEY` in the env file before doing that.
+- Set `STT_END_OF_SPEECH_MS` in the env file to control how long the gateway waits for silence before finalizing live speech. Default: `150`.
 
 ## Test split
 
@@ -91,3 +92,17 @@ The gateway exposes OpenAI-compatible endpoints for TTS/STT, enabling integratio
 ```
 
 See [docs/openclaw-integration.md](docs/openclaw-integration.md) for detailed setup instructions.
+
+## STT end-of-speech tuning
+
+The live STT pipeline finalizes an utterance after a short silence window. You can override that threshold with `STT_END_OF_SPEECH_MS`.
+
+```bash
+export STT_END_OF_SPEECH_MS=250
+mise run dev
+```
+
+- Default: `150`
+- Units: milliseconds
+- Lower values return transcripts faster but can split speech on brief pauses
+- Higher values are more forgiving for slower speakers but add latency before final transcripts
