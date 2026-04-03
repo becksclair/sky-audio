@@ -293,9 +293,12 @@ func TestModelsHandlerRejectsPost(t *testing.T) {
 
 // mockSTTTranscriber implements STTTranscriber for testing
 type mockSTTTranscriber struct {
-	shouldFail     bool
-	lastAudio      []byte
-	lastSampleRate int32
+	shouldFail       bool
+	lastAudio        []byte
+	lastSampleRate   int32
+	streamEvents     []streamingSTTResponse
+	streamShouldFail bool
+	transcribeText   string
 }
 
 func (m *mockSTTTranscriber) Transcribe(ctx context.Context, audioData []byte, sampleRate int32) (string, error) {
@@ -304,7 +307,25 @@ func (m *mockSTTTranscriber) Transcribe(ctx context.Context, audioData []byte, s
 	}
 	m.lastAudio = audioData
 	m.lastSampleRate = sampleRate
+	if m.transcribeText != "" {
+		return m.transcribeText, nil
+	}
 	return "Hello, this is a test transcription.", nil
+}
+
+func (m *mockSTTTranscriber) TranscribeStream(ctx context.Context, audioData []byte, sampleRate int32, onTranscript func(text string, isFinal bool)) error {
+	m.lastAudio = audioData
+	m.lastSampleRate = sampleRate
+	if m.streamShouldFail {
+		return errors.New("stream transcription failed")
+	}
+	if len(m.streamEvents) == 0 {
+		m.streamEvents = []streamingSTTResponse{{Text: "Hello, this is a test transcription.", IsFinal: true}}
+	}
+	for _, event := range m.streamEvents {
+		onTranscript(event.Text, event.IsFinal)
+	}
+	return nil
 }
 
 func TestTranscriptionsHandlerRequiresFile(t *testing.T) {
@@ -403,6 +424,134 @@ func TestTranscriptionsHandlerRejectsGet(t *testing.T) {
 
 	if rr.Code != http.StatusMethodNotAllowed {
 		t.Errorf("Expected status %d, got %d", http.StatusMethodNotAllowed, rr.Code)
+	}
+}
+
+func TestTranscriptionsHandlerSupportsStreaming(t *testing.T) {
+	mock := &mockSTTTranscriber{
+		streamEvents: []streamingSTTResponse{
+			{Text: "hello", IsFinal: false},
+			{Text: "hello world", IsFinal: true},
+		},
+	}
+	handler := TranscriptionsHandlerWithTranscriber(mock)
+
+	wavData := createMinimalWAV()
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	_ = writer.WriteField("model", "whisper-1")
+	_ = writer.WriteField("stream", "true")
+	part, _ := writer.CreateFormFile("file", "test.wav")
+	part.Write(wavData)
+	writer.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("Expected status %d, got %d", http.StatusOK, rr.Code)
+	}
+	if got := rr.Header().Get("Content-Type"); got != "text/event-stream" {
+		t.Fatalf("Expected Content-Type text/event-stream, got %q", got)
+	}
+
+	bodyStr := rr.Body.String()
+	if !strings.Contains(bodyStr, "data: {\"text\":\"hello\",\"isFinal\":false}") {
+		t.Fatalf("Expected partial transcript event, got %q", bodyStr)
+	}
+	if !strings.Contains(bodyStr, "data: {\"text\":\"hello world\",\"isFinal\":true}") {
+		t.Fatalf("Expected final transcript event, got %q", bodyStr)
+	}
+	if !strings.Contains(bodyStr, "data: [DONE]") {
+		t.Fatalf("Expected DONE sentinel, got %q", bodyStr)
+	}
+}
+
+func TestTranscriptionsHandlerRejectsInvalidStreamValue(t *testing.T) {
+	handler := TranscriptionsHandlerWithTranscriber(&mockSTTTranscriber{})
+
+	wavData := createMinimalWAV()
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	_ = writer.WriteField("model", "whisper-1")
+	_ = writer.WriteField("stream", "definitely-not-a-bool")
+	part, _ := writer.CreateFormFile("file", "test.wav")
+	part.Write(wavData)
+	writer.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("Expected status %d, got %d", http.StatusBadRequest, rr.Code)
+	}
+}
+
+func TestTranscriptionsHandlerNormalizesEmptyTranscription(t *testing.T) {
+	mock := &mockSTTTranscriber{transcribeText: " \n\t "}
+	handler := TranscriptionsHandlerWithTranscriber(mock)
+
+	wavData := createMinimalWAV()
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	_ = writer.WriteField("model", "whisper-1")
+	part, _ := writer.CreateFormFile("file", "test.wav")
+	part.Write(wavData)
+	writer.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("Expected status %d, got %d", http.StatusOK, rr.Code)
+	}
+
+	var resp STTResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Failed to unmarshal response: %v", err)
+	}
+	if resp.Text != "[empty transcription]" {
+		t.Fatalf("Expected normalized empty transcript, got %q", resp.Text)
+	}
+}
+
+func TestTranscriptionsHandlerStreamingFailureWritesErrorEvent(t *testing.T) {
+	mock := &mockSTTTranscriber{streamShouldFail: true}
+	handler := TranscriptionsHandlerWithTranscriber(mock)
+
+	wavData := createMinimalWAV()
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	_ = writer.WriteField("model", "whisper-1")
+	_ = writer.WriteField("stream", "true")
+	part, _ := writer.CreateFormFile("file", "test.wav")
+	part.Write(wavData)
+	writer.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("Expected status %d, got %d", http.StatusOK, rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "data: {\"error\":\"Transcription failed\"}") {
+		t.Fatalf("Expected streaming error event, got %q", rr.Body.String())
 	}
 }
 
@@ -876,11 +1025,11 @@ func TestTranscriptionsHandlerWithEnsureRunningUnavailable(t *testing.T) {
 // TestParseEmotionTag verifies emotion tag parsing functionality
 func TestParseEmotionTag(t *testing.T) {
 	tests := []struct {
-		name          string
-		input         string
-		wantEmotion   string
-		wantStripped  string
-		wantFound     bool
+		name         string
+		input        string
+		wantEmotion  string
+		wantStripped string
+		wantFound    bool
 	}{
 		{
 			name:         "no tag",
@@ -1098,11 +1247,11 @@ func TestTTSHandlerWithSynthSynthesisOptions(t *testing.T) {
 	})
 
 	reqBody := TTSRequest{
-		Model:           "sky-kyutai",
-		Input:           "Hello world",
-		Temperature:     0.95,
-		CfgCoef:         2.0,
-		PaddingBetween:  1,
+		Model:          "sky-kyutai",
+		Input:          "Hello world",
+		Temperature:    0.95,
+		CfgCoef:        2.0,
+		PaddingBetween: 1,
 	}
 	body, _ := json.Marshal(reqBody)
 	req := httptest.NewRequest(http.MethodPost, "/v1/audio/speech", bytes.NewReader(body))
@@ -1206,11 +1355,11 @@ func TestTTSHandlerWithSynthEmotionWithOptions(t *testing.T) {
 	})
 
 	reqBody := TTSRequest{
-		Model:           "sky-kyutai",
-		Input:           "[emotion:desire] I want this",
-		Temperature:     0.85,
-		CfgCoef:         1.8,
-		PaddingBetween:  2,
+		Model:          "sky-kyutai",
+		Input:          "[emotion:desire] I want this",
+		Temperature:    0.85,
+		CfgCoef:        1.8,
+		PaddingBetween: 2,
 	}
 	body, _ := json.Marshal(reqBody)
 	req := httptest.NewRequest(http.MethodPost, "/v1/audio/speech", bytes.NewReader(body))
@@ -1246,13 +1395,13 @@ func TestTTSHandlerWithSynthEmotionWithOptions(t *testing.T) {
 // TestResolveEngineAndVoice verifies engine and voice resolution
 func TestResolveEngineAndVoice(t *testing.T) {
 	tests := []struct {
-		name        string
-		model       string
-		voice       string
-		emotion     string
-		wantEngine  string
-		wantVoice   string
-		wantErr     bool
+		name       string
+		model      string
+		voice      string
+		emotion    string
+		wantEngine string
+		wantVoice  string
+		wantErr    bool
 	}{
 		{
 			name:       "basic pocket",

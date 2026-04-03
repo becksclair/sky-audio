@@ -26,6 +26,7 @@ type STTRequest struct {
 	Prompt         string  // optional prompt to guide transcription
 	ResponseFormat string  // "json", "text", "srt", "verbose_json", "vtt"
 	Temperature    float64 // sampling temperature (not supported by most STT)
+	Stream         bool    // stream partial/final transcripts over SSE
 }
 
 // STTResponse matches OpenAI's transcription response (json format)
@@ -64,29 +65,46 @@ type STTTranscriber interface {
 	Transcribe(ctx context.Context, audioData []byte, sampleRate int32) (string, error)
 }
 
+// STTStreamingTranscriber streams partial/final transcripts over a callback.
+type STTStreamingTranscriber interface {
+	TranscribeStream(ctx context.Context, audioData []byte, sampleRate int32, onTranscript func(text string, isFinal bool)) error
+}
+
 // sttTranscriber creates a new STT client per request to ensure thread safety
 type sttTranscriber struct {
 	socketPath string
 }
 
 func (t *sttTranscriber) Transcribe(ctx context.Context, audioData []byte, sampleRate int32) (string, error) {
-	// Create a new client for this request (ensures thread safety)
+	var finalText string
+	if err := t.TranscribeStream(ctx, audioData, sampleRate, func(text string, isFinal bool) {
+		if isFinal && strings.TrimSpace(text) != "" {
+			finalText = text
+		}
+	}); err != nil {
+		return "", err
+	}
+	if finalText == "" {
+		return "", errors.New("final transcript not received")
+	}
+	return finalText, nil
+}
+
+func (t *sttTranscriber) TranscribeStream(ctx context.Context, audioData []byte, sampleRate int32, onTranscript func(text string, isFinal bool)) error {
 	client, err := skywebrtc.NewSTTClient(t.socketPath)
 	if err != nil {
-		return "", fmt.Errorf("connect to STT worker: %w", err)
+		return fmt.Errorf("connect to STT worker: %w", err)
 	}
 	defer client.Close()
 
-	// Start the gRPC stream
 	if err := client.StartStream(ctx); err != nil {
-		return "", fmt.Errorf("start stream: %w", err)
+		return fmt.Errorf("start stream: %w", err)
 	}
 
-	// Stream audio chunks to the worker to avoid gRPC 4MB message limit
-	chunkSize := 1024 * 1024 // 1MB chunks
+	chunkSize := 1024 * 1024
 	if len(audioData) == 0 {
 		if err := client.SendAudio(nil, true, sampleRate); err != nil {
-			return "", fmt.Errorf("send audio: %w", err)
+			return fmt.Errorf("send audio: %w", err)
 		}
 	} else {
 		for i := 0; i < len(audioData); i += chunkSize {
@@ -96,35 +114,26 @@ func (t *sttTranscriber) Transcribe(ctx context.Context, audioData []byte, sampl
 			}
 			isLast := end == len(audioData)
 			if err := client.SendAudio(audioData[i:end], isLast, sampleRate); err != nil {
-				return "", fmt.Errorf("send audio chunk: %w", err)
+				return fmt.Errorf("send audio chunk: %w", err)
 			}
 		}
 	}
 
-	// Receive transcripts until we get a final result
-	var finalText string
 	for {
 		transcript, err := client.Recv()
 		if err != nil {
-			// Handle clean stream closure (EOF) - return accumulated text
 			if errors.Is(err, io.EOF) {
-				return finalText, nil
+				return nil
 			}
-			return "", fmt.Errorf("recv transcript: %w", err)
+			return fmt.Errorf("recv transcript: %w", err)
 		}
-
-		// Accumulate non-empty transcripts
-		if transcript.Text != "" {
-			finalText = transcript.Text
+		if transcript != nil && onTranscript != nil {
+			onTranscript(transcript.Text, transcript.IsFinal)
 		}
-
-		// Stop when we get the final result
-		if transcript.IsFinal {
-			break
+		if transcript != nil && transcript.IsFinal {
+			return nil
 		}
 	}
-
-	return finalText, nil
 }
 
 // EnsureRunningFunc is called before using STT to ensure the worker is running (lazy loading).
@@ -211,6 +220,18 @@ func handleTranscription(w http.ResponseWriter, r *http.Request, transcriber STT
 	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
 	defer cancel()
 
+	if req.Stream {
+		streamingTranscriber, ok := transcriber.(STTStreamingTranscriber)
+		if !ok {
+			writeTTSError(w, http.StatusBadRequest, "invalid_request_error", "Streaming transcription is not supported by this handler")
+			return
+		}
+		if err := writeStreamingTranscription(w, ctx, pcmData, sampleRate, streamingTranscriber); err != nil {
+			log.Printf("[stt] streaming transcription error: %v", err)
+		}
+		return
+	}
+
 	text, err := transcriber.Transcribe(ctx, pcmData, sampleRate)
 	if err != nil {
 		// Log detailed error server-side, return generic message to client
@@ -280,6 +301,74 @@ func handleTranscription(w http.ResponseWriter, r *http.Request, transcriber STT
 	}
 }
 
+type streamingSTTResponse struct {
+	Text    string `json:"text"`
+	IsFinal bool   `json:"isFinal"`
+}
+
+func writeStreamingTranscription(w http.ResponseWriter, ctx context.Context, pcmData []byte, sampleRate int32, transcriber STTStreamingTranscriber) error {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeTTSError(w, http.StatusInternalServerError, "api_error", "Streaming unsupported by response writer")
+		return fmt.Errorf("response writer does not support flushing")
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var writeErr error
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	writeFrame := func(text string, isFinal bool) error {
+		payload, err := json.Marshal(streamingSTTResponse{Text: text, IsFinal: isFinal})
+		if err != nil {
+			return fmt.Errorf("marshal streaming transcript: %w", err)
+		}
+		if _, err := fmt.Fprintf(w, "data: %s\n\n", payload); err != nil {
+			return err
+		}
+		flusher.Flush()
+		return nil
+	}
+
+	if err := transcriber.TranscribeStream(ctx, pcmData, sampleRate, func(text string, isFinal bool) {
+		if writeErr != nil {
+			return
+		}
+		text = strings.TrimSpace(text)
+		if text == "" {
+			return
+		}
+		if err := writeFrame(text, isFinal); err != nil {
+			writeErr = err
+			cancel()
+			log.Printf("[stt] write streaming frame error: %v", err)
+		}
+	}); err != nil {
+		if writeErr != nil {
+			return writeErr
+		}
+		_, _ = fmt.Fprintf(w, "data: {\"error\":%q}\n\n", "Transcription failed")
+		flusher.Flush()
+		return err
+	}
+
+	if writeErr != nil {
+		return writeErr
+	}
+
+	if _, err := fmt.Fprint(w, "data: [DONE]\n\n"); err != nil {
+		return err
+	}
+	flusher.Flush()
+	return nil
+}
+
 func parseSTTRequest(r *http.Request) (*STTRequest, error) {
 	req := &STTRequest{}
 
@@ -323,6 +412,14 @@ func parseSTTRequest(r *http.Request) (*STTRequest, error) {
 		if err == nil {
 			req.Temperature = temp
 		}
+	}
+
+	if streamStr := strings.TrimSpace(r.FormValue("stream")); streamStr != "" {
+		stream, err := strconv.ParseBool(streamStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid stream value: %q", streamStr)
+		}
+		req.Stream = stream
 	}
 
 	return req, nil

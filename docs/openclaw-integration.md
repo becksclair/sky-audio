@@ -19,6 +19,13 @@ This gives OpenClaw fully local, self-hosted voice capabilities without requirin
 mise run dev
 ```
 
+You can tune live STT end-of-speech behavior with `STT_END_OF_SPEECH_MS` before starting the gateway. Lower values make final transcripts return faster; higher values are more tolerant of pauses.
+
+```bash
+export STT_END_OF_SPEECH_MS=250
+mise run dev
+```
+
 The gateway listens on `:8080` by default. Verify it's running:
 
 ```bash
@@ -157,6 +164,7 @@ curl -X POST http://localhost:8585/v1/audio/transcriptions \
 - `model` (required) - STT model ID
 - `language` (optional) - Language hint (e.g., `en`, `fr`, `de`)
 - `response_format` (optional) - `json`, `text`, `verbose_json`, `srt`, `vtt` (default: `json`)
+- `stream` (optional) - `true` to receive partial/final transcript events over SSE
 - `prompt` (optional) - Ignored for compatibility
 - `temperature` (optional) - Ignored for compatibility
 
@@ -175,6 +183,15 @@ Note: MP3 and OGG/Opus are not supported. Please convert to WAV before uploading
 **Response (text format):**
 ```
 This is the transcribed text from the audio.
+```
+
+**Streaming response (`stream=true`):**
+```text
+data: {"text":"hello","isFinal":false}
+
+data: {"text":"hello world","isFinal":true}
+
+data: [DONE]
 ```
 
 ### GET /v1/models
