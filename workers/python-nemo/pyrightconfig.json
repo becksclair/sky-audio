@@ -1,6 +1,8 @@
 {
   "include": ["."],
-  "extraPaths": ["."],
+  "exclude": [".venv", "pb"],
   "pythonVersion": "3.13",
-  "typeCheckingMode": "basic"
+  "typeCheckingMode": "basic",
+  "venvPath": ".",
+  "venv": ".venv"
 }

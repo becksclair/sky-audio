@@ -1,7 +1,9 @@
 package audio
 
 import (
+	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 )
@@ -41,4 +43,126 @@ func WriteWAV(w io.Writer, pcm []byte, sampleRate int32) error {
 	}
 	_, err := w.Write(pcm)
 	return err
+}
+
+func DecodeWAV(data []byte) ([]byte, int32, error) {
+	if len(data) < 44 {
+		return nil, 0, errors.New("WAV file too small")
+	}
+	if !bytes.Equal(data[0:4], []byte("RIFF")) {
+		return nil, 0, errors.New("invalid RIFF header")
+	}
+	if !bytes.Equal(data[8:12], []byte("WAVE")) {
+		return nil, 0, errors.New("invalid WAVE format")
+	}
+
+	var sampleRate int32
+	var bitsPerSample int16
+	var numChannels int16
+
+	offset := 12
+	for offset < len(data)-8 {
+		chunkID := string(data[offset : offset+4])
+		chunkSize := int64(uint32(data[offset+4]) | uint32(data[offset+5])<<8 | uint32(data[offset+6])<<16 | uint32(data[offset+7])<<24)
+		if chunkSize < 0 || int64(offset)+8+chunkSize > int64(len(data)) {
+			return nil, 0, errors.New("invalid chunk size")
+		}
+		if chunkSize == 0 {
+			return nil, 0, errors.New("zero-size chunk")
+		}
+
+		switch chunkID {
+		case "fmt ":
+			if chunkSize < 16 || int64(offset)+24 > int64(len(data)) {
+				return nil, 0, errors.New("invalid fmt chunk")
+			}
+			audioFormat := int16(data[offset+8]) | int16(data[offset+9])<<8
+			if audioFormat != 1 {
+				return nil, 0, fmt.Errorf("unsupported WAV audio format %d (only PCM/format 1 is supported)", audioFormat)
+			}
+			numChannels = int16(data[offset+10]) | int16(data[offset+11])<<8
+			sampleRate = int32(data[offset+12]) | int32(data[offset+13])<<8 | int32(data[offset+14])<<16 | int32(data[offset+15])<<24
+			bitsPerSample = int16(data[offset+22]) | int16(data[offset+23])<<8
+			if sampleRate <= 0 {
+				return nil, 0, fmt.Errorf("invalid sample rate: %d", sampleRate)
+			}
+		case "data":
+			if int64(offset)+8+chunkSize > int64(len(data)) {
+				return nil, 0, errors.New("invalid data chunk")
+			}
+			chunkSizeInt := int(chunkSize)
+			pcmData := data[offset+8 : offset+8+chunkSizeInt]
+			pcmData, sampleRate, err := ConvertToMono16kHz(pcmData, sampleRate, numChannels, bitsPerSample)
+			if err != nil {
+				return nil, 0, fmt.Errorf("WAV conversion failed: %w", err)
+			}
+			return pcmData, sampleRate, nil
+		}
+
+		offset += 8 + int(chunkSize)
+		if chunkSize%2 == 1 {
+			offset++
+		}
+	}
+
+	return nil, 0, errors.New("data chunk not found")
+}
+
+func ConvertToMono16kHz(data []byte, sampleRate int32, channels int16, bitsPerSample int16) ([]byte, int32, error) {
+	targetRate := int32(TargetSampleRate)
+	if sampleRate < 4000 || sampleRate > 384000 {
+		return nil, 0, fmt.Errorf("unsupported sample rate: %d (must be between 4000 and 384000)", sampleRate)
+	}
+	if channels == 1 && bitsPerSample == 16 && sampleRate == targetRate {
+		return data, sampleRate, nil
+	}
+
+	var samples []int16
+	switch bitsPerSample {
+	case 8:
+		samples = make([]int16, len(data))
+		for i, b := range data {
+			samples[i] = int16(b-128) << 8
+		}
+	case 16:
+		samples = make([]int16, len(data)/2)
+		for i := range samples {
+			samples[i] = int16(data[i*2]) | int16(data[i*2+1])<<8
+		}
+	default:
+		return nil, 0, fmt.Errorf("unsupported bits per sample: %d (supported: 8, 16)", bitsPerSample)
+	}
+
+	if channels > 1 {
+		monoSamples := make([]int16, len(samples)/int(channels))
+		for i := 0; i < len(monoSamples); i++ {
+			sum := int32(0)
+			for ch := 0; ch < int(channels); ch++ {
+				sum += int32(samples[i*int(channels)+ch])
+			}
+			monoSamples[i] = int16(sum / int32(channels))
+		}
+		samples = monoSamples
+	}
+
+	if sampleRate != targetRate {
+		ratio := float64(targetRate) / float64(sampleRate)
+		targetLen := int(float64(len(samples)) * ratio)
+		resampled := make([]int16, targetLen)
+		for i := 0; i < targetLen; i++ {
+			srcIdx := int(float64(i) / ratio)
+			if srcIdx < len(samples) {
+				resampled[i] = samples[srcIdx]
+			}
+		}
+		samples = resampled
+	}
+
+	result := make([]byte, len(samples)*2)
+	for i, s := range samples {
+		result[i*2] = byte(s)
+		result[i*2+1] = byte(s >> 8)
+	}
+
+	return result, targetRate, nil
 }

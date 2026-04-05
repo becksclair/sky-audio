@@ -26,6 +26,7 @@ import (
 	"github.com/heliasar/sky-audio/gateway/pkg/openaihttp"
 	pb "github.com/heliasar/sky-audio/gateway/pkg/pb"
 	"github.com/heliasar/sky-audio/gateway/pkg/process"
+	"github.com/heliasar/sky-audio/gateway/pkg/realtimeevents"
 	"github.com/heliasar/sky-audio/gateway/pkg/speech"
 	"github.com/heliasar/sky-audio/gateway/pkg/vram"
 	skywebrtc "github.com/heliasar/sky-audio/gateway/pkg/webrtc"
@@ -275,6 +276,25 @@ type trackedSession struct {
 	skywebrtc.PeerSession
 	onClose func()
 	closed  atomic.Bool
+}
+
+func (s *trackedSession) SetAudioSink(sink skywebrtc.PeerAudioSink) {
+	if setter, ok := s.PeerSession.(skywebrtc.PeerAudioSinkSetter); ok {
+		setter.SetAudioSink(sink)
+	}
+}
+
+func (s *trackedSession) SetEventSink(sink func(map[string]any) error) {
+	if setter, ok := s.PeerSession.(skywebrtc.PeerEventSinkSetter); ok {
+		setter.SetEventSink(sink)
+	}
+}
+
+func (s *trackedSession) HandleEvent(event map[string]any) error {
+	if handler, ok := s.PeerSession.(skywebrtc.PeerEventHandler); ok {
+		return handler.HandleEvent(event)
+	}
+	return nil
 }
 
 func (s *trackedSession) Close() {
@@ -892,6 +912,17 @@ func (s *lazyTTSSynthesizer) Synthesize(ctx context.Context, text, voice string,
 	return client.Synthesize(ctx, text, voice, opts)
 }
 
+func (s *lazyTTSSynthesizer) SynthesizeStream(ctx context.Context, text, voice string, opts *skywebrtc.SynthesisOptions, onChunk func(pcm []byte, sampleRate int32) error) error {
+	client, cleanup := s.loader.EnsureRunning()
+	if client == nil {
+		return fmt.Errorf("%s TTS worker unavailable", s.loader.engine)
+	}
+	if cleanup != nil {
+		defer cleanup()
+	}
+	return client.SynthesizeStream(ctx, text, voice, opts, onChunk)
+}
+
 func (l *lazySTTLoader) Stop() {
 	l.mu.Lock()
 	// Wait for any in-flight shutdown to complete before proceeding
@@ -953,12 +984,22 @@ type audioSession struct {
 	closed       atomic.Bool
 }
 
+type realtimeCallSession struct {
+	inner          *audioSession
+	emitter        *realtimeevents.TranscriptEmitter
+	eventSink      func(map[string]any) error
+	audioSink      skywebrtc.PeerAudioSink
+	synths         map[string]openaihttp.TTSSynthesizer
+	responseRunner *openaihttp.RealtimeResponseRunner
+}
+
 func newAudioSession(
 	ctx context.Context,
 	peerID string,
 	socketPath string,
 	cfg speech.Config,
 	hub *transcriptHub,
+	onTranscript func(*pb.Transcript),
 	onFatal func(),
 ) (*audioSession, error) {
 	sessionCtx, cancel := context.WithCancel(ctx)
@@ -1003,6 +1044,9 @@ func newAudioSession(
 		log.Printf("[trace=%s][stt][session=%s][final=%v][chars=%d] received", traceID, peerID, transcript.IsFinal, utf8.RuneCountInString(transcript.Text))
 		log.Printf("[trace=%s][stt][session=%s][publish_ms=%d] published", traceID, peerID, time.Since(receivedAt).Milliseconds())
 		hub.Publish(peerID, transcript)
+		if onTranscript != nil {
+			onTranscript(transcript)
+		}
 	})
 
 	return session, nil
@@ -1057,6 +1101,116 @@ func (s *audioSession) Close() {
 			log.Printf("[WARN] Session %s pipeline destroy failed: %v", s.id, err)
 		}
 		s.hub.CloseSession(s.id)
+	})
+}
+
+func (s *realtimeCallSession) Start() {
+	s.inner.Start()
+	_ = s.emitter.EmitSessionCreated()
+}
+
+func (s *realtimeCallSession) HandlePCM(pcm []byte) {
+	s.inner.HandlePCM(pcm)
+}
+
+func (s *realtimeCallSession) HandleTrackEnded() {
+	s.inner.HandleTrackEnded()
+}
+
+func (s *realtimeCallSession) Close() {
+	if s.responseRunner != nil {
+		s.responseRunner.CancelIfActive()
+	}
+	if s.audioSink != nil {
+		if err := s.audioSink.Close(); err != nil {
+			log.Printf("[realtime][calls][session=%s] audio sink close error: %v", s.emitter.SessionID(), err)
+		}
+	}
+	s.inner.Close()
+}
+
+func (s *realtimeCallSession) SetEventSink(sink func(map[string]any) error) {
+	s.eventSink = sink
+	s.emitter.SetSink(sink)
+}
+
+func (s *realtimeCallSession) SetAudioSink(sink skywebrtc.PeerAudioSink) {
+	s.audioSink = sink
+}
+
+func (s *realtimeCallSession) onTranscript(transcript *pb.Transcript) {
+	if transcript == nil {
+		return
+	}
+	if err := s.emitter.HandleTranscript(transcript.Text, transcript.IsFinal); err != nil {
+		log.Printf("[realtime][calls][session=%s] event emit error: %v", s.emitter.SessionID(), err)
+	}
+}
+
+func (s *realtimeCallSession) HandleEvent(event map[string]any) error {
+	eventType, _ := event["type"].(string)
+	switch eventType {
+	case "response.create":
+		return s.handleResponseCreate(event)
+	case "response.cancel":
+		responseID, _ := event["response_id"].(string)
+		if s.responseRunner == nil {
+			return s.emitError("invalid_request_error", "no response is in progress")
+		}
+		if err := s.responseRunner.Cancel(responseID); err != nil {
+			return s.emitError("invalid_request_error", err.Error())
+		}
+		if s.audioSink != nil {
+			if clearer, ok := s.audioSink.(interface{ Clear() error }); ok {
+				_ = clearer.Clear()
+			}
+		}
+		return nil
+	case "ping":
+		return s.emitEvent(map[string]any{"type": "pong"})
+	default:
+		return s.emitError("unsupported_event", fmt.Sprintf("Unsupported event type %q", eventType))
+	}
+}
+
+func (s *realtimeCallSession) handleResponseCreate(event map[string]any) error {
+	if s.audioSink == nil {
+		return s.emitError("api_error", "realtime audio output is not configured")
+	}
+	responsePayload, ok := event["response"]
+	if !ok {
+		return s.emitError("invalid_request_error", "response is required")
+	}
+	payload, err := json.Marshal(responsePayload)
+	if err != nil {
+		return s.emitError("invalid_request_error", "response must be a valid object")
+	}
+	var req openaihttp.RealtimeResponseCreateRequest
+	if err := json.Unmarshal(payload, &req); err != nil {
+		return s.emitError("invalid_request_error", "response must be a valid object")
+	}
+
+	if s.responseRunner == nil {
+		return s.emitError("api_error", "realtime response runner is not configured")
+	}
+	if _, err := s.responseRunner.Start(s.inner.ctx, &req); err != nil {
+		return s.emitError("api_error", err.Error())
+	}
+	return nil
+}
+
+func (s *realtimeCallSession) emitEvent(event map[string]any) error {
+	if s.eventSink == nil {
+		return nil
+	}
+	return s.eventSink(event)
+}
+
+func (s *realtimeCallSession) emitError(code, message string) error {
+	return s.emitEvent(map[string]any{
+		"type":    "error",
+		"code":    code,
+		"message": message,
 	})
 }
 
@@ -1172,29 +1326,65 @@ func main() {
 		log.Printf("[INFO] Loaded %s voice catalog: %d voices (default=%s)", engine, len(catalog.Voices), catalog.Default)
 	}
 
+	newPeerSession := func(peerID string) (skywebrtc.PeerSession, error) {
+		cleanup := sttLazy.EnsureRunning()
+		if cleanup == nil {
+			return nil, fmt.Errorf("stt unavailable")
+		}
+		session, err := newAudioSession(ctx, peerID, sttSpec.SocketPath, speechCfg, transcripts, nil, func() {
+			peerRegistry.Close(peerID)
+		})
+		if err != nil {
+			cleanup()
+			return nil, err
+		}
+		return &trackedSession{
+			PeerSession: session,
+			onClose:     cleanup,
+		}, nil
+	}
+
+	realtimeSynthesizers := make(map[string]openaihttp.TTSSynthesizer, 1)
+	if ttsLazy != nil {
+		realtimeSynthesizers[ttsEngine] = &lazyTTSSynthesizer{loader: ttsLazy}
+	}
+
+	newRealtimePeerSession := func(peerID string) (skywebrtc.PeerSession, error) {
+		cleanup := sttLazy.EnsureRunning()
+		if cleanup == nil {
+			return nil, fmt.Errorf("stt unavailable")
+		}
+
+		emitter := realtimeevents.NewTranscriptEmitter(peerID)
+		realtimeSession := &realtimeCallSession{emitter: emitter, synths: realtimeSynthesizers}
+		realtimeSession.responseRunner = openaihttp.NewRealtimeResponseRunner(
+			emitter.SessionID(),
+			realtimeSynthesizers,
+			func(event map[string]any) error { return realtimeSession.emitEvent(event) },
+			func(pcm []byte, sampleRate int32) error {
+				if realtimeSession.audioSink == nil {
+					return fmt.Errorf("realtime audio output is not configured")
+				}
+				return realtimeSession.audioSink.WritePCM(pcm, sampleRate)
+			},
+			false,
+		)
+		session, err := newAudioSession(ctx, peerID, sttSpec.SocketPath, speechCfg, transcripts, realtimeSession.onTranscript, func() {
+			peerRegistry.Close(peerID)
+		})
+		if err != nil {
+			cleanup()
+			return nil, err
+		}
+		realtimeSession.inner = session
+		return &trackedSession{
+			PeerSession: realtimeSession,
+			onClose:     cleanup,
+		}, nil
+	}
+
 	// WebRTC endpoint - require auth when binding to non-loopback
-	webrtcHandler := skywebrtc.OfferHandler(skywebrtc.PeerConfig{
-		NewSession: func(peerID string) (skywebrtc.PeerSession, error) {
-			// Ensure STT is running and get cleanup func for session tracking
-			cleanup := sttLazy.EnsureRunning()
-			if cleanup == nil {
-				return nil, fmt.Errorf("stt unavailable")
-			}
-			session, err := newAudioSession(ctx, peerID, sttSpec.SocketPath, speechCfg, transcripts, func() {
-				peerRegistry.Close(peerID)
-			})
-			if err != nil {
-				// Session creation failed, clean up immediately
-				cleanup()
-				return nil, err
-			}
-			// Wrap session with cleanup that handles both session close and idle tracking
-			return &trackedSession{
-				PeerSession: session,
-				onClose:     cleanup,
-			}, nil
-		},
-	}, peerRegistry)
+	webrtcHandler := skywebrtc.OfferHandler(skywebrtc.PeerConfig{NewSession: newPeerSession}, peerRegistry)
 	mux.Handle("/webrtc/offer", openaihttp.OptionalAuthMiddleware(webrtcHandler))
 
 	// API endpoints - require auth when binding to non-loopback
@@ -1210,17 +1400,21 @@ func main() {
 	// These provide /v1/audio/speech, /v1/audio/transcriptions, and /v1/models
 	openaiMux := http.NewServeMux()
 	availableTTSEngines := map[string]struct{}{ttsEngine: {}}
-	openaiMux.HandleFunc("GET /v1/models", openaihttp.ModelsHandlerWithAvailableTTSEngines(availableTTSEngines))
-	openaiMux.HandleFunc("GET /v1/models/{model}", openaihttp.ModelsRetrieveHandlerWithAvailableTTSEngines(availableTTSEngines))
+	realtimeSecrets := openaihttp.NewClientSecretStore(60 * time.Second)
 	// Build synthesizer map for the active TTS engine
 	synthesizers := make(map[string]openaihttp.TTSSynthesizer, 1)
 	if ttsLazy != nil {
 		synthesizers[ttsEngine] = &lazyTTSSynthesizer{loader: ttsLazy}
 	}
+	openaiMux.HandleFunc("GET /v1/models", openaihttp.ModelsHandlerWithAvailableTTSEngines(availableTTSEngines))
+	openaiMux.HandleFunc("GET /v1/models/{model}", openaihttp.ModelsRetrieveHandlerWithAvailableTTSEngines(availableTTSEngines))
+	openaiMux.HandleFunc("GET /v1/realtime", openaihttp.RealtimeHandler(openaihttp.RealtimeHandlerOptions{SocketPath: sttSpec.SocketPath, EnsureRunning: sttLazy.EnsureRunning, Synthesizers: synthesizers}))
+	openaiMux.HandleFunc("POST /v1/realtime/client_secrets", openaihttp.ClientSecretsHandler(realtimeSecrets))
+	openaiMux.Handle("POST /v1/realtime/calls", skywebrtc.RawSDPHandler(skywebrtc.PeerConfig{NewSession: newRealtimePeerSession}, peerRegistry))
 	openaiMux.HandleFunc("POST /v1/audio/speech", openaihttp.TTSHandlerWithSynth(synthesizers))
 	openaiMux.HandleFunc("POST /v1/audio/transcriptions", openaihttp.TranscriptionsHandlerWithEnsureRunning(sttSpec.SocketPath, sttLazy.EnsureRunning))
 	// Apply optional auth middleware (requires SKY_AUDIO_API_KEY env var to enable)
-	mux.Handle("/v1/", openaihttp.OptionalAuthMiddleware(openaiMux))
+	mux.Handle("/v1/", openaihttp.OptionalAuthMiddlewareWithValidator(openaiMux, realtimeSecrets.Validate))
 	log.Println("[INFO] OpenAI-compatible endpoints enabled at /v1/ (for OpenClaw integration)")
 
 	dashFS, err := fs.Sub(dashboard.Assets, "dist")

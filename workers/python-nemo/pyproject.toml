@@ -3,12 +3,23 @@ name = "python-nemo"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.13,<3.14"
 dependencies = [
     "cuda-python>=12.3",
     "grpcio>=1.78.0",
-    "grpcio-tools>=1.78.0",
-    "nemo-toolkit[asr]>=2.1.0",
+    "grpcio-tools==1.71.2",
+    "protobuf>=5.29.6,<6",
+    "nemo-toolkit[asr]==2.7.2",
     "numpy>=2.4.3",
     "torch>=2.11.0",
+]
+
+[dependency-groups]
+dev = [
+    "basedpyright>=1.31.3",
+]
+
+[tool.basedpyright]
+exclude = [
+    "pb",
 ]

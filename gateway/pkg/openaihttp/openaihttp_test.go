@@ -3,6 +3,7 @@ package openaihttp
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"mime/multipart"
@@ -16,10 +17,14 @@ import (
 
 // mockTTSSynthesizer implements TTSSynthesizer for testing
 type mockTTSSynthesizer struct {
-	shouldFail bool
-	lastVoice  string
-	lastText   string
-	lastOpts   *skywebrtc.SynthesisOptions
+	shouldFail           bool
+	lastVoice            string
+	lastText             string
+	lastOpts             *skywebrtc.SynthesisOptions
+	sampleRate           int32
+	streamChunks         [][]byte
+	blockUntilCancel     bool
+	blockAfterFirstChunk bool
 }
 
 func (m *mockTTSSynthesizer) Synthesize(ctx context.Context, text, voice string, opts *skywebrtc.SynthesisOptions) ([]byte, int32, error) {
@@ -29,12 +34,54 @@ func (m *mockTTSSynthesizer) Synthesize(ctx context.Context, text, voice string,
 	m.lastText = text
 	m.lastVoice = voice
 	m.lastOpts = opts
+	sampleRate := m.sampleRate
+	if sampleRate == 0 {
+		sampleRate = 16000
+	}
+	if len(m.streamChunks) > 0 {
+		var pcm []byte
+		for _, chunk := range m.streamChunks {
+			pcm = append(pcm, chunk...)
+		}
+		return pcm, sampleRate, nil
+	}
 	// Return fake PCM data (sine wave-ish pattern)
 	pcm := make([]byte, 32000) // 1 second at 16kHz mono16
 	for i := range pcm {
 		pcm[i] = byte(i % 256)
 	}
-	return pcm, 16000, nil
+	return pcm, sampleRate, nil
+}
+
+func (m *mockTTSSynthesizer) SynthesizeStream(ctx context.Context, text, voice string, opts *skywebrtc.SynthesisOptions, onChunk func(pcm []byte, sampleRate int32) error) error {
+	if m.shouldFail {
+		return errors.New("synthesis failed")
+	}
+	m.lastText = text
+	m.lastVoice = voice
+	m.lastOpts = opts
+	sampleRate := m.sampleRate
+	if sampleRate == 0 {
+		sampleRate = 16000
+	}
+	chunks := m.streamChunks
+	if len(chunks) == 0 {
+		chunks = [][]byte{{0x01, 0x02}, {0x03, 0x04}}
+	}
+	for idx, chunk := range chunks {
+		if err := onChunk(chunk, sampleRate); err != nil {
+			return err
+		}
+		if m.blockAfterFirstChunk && idx == 0 {
+			<-ctx.Done()
+			return ctx.Err()
+		}
+	}
+	if m.blockUntilCancel {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return nil
 }
 
 func TestTTSHandlerWithSynthRejectsOversizedBody(t *testing.T) {
@@ -906,6 +953,28 @@ func TestOptionalAuthMiddlewareHeaderPrecedence(t *testing.T) {
 	}
 }
 
+func TestOptionalAuthMiddlewareWithValidator(t *testing.T) {
+	t.Setenv("SKY_AUDIO_API_KEY", "master-key")
+
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	middleware := OptionalAuthMiddlewareWithValidator(inner, func(token string) bool {
+		return token == "ephemeral-secret"
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/realtime", nil)
+	req.Header.Set("Sec-WebSocket-Protocol", "realtime, openai-insecure-api-key.ephemeral-secret")
+	rr := httptest.NewRecorder()
+
+	middleware.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("validator token should pass: status = %d, want %d", rr.Code, http.StatusOK)
+	}
+}
+
 // createTestWAV creates a minimal valid WAV file for STT testing
 func createTestWAV(durationMs int) []byte {
 	sampleRate := 16000
@@ -1428,6 +1497,35 @@ func TestResolveEngineAndVoice(t *testing.T) {
 			wantVoice:  "custom-voice",
 		},
 		{
+			name:       "kyutai allows catalog path voice",
+			model:      "sky-kyutai",
+			voice:      "ears/p003/emo_amusement_freeform.wav",
+			emotion:    "",
+			wantEngine: "kyutai",
+			wantVoice:  "ears/p003/emo_amusement_freeform.wav",
+		},
+		{
+			name:    "pocket rejects slash path voice",
+			model:   "tts-1",
+			voice:   "voices/custom",
+			emotion: "",
+			wantErr: true,
+		},
+		{
+			name:    "rejects traversal voice",
+			model:   "sky-kyutai",
+			voice:   "../evil.safetensors",
+			emotion: "",
+			wantErr: true,
+		},
+		{
+			name:    "rejects absolute voice path",
+			model:   "sky-kyutai",
+			voice:   "/tmp/evil.safetensors",
+			emotion: "",
+			wantErr: true,
+		},
+		{
 			name:       "kyutai no emotion uses empty voice",
 			model:      "sky-kyutai",
 			voice:      "",
@@ -1464,5 +1562,65 @@ func TestResolveEngineAndVoice(t *testing.T) {
 				t.Errorf("Expected voice %q, got %q", tt.wantVoice, voice)
 			}
 		})
+	}
+}
+
+func TestRealtimeTranscriptionSessionAppendInputAudioRejectsOverflow(t *testing.T) {
+	session := newRealtimeTranscriptionSession(RealtimeHandlerOptions{})
+	session.inputAudio.Write(bytes.Repeat([]byte{0x01}, maxRealtimeInputAudioBytes-2))
+
+	err := session.appendInputAudio(base64.StdEncoding.EncodeToString([]byte{0x02, 0x03, 0x04, 0x05}))
+	if err == nil {
+		t.Fatal("expected append overflow error")
+	}
+	if !strings.Contains(err.Error(), "exceeds maximum size") {
+		t.Fatalf("expected overflow error, got %v", err)
+	}
+	if got := session.inputAudio.Len(); got != maxRealtimeInputAudioBytes-2 {
+		t.Fatalf("expected buffer length to remain unchanged, got %d", got)
+	}
+}
+
+func TestRunPreparedRealtimeResponseResamplesOnPCMTo16kHz(t *testing.T) {
+	mock := &mockTTSSynthesizer{
+		sampleRate:   24000,
+		streamChunks: [][]byte{bytes.Repeat([]byte{0x01, 0x02}, 240), bytes.Repeat([]byte{0x03, 0x04}, 240)},
+	}
+	plan := &preparedRealtimeResponse{
+		wantAudio: true,
+		prepared: &preparedTTSSynthesis{
+			text:  "hi",
+			synth: mock,
+		},
+	}
+
+	var sampleRates []int32
+	var totalBytes int
+	err := runPreparedRealtimeResponse(
+		context.Background(),
+		"sess-1",
+		"resp-1",
+		plan,
+		func(map[string]any) error { return nil },
+		func(pcm []byte, sampleRate int32) error {
+			sampleRates = append(sampleRates, sampleRate)
+			totalBytes += len(pcm)
+			return nil
+		},
+		false,
+	)
+	if err != nil {
+		t.Fatalf("runPreparedRealtimeResponse: %v", err)
+	}
+	if len(sampleRates) == 0 {
+		t.Fatal("expected onPCM to receive resampled audio")
+	}
+	for _, sampleRate := range sampleRates {
+		if sampleRate != 16000 {
+			t.Fatalf("expected onPCM sample rate 16000, got %d", sampleRate)
+		}
+	}
+	if totalBytes == 0 {
+		t.Fatal("expected non-empty resampled PCM")
 	}
 }

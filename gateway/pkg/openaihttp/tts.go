@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -37,14 +38,14 @@ import (
 
 // TTSRequest matches OpenAI's /v1/audio/speech request format
 type TTSRequest struct {
-	Model           string  `json:"model"`                      // e.g., "sky-kyutai", "sky-pocket"
-	Input           string  `json:"input"`                      // text to synthesize
-	Voice           string  `json:"voice,omitempty"`            // optional voice ID (uses worker default if empty)
-	ResponseFormat  string  `json:"response_format,omitempty"`  // "wav", "mp3", "opus", "pcm"
-	Speed           float64 `json:"speed,omitempty"`            // playback speed (not supported)
-	Temperature     float32 `json:"temperature,omitempty"`      // synthesis temperature (Kyutai only)
-	CfgCoef         float32 `json:"cfg_coef,omitempty"`         // classifier-free guidance coefficient (Kyutai only)
-	PaddingBetween  int32   `json:"padding_between,omitempty"`  // padding between segments (Kyutai only)
+	Model          string  `json:"model"`                     // e.g., "sky-kyutai", "sky-pocket"
+	Input          string  `json:"input"`                     // text to synthesize
+	Voice          string  `json:"voice,omitempty"`           // optional voice ID (uses worker default if empty)
+	ResponseFormat string  `json:"response_format,omitempty"` // "wav", "mp3", "opus", "pcm"
+	Speed          float64 `json:"speed,omitempty"`           // playback speed (not supported)
+	Temperature    float32 `json:"temperature,omitempty"`     // synthesis temperature (Kyutai only)
+	CfgCoef        float32 `json:"cfg_coef,omitempty"`        // classifier-free guidance coefficient (Kyutai only)
+	PaddingBetween int32   `json:"padding_between,omitempty"` // padding between segments (Kyutai only)
 }
 
 // TTSError is OpenAI-compatible error response
@@ -60,8 +61,8 @@ type TTSError struct {
 type TTSResponseFormat string
 
 const (
-	FormatOpus TTSResponseFormat = "opus"  // Default: Ogg/Opus, best for voice
-	FormatMP3  TTSResponseFormat = "mp3"   // Widely compatible
+	FormatOpus TTSResponseFormat = "opus" // Default: Ogg/Opus, best for voice
+	FormatMP3  TTSResponseFormat = "mp3"  // Widely compatible
 	FormatAAC  TTSResponseFormat = "aac"  // AAC in ADTS
 	FormatFLAC TTSResponseFormat = "flac" // Lossless compression
 	FormatWAV  TTSResponseFormat = "wav"  // Uncompressed PCM in WAV
@@ -179,6 +180,11 @@ type TTSSynthesizer interface {
 	Synthesize(ctx context.Context, text, voice string, opts *skywebrtc.SynthesisOptions) (pcm []byte, sampleRate int32, err error)
 }
 
+type TTSStreamingSynthesizer interface {
+	TTSSynthesizer
+	SynthesizeStream(ctx context.Context, text, voice string, opts *skywebrtc.SynthesisOptions, onChunk func(pcm []byte, sampleRate int32) error) error
+}
+
 // ttsClientAdapter wraps skywebrtc.TTSClient to match our interface
 type ttsClientAdapter struct {
 	client *skywebrtc.TTSClient
@@ -186,6 +192,10 @@ type ttsClientAdapter struct {
 
 func (a ttsClientAdapter) Synthesize(ctx context.Context, text, voice string, opts *skywebrtc.SynthesisOptions) ([]byte, int32, error) {
 	return a.client.Synthesize(ctx, text, voice, opts)
+}
+
+func (a ttsClientAdapter) SynthesizeStream(ctx context.Context, text, voice string, opts *skywebrtc.SynthesisOptions, onChunk func(pcm []byte, sampleRate int32) error) error {
+	return a.client.SynthesizeStream(ctx, text, voice, opts, onChunk)
 }
 
 // NewTTSSynthesizer creates a TTSSynthesizer from a TTSClient
@@ -201,6 +211,57 @@ func TTSHandler(clients map[string]*skywebrtc.TTSClient) http.HandlerFunc {
 		synthesizers[name] = NewTTSSynthesizer(client)
 	}
 	return TTSHandlerWithSynth(synthesizers)
+}
+
+type preparedTTSSynthesis struct {
+	engineName string
+	voice      string
+	text       string
+	opts       *skywebrtc.SynthesisOptions
+	synth      TTSSynthesizer
+}
+
+func prepareTTSSynthesis(req TTSRequest, synthesizers map[string]TTSSynthesizer) (*preparedTTSSynthesis, error) {
+	if err := validateTTSRequest(&req); err != nil {
+		return nil, err
+	}
+
+	emotion, strippedInput, _ := parseEmotionTag(req.Input)
+	if strings.TrimSpace(strippedInput) == "" {
+		return nil, errors.New("input is required (empty after removing emotion tag)")
+	}
+
+	strippedInput = sanitizeTTSInput(strippedInput)
+	if strippedInput == "" {
+		return nil, errors.New("input is required after cleanup")
+	}
+
+	engineName, voice, err := resolveEngineAndVoice(req.Model, req.Voice, emotion)
+	if err != nil {
+		return nil, err
+	}
+
+	synth, ok := synthesizers[engineName]
+	if !ok {
+		return nil, fmt.Errorf("Model '%s' engine '%s' is not available", req.Model, engineName)
+	}
+
+	var opts *skywebrtc.SynthesisOptions
+	if engineName == "kyutai" {
+		opts = &skywebrtc.SynthesisOptions{
+			Temperature:    req.Temperature,
+			CfgCoef:        req.CfgCoef,
+			PaddingBetween: req.PaddingBetween,
+		}
+	}
+
+	return &preparedTTSSynthesis{
+		engineName: engineName,
+		voice:      voice,
+		text:       strippedInput,
+		opts:       opts,
+		synth:      synth,
+	}, nil
 }
 
 // TTSHandlerWithSynth creates handler from TTSSynthesizer interface (for testing)
@@ -225,49 +286,10 @@ func TTSHandlerWithSynth(synthesizers map[string]TTSSynthesizer) http.HandlerFun
 			return
 		}
 
-		// Validate request
-		if err := validateTTSRequest(&req); err != nil {
-			writeTTSError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
-			return
-		}
-
-		// Parse emotion tag from input (gateway owns this)
-		emotion, strippedInput, _ := parseEmotionTag(req.Input)
-
-		// Validate that text remains after emotion tag stripping
-		if strings.TrimSpace(strippedInput) == "" {
-			writeTTSError(w, http.StatusBadRequest, "invalid_request_error", "input is required (empty after removing emotion tag)")
-			return
-		}
-
-		strippedInput = sanitizeTTSInput(strippedInput)
-		if strippedInput == "" {
-			writeTTSError(w, http.StatusBadRequest, "invalid_request_error", "input is required after cleanup")
-			return
-		}
-
-		// Normalize and map model to engine
-		engineName, voice, err := resolveEngineAndVoice(req.Model, req.Voice, emotion)
+		prepared, err := prepareTTSSynthesis(req, synthesizers)
 		if err != nil {
 			writeTTSError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 			return
-		}
-		synth, ok := synthesizers[engineName]
-		if !ok {
-			writeTTSError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("Model '%s' engine '%s' is not available", req.Model, engineName))
-			return
-		}
-
-		// Build synthesis options (nil for non-Kyutai engines)
-		var opts *skywebrtc.SynthesisOptions
-		if engineName == "kyutai" {
-			opts = &skywebrtc.SynthesisOptions{
-				Temperature:    req.Temperature,
-				CfgCoef:        req.CfgCoef,
-				PaddingBetween: req.PaddingBetween,
-			}
-			// Note: We don't override zero values here - the worker applies defaults.
-			// This allows explicit requests for temperature=0, cfg_coef=0.
 		}
 
 		// Determine response format (default is opus per OpenAI best practices for voice)
@@ -293,7 +315,7 @@ func TTSHandlerWithSynth(synthesizers map[string]TTSSynthesizer) http.HandlerFun
 		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 		defer cancel()
 
-		pcm, sampleRate, err := synth.Synthesize(ctx, strippedInput, voice, opts)
+		pcm, sampleRate, err := prepared.synth.Synthesize(ctx, prepared.text, prepared.voice, prepared.opts)
 		if err != nil {
 			// Log detailed error server-side, return generic message to client
 			// to avoid leaking internal paths and implementation details
@@ -344,6 +366,35 @@ func validateTTSRequest(req *TTSRequest) error {
 	return nil
 }
 
+func validateExplicitVoice(engine, voice string) (string, error) {
+	trimmedVoice := strings.TrimSpace(voice)
+	if trimmedVoice == "" {
+		return "", nil
+	}
+	if strings.Contains(trimmedVoice, "\\") {
+		return "", fmt.Errorf("voice contains invalid path separators")
+	}
+	for _, r := range trimmedVoice {
+		if r == 0 || unicode.IsControl(r) {
+			return "", fmt.Errorf("voice contains invalid characters")
+		}
+	}
+	if path.IsAbs(trimmedVoice) {
+		return "", fmt.Errorf("voice must be a catalog voice id")
+	}
+	cleaned := path.Clean(trimmedVoice)
+	if cleaned == "." || cleaned != trimmedVoice || strings.HasPrefix(cleaned, "../") || cleaned == ".." {
+		return "", fmt.Errorf("voice must be a normalized catalog voice id")
+	}
+	if strings.Contains(trimmedVoice, "..") {
+		return "", fmt.Errorf("voice must not contain path traversal")
+	}
+	if engine == "pocket" && strings.Contains(trimmedVoice, "/") {
+		return "", fmt.Errorf("voice must be a pocket catalog voice id")
+	}
+	return trimmedVoice, nil
+}
+
 func resolveEngineAndVoice(model, voice, emotion string) (engineName, resolvedVoice string, err error) {
 	// Map model to engine
 	engine, ok := modelToEngine[strings.ToLower(model)]
@@ -352,7 +403,10 @@ func resolveEngineAndVoice(model, voice, emotion string) (engineName, resolvedVo
 	}
 
 	// If explicit voice is provided, it takes precedence over emotion-derived voice
-	trimmedVoice := strings.TrimSpace(voice)
+	trimmedVoice, err := validateExplicitVoice(engine, voice)
+	if err != nil {
+		return "", "", err
+	}
 	if trimmedVoice != "" {
 		return engine, trimmedVoice, nil
 	}

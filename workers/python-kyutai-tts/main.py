@@ -258,10 +258,6 @@ class TextToSpeechServicer(audio_engine_pb2_grpc.TextToSpeechServicer):
                 raise ValueError(f"bundled Kyutai voice is missing: {voice_name}")
             return voice_name, local_path
 
-        candidate_path = Path(voice_name)
-        if candidate_path.exists() and candidate_path.suffix == ".safetensors":
-            return voice_name, candidate_path
-
         raise ValueError(f"unknown Kyutai voice: {voice_name}")
 
     def _get_condition_attributes(self, voice_selector: str, cfg_coef: float) -> tuple[str, Any]:

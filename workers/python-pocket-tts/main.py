@@ -144,10 +144,6 @@ class TextToSpeechServicer(audio_engine_pb2_grpc.TextToSpeechServicer):
                 raise ValueError(f"bundled PocketTTS voice is missing: {voice_name}")
             return voice_name, local_path
 
-        candidate_path = Path(voice_name)
-        if candidate_path.exists():
-            return voice_name, candidate_path
-
         raise ValueError(f"unknown PocketTTS voice: {voice_name}")
 
     def _get_voice_state(self, voice_selector: str) -> tuple[str, dict[str, Any]]:
