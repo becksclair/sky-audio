@@ -6,7 +6,7 @@ python = "3.13"
 
 [tasks.dev]
 description = "Start gateway + STT worker (dev mode)"
-run = "CGO_LDFLAGS='-L/usr/local/lib/onnxruntime -lonnxruntime -Wl,-rpath,/usr/local/lib/onnxruntime' CGO_CFLAGS='-I/usr/local/include/onnxruntime' LD_LIBRARY_PATH=\"/usr/local/lib/onnxruntime:${LD_LIBRARY_PATH:-}\" go run ./gateway/cmd/sky-audio"
+run = "./scripts/with-onnx-env.sh go run ./gateway/cmd/sky-audio"
 
 [tasks."dev:dashboard"]
 description = "Start Vite dev server with HMR (proxy to gateway on :8080)"
@@ -30,7 +30,7 @@ description = "Build Go gateway binary (assumes dashboard dist exists)"
 run = """
 rm -rf gateway/pkg/dashboard/dist
 cp -r dashboard/dist gateway/pkg/dashboard/dist
-cd gateway && CGO_LDFLAGS='-L/usr/local/lib/onnxruntime -lonnxruntime -Wl,-rpath,/usr/local/lib/onnxruntime' CGO_CFLAGS='-I/usr/local/include/onnxruntime' LD_LIBRARY_PATH=\"/usr/local/lib/onnxruntime:${LD_LIBRARY_PATH:-}\" go build -o sky-audio ./cmd/sky-audio
+cd gateway && ../scripts/with-onnx-env.sh go build -o sky-audio ./cmd/sky-audio
 """
 
 [tasks."build:proto"]
@@ -42,11 +42,13 @@ protoc \
   --go_out=gateway/pkg/pb --go-grpc_out=gateway/pkg/pb \
   --go_opt=paths=source_relative --go-grpc_opt=paths=source_relative \
   proto/audio_engine.proto
-python -m grpc_tools.protoc \
-  -I=proto \
-  --python_out=workers/python-nemo/pb \
-  --grpc_python_out=workers/python-nemo/pb \
-  proto/audio_engine.proto
+cd workers/python-nemo && uv run python -m grpc_tools.protoc \
+  -I=../../proto \
+  --python_out=pb \
+  --grpc_python_out=pb \
+  ../../proto/audio_engine.proto
+cd ../..
+python3 scripts/normalize-python-protobuf.py workers/python-nemo/pb/audio_engine_pb2.py
 sed -i 's/^import audio_engine_pb2 as/from . import audio_engine_pb2 as/' \
   workers/python-nemo/pb/audio_engine_pb2_grpc.py
 for dir in workers/python-pocket-tts/pb workers/python-kyutai-tts/pb; do
@@ -60,11 +62,19 @@ done
 
 [tasks.test]
 description = "Run local Go unit and package tests (excludes env-dependent e2e)"
-run = "CGO_LDFLAGS='-L/usr/local/lib/onnxruntime -lonnxruntime -Wl,-rpath,/usr/local/lib/onnxruntime' CGO_CFLAGS='-I/usr/local/include/onnxruntime' LD_LIBRARY_PATH=\"/usr/local/lib/onnxruntime:${LD_LIBRARY_PATH:-}\" go test $(go list ./gateway/... | grep -v '/gateway/e2e$') -count=1 -v"
+run = "./scripts/with-onnx-env.sh go test $(go list ./gateway/... | grep -v '/gateway/e2e$') -count=1 -v"
 
 [tasks."test:e2e"]
 description = "Run gateway end-to-end tests (requires worker sockets and test assets)"
-run = "CGO_LDFLAGS='-L/usr/local/lib/onnxruntime -lonnxruntime -Wl,-rpath,/usr/local/lib/onnxruntime' CGO_CFLAGS='-I/usr/local/include/onnxruntime' LD_LIBRARY_PATH=\"/usr/local/lib/onnxruntime:${LD_LIBRARY_PATH:-}\" go test ./gateway/e2e -count=1 -v"
+run = "./scripts/with-onnx-env.sh go test ./gateway/e2e -count=1 -v"
+
+[tasks."smoke:realtime-ws"]
+description = "Run a live gateway-level websocket smoke test against GET /v1/realtime"
+run = "./scripts/smoke-realtime-ws.sh"
+
+[tasks."smoke:realtime-calls"]
+description = "Run a live gateway-level WebRTC smoke test against POST /v1/realtime/calls"
+run = "./scripts/smoke-realtime-calls.sh"
 
 [tasks.check]
 description = "Full validation: vet + test + build"
@@ -72,14 +82,14 @@ depends = ["check:vet", "test", "build"]
 
 [tasks."check:vet"]
 description = "Go vet"
-run = "CGO_LDFLAGS='-L/usr/local/lib/onnxruntime -lonnxruntime -Wl,-rpath,/usr/local/lib/onnxruntime' CGO_CFLAGS='-I/usr/local/include/onnxruntime' LD_LIBRARY_PATH=\"/usr/local/lib/onnxruntime:${LD_LIBRARY_PATH:-}\" go vet ./gateway/..."
+run = "./scripts/with-onnx-env.sh go vet ./gateway/..."
 
 [tasks."check:types"]
 description = "Typecheck all languages"
 run = """
-CGO_LDFLAGS='-L/usr/local/lib/onnxruntime -lonnxruntime -Wl,-rpath,/usr/local/lib/onnxruntime' CGO_CFLAGS='-I/usr/local/include/onnxruntime' LD_LIBRARY_PATH="/usr/local/lib/onnxruntime:${LD_LIBRARY_PATH:-}" go vet ./gateway/...
+./scripts/with-onnx-env.sh go vet ./gateway/...
 cd dashboard && bun run typecheck 2>/dev/null || true
-cd ../workers/python-nemo && uv run basedpyright main.py
+cd ../workers/python-nemo && uv run basedpyright main.py streaming_import_smoke.py streaming_eval.py
 """
 
 [tasks.clean]
@@ -92,6 +102,14 @@ rm -f /tmp/sky-audio-*.sock
 [tasks."worker:stt"]
 description = "Run STT worker standalone (for debugging)"
 run = "cd workers/python-nemo && uv run python main.py"
+
+[tasks."worker:stt:import-smoke"]
+description = "Verify NeMo streaming imports and runtime compatibility"
+run = "cd workers/python-nemo && uv run python streaming_import_smoke.py"
+
+[tasks."worker:stt:eval"]
+description = "Benchmark the NeMo streaming path against the checked-in voice fixture"
+run = "cd workers/python-nemo && uv run python streaming_eval.py"
 
 [tasks."worker:tts-pocket"]
 description = "Run PocketTTS worker standalone (for debugging)"

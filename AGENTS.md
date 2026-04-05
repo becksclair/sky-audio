@@ -30,6 +30,8 @@ mise run build
 mise run deploy
 mise run test
 mise run check
+mise run smoke:realtime-ws
+mise run smoke:realtime-calls
 ```
 
 ### Test split
@@ -46,6 +48,12 @@ mise run check
 - `mise run check`
   - Runs vet, local tests, and production build.
   - This is the default validation path for ordinary code changes.
+- `mise run smoke:realtime-ws`
+  - Runs a live gateway-level websocket smoke against `GET /v1/realtime`.
+  - Normalizes the checked-in voice fixture, verifies partials/final transcript, and compares against batch STT.
+- `mise run smoke:realtime-calls`
+  - Runs a live gateway-level WebRTC smoke against `POST /v1/realtime/calls`.
+  - Normalizes the checked-in voice fixture, verifies partials/final transcript, and compares against batch STT.
 
 ## Notes
 

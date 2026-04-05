@@ -26,12 +26,14 @@ export STT_END_OF_SPEECH_MS=250
 mise run dev
 ```
 
-The gateway listens on `:8080` by default. Verify it's running:
+The gateway listens on `127.0.0.1:8585` by default. Verify it's running:
 
 ```bash
 curl http://localhost:8585/health
 # Should return: ok
 ```
+
+For STT, the recommended default is `STT_DEVICE=auto`, which uses CUDA when available and falls back to CPU. The cache-aware streaming path should stay on `float32`; half precision was faster on paper and garbage in practice.
 
 ### 2. Configure OpenClaw
 
@@ -402,7 +404,7 @@ The OpenAI-compatible layer is implemented in `gateway/pkg/openaihttp/`:
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                        OpenClaw                              │
-│  (Configured with baseUrl: http://sky-audio:8080/v1)        │
+│  (Configured with baseUrl: http://sky-audio:8585/v1)        │
 └──────────────────────┬──────────────────────────────────────┘
                        │ POST /v1/audio/speech
                        │ POST /v1/audio/transcriptions

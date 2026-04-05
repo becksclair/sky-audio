@@ -1,5 +1,6 @@
 {
   "include": ["workers/python-nemo"],
+  "exclude": ["workers/python-nemo/pb"],
   "extraPaths": ["workers/python-nemo"],
   "pythonVersion": "3.13",
   "typeCheckingMode": "basic",

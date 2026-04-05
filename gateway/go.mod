@@ -4,9 +4,11 @@ go 1.26.1
 
 require (
 	github.com/NVIDIA/go-nvml v0.13.0-1
+	github.com/coder/websocket v1.8.14
 	github.com/hraban/opus v0.0.0-20251117090126-c76ea7e21bf3
 	github.com/pion/rtp v1.10.1
 	github.com/pion/webrtc/v4 v4.2.9
+	github.com/streamer45/silero-vad-go v0.2.1
 	google.golang.org/grpc v1.79.3
 	google.golang.org/protobuf v1.36.11
 )
@@ -27,7 +29,6 @@ require (
 	github.com/pion/stun/v3 v3.1.1 // indirect
 	github.com/pion/transport/v4 v4.0.1 // indirect
 	github.com/pion/turn/v4 v4.1.4 // indirect
-	github.com/streamer45/silero-vad-go v0.2.1 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
 	golang.org/x/crypto v0.48.0 // indirect
 	golang.org/x/net v0.50.0 // indirect

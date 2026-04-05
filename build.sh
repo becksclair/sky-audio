@@ -16,9 +16,6 @@ cp -r dashboard/dist gateway/pkg/dashboard/dist
 
 echo "[3/3] Building Go gateway..."
 cd gateway
-export CGO_LDFLAGS='-L/usr/local/lib/onnxruntime -lonnxruntime -Wl,-rpath,/usr/local/lib/onnxruntime'
-export CGO_CFLAGS='-I/usr/local/include/onnxruntime'
-export LD_LIBRARY_PATH="/usr/local/lib/onnxruntime:${LD_LIBRARY_PATH:-}"
-go build -o sky-audio ./cmd/sky-audio
+../scripts/with-onnx-env.sh go build -o sky-audio ./cmd/sky-audio
 
 echo "Done. Binary: gateway/sky-audio"

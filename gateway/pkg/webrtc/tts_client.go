@@ -52,9 +52,29 @@ func (c *TTSClient) GetStatus(ctx context.Context) (*pb.WorkerStatus, error) {
 }
 
 func (c *TTSClient) Synthesize(ctx context.Context, text, voice string, opts *SynthesisOptions) (pcm []byte, sampleRate int32, err error) {
+	var pcmBuf []byte
+	var sr int32
+	err = c.SynthesizeStream(ctx, text, voice, opts, func(chunk []byte, chunkSampleRate int32) error {
+		if len(pcmBuf)+len(chunk) > maxPCMBytes {
+			return fmt.Errorf("pcm buffer exceeded %d bytes", maxPCMBytes)
+		}
+		pcmBuf = append(pcmBuf, chunk...)
+		sr = chunkSampleRate
+		return nil
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(pcmBuf) == 0 || sr == 0 {
+		return nil, 0, fmt.Errorf("worker returned no audio data")
+	}
+	return pcmBuf, sr, nil
+}
+
+func (c *TTSClient) SynthesizeStream(ctx context.Context, text, voice string, opts *SynthesisOptions, onChunk func(pcm []byte, sampleRate int32) error) error {
 	stream, err := c.client.SynthesizeStream(ctx)
 	if err != nil {
-		return nil, 0, fmt.Errorf("start synthesize stream: %w", err)
+		return fmt.Errorf("start synthesize stream: %w", err)
 	}
 
 	token := &pb.TextToken{Text: text, IsEos: true, Voice: voice}
@@ -67,21 +87,21 @@ func (c *TTSClient) Synthesize(ctx context.Context, text, voice string, opts *Sy
 	}
 
 	if err := stream.Send(token); err != nil {
-		return nil, 0, fmt.Errorf("send text token: %w", err)
+		return fmt.Errorf("send text token: %w", err)
 	}
 	if err := stream.CloseSend(); err != nil {
-		return nil, 0, fmt.Errorf("close send: %w", err)
+		return fmt.Errorf("close send: %w", err)
 	}
 
-	var pcmBuf []byte
 	var sr int32
+	var totalPCMBytes int
 	for {
 		chunk, err := stream.Recv()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return nil, 0, fmt.Errorf("recv audio chunk: %w", err)
+			return fmt.Errorf("recv audio chunk: %w", err)
 		}
 		if chunk.IsEndOfSpeech {
 			if sr == 0 {
@@ -89,18 +109,22 @@ func (c *TTSClient) Synthesize(ctx context.Context, text, voice string, opts *Sy
 			}
 			break
 		}
-		if len(pcmBuf)+len(chunk.PcmData) > maxPCMBytes {
-			return nil, 0, fmt.Errorf("pcm buffer exceeded %d bytes", maxPCMBytes)
+		if totalPCMBytes+len(chunk.PcmData) > maxPCMBytes {
+			return fmt.Errorf("pcm buffer exceeded %d bytes", maxPCMBytes)
 		}
-		pcmBuf = append(pcmBuf, chunk.PcmData...)
+		totalPCMBytes += len(chunk.PcmData)
 		sr = chunk.SampleRate
+		if onChunk != nil {
+			if err := onChunk(chunk.PcmData, chunk.SampleRate); err != nil {
+				return err
+			}
+		}
 	}
 
-	if len(pcmBuf) == 0 || sr == 0 {
-		return nil, 0, fmt.Errorf("worker returned no audio data")
+	if totalPCMBytes == 0 || sr == 0 {
+		return fmt.Errorf("worker returned no audio data")
 	}
-
-	return pcmBuf, sr, nil
+	return nil
 }
 
 func (c *TTSClient) Close() error {

@@ -66,8 +66,19 @@ The gateway exposes OpenAI-compatible endpoints for TTS/STT, enabling integratio
 
 **Endpoints:**
 - `POST /v1/audio/speech` - Text-to-speech synthesis
-- `POST /v1/audio/transcriptions` - Speech-to-text transcription  
+- `POST /v1/audio/transcriptions` - Speech-to-text transcription
 - `GET /v1/models` - List available models
+- `GET /v1/realtime` - OpenAI-compatible realtime websocket sessions for transcription input and audio/text response events
+- `POST /v1/realtime/client_secrets` - Short-lived browser-safe realtime client secrets
+- `POST /v1/realtime/calls` - Raw-SDP WebRTC setup for realtime sessions with transcript events and outbound audio responses
+
+Realtime sessions now accept websocket transcription input as `audio/pcm` (16 kHz legacy default or 24 kHz session-configured), `audio/pcmu`, and `audio/pcma`; support `response.cancel`; and can emit mixed text+audio response lifecycles. Realtime transcription logprobs are still intentionally unsupported until the worker and protobuf contract can carry real metadata instead of lies in a nicer hat.
+
+**Live smoke commands:**
+- `mise run smoke:realtime-ws` for a gateway-level websocket smoke against `GET /v1/realtime` using an ephemeral client secret.
+- `mise run smoke:realtime-calls` for a gateway-level WebRTC smoke against `POST /v1/realtime/calls`.
+
+Both commands normalize `sky_voice_test.wav`, compare realtime transcripts against the batch STT baseline, and print VRAM usage when `nvidia-smi` is available.
 
 **Quick start with OpenClaw:**
 ```json
@@ -92,6 +103,19 @@ The gateway exposes OpenAI-compatible endpoints for TTS/STT, enabling integratio
 ```
 
 See [docs/openclaw-integration.md](docs/openclaw-integration.md) for detailed setup instructions.
+
+## STT runtime and end-of-speech tuning
+
+The NeMo STT worker supports `STT_DEVICE=cpu`, `STT_DEVICE=cuda`, and `STT_DEVICE=auto`.
+
+- Default behavior: `auto`, which uses CUDA when available and falls back to CPU.
+- Recommended CUDA mode: `float32` cache-aware streaming with AMP disabled.
+- Reason: half precision (`float16`) corrupted transcripts in the cache-aware streaming path, while CUDA `float32` kept transcript quality and still beat CPU by a wide margin on the checked-in speech fixture.
+
+```bash
+export STT_DEVICE=auto
+mise run dev
+```
 
 ## STT end-of-speech tuning
 
