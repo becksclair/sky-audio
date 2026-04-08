@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import sys
@@ -112,6 +113,14 @@ def resolve_service_port() -> str:
     if not (1 <= port <= 65535):
         fail(f"PORT value out of range in {ENV_FILE}: {port}")
     return str(port)
+
+
+def resolve_active_tts_engine(env: dict[str, str] | None = None) -> str:
+    values = env if env is not None else load_env_file()
+    engine = values.get("TTS_ENGINE", "").strip().lower() or "pocket"
+    if engine not in {"pocket", "kyutai"}:
+        fail(f"invalid TTS_ENGINE value in {ENV_FILE}: {engine!r}")
+    return engine
 
 
 def service_urls() -> tuple[str, str]:
@@ -328,6 +337,7 @@ def http_get(url: str, *, headers: dict[str, str] | None = None) -> str:
 
 def wait_for_http_health() -> None:
     env = load_env_file()
+    active_tts_engine = resolve_active_tts_engine(env)
     health_url, voices_url = service_urls()
     headers: dict[str, str] = {}
     api_key = env.get("SKY_AUDIO_API_KEY", "")
@@ -342,13 +352,23 @@ def wait_for_http_health() -> None:
             if body != "ok":
                 last_error = f"unexpected health body: {body!r}"
             else:
-                voices = http_get(voices_url, headers=headers)
-                if '"pocket"' not in voices or '"kyutai"' not in voices:
-                    last_error = "voice catalog endpoint did not return expected engines"
+                voices_raw = http_get(voices_url, headers=headers)
+                voices_payload = json.loads(voices_raw)
+                if not isinstance(voices_payload, dict):
+                    last_error = "voice catalog endpoint returned a non-object payload"
                 else:
-                    log(f"health verification passed via {health_url} and {voices_url}")
-                    return
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                    catalog = voices_payload.get(active_tts_engine)
+                    if not isinstance(catalog, dict):
+                        last_error = f"voice catalog endpoint did not return active engine {active_tts_engine!r}"
+                    elif not catalog.get("voices"):
+                        last_error = f"voice catalog for active engine {active_tts_engine!r} was empty"
+                    else:
+                        log(
+                            f"health verification passed via {health_url} and {voices_url} "
+                            f"(active_tts_engine={active_tts_engine})"
+                        )
+                        return
+        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
             last_error = str(exc)
         time.sleep(2)
     fail(f"timed out waiting for HTTP health: {last_error}")
