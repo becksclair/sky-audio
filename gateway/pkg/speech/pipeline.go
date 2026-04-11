@@ -2,6 +2,8 @@ package speech
 
 import (
 	"context"
+	"errors"
+	"io"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -31,19 +33,23 @@ type vadEngine interface {
 }
 
 type Pipeline struct {
-	ctx              context.Context
-	sttClient        sttStream
-	ringBuf          *vad.RingBuffer
-	sileroVAD        vadEngine
-	ringMu           sync.Mutex
-	vadMu            sync.Mutex
-	audioCh          chan audioMsg
-	errCh            chan error
-	lastDropWarn     atomic.Int64
-	transcriptLoopOn atomic.Bool
-	errorOnce        sync.Once
-	destroyed        atomic.Bool
-	senderDone       chan struct{}
+	ctx               context.Context
+	sttClient         sttStream
+	ringBuf           *vad.RingBuffer
+	sileroVAD         vadEngine
+	ringMu            sync.Mutex
+	vadMu             sync.Mutex
+	audioCh           chan audioMsg
+	errCh             chan error
+	lastDropWarn      atomic.Int64
+	transcriptLoopOn  atomic.Bool
+	errorOnce         sync.Once
+	destroyed         atomic.Bool
+	senderDone        chan struct{}
+	eosSentCount      atomic.Uint64
+	inactivityMu      sync.Mutex
+	inactivityTimer   *time.Timer
+	inactivityTimeout time.Duration
 }
 
 type Config struct {
@@ -69,7 +75,11 @@ func NewPipeline(ctx context.Context, sttClient *skywebrtc.STTClient, cfg Config
 		return nil, err
 	}
 
-	return newPipelineWithDeps(ctx, sttClient, sileroVAD, true), nil
+	p := newPipelineWithDeps(ctx, sttClient, sileroVAD, true)
+	if cfg.MinSilenceDurationMs > 0 {
+		p.inactivityTimeout = time.Duration(cfg.MinSilenceDurationMs) * time.Millisecond
+	}
+	return p, nil
 }
 
 func newPipelineWithDeps(ctx context.Context, sttClient sttStream, sileroVAD vadEngine, startSender bool) *Pipeline {
@@ -92,6 +102,7 @@ func newPipelineWithDeps(ctx context.Context, sttClient sttStream, sileroVAD vad
 }
 
 func (p *Pipeline) Destroy() error {
+	p.stopInactivityTimer()
 	p.vadMu.Lock()
 	defer p.vadMu.Unlock()
 	p.destroyed.Store(true)
@@ -110,6 +121,10 @@ func (p *Pipeline) SenderDone() <-chan struct{} {
 	return p.senderDone
 }
 
+func (p *Pipeline) EOSSentCount() uint64 {
+	return p.eosSentCount.Load()
+}
+
 func (p *Pipeline) StartTranscriptLoop(onTranscript func(*pb.Transcript)) {
 	if !p.transcriptLoopOn.CompareAndSwap(false, true) {
 		return
@@ -119,6 +134,9 @@ func (p *Pipeline) StartTranscriptLoop(onTranscript func(*pb.Transcript)) {
 		for {
 			transcript, err := p.sttClient.Recv()
 			if err != nil {
+				if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
+					return
+				}
 				log.Printf("[stt] Recv error: %v", err)
 				p.reportError(err)
 				return
@@ -150,6 +168,11 @@ func (p *Pipeline) HandlePCM(data []byte) {
 		p.reportError(vadErr)
 		return
 	}
+	if isSpeaking {
+		p.armInactivityTimer()
+	} else {
+		p.stopInactivityTimer()
+	}
 
 	hadSpeechStart := false
 	for _, ev := range events {
@@ -168,6 +191,7 @@ func (p *Pipeline) HandlePCM(data []byte) {
 				}
 			}
 		case vad.EventSpeechEnd:
+			p.stopInactivityTimer()
 			log.Println("[vad] Silence detected — sending EOS")
 			if len(data) > 0 && !hadSpeechStart {
 				select {
@@ -203,6 +227,7 @@ func (p *Pipeline) warnAudioDrop(msg string) {
 }
 
 func (p *Pipeline) HandleTrackEnded() {
+	p.stopInactivityTimer()
 	p.vadMu.Lock()
 	if p.destroyed.Load() {
 		p.vadMu.Unlock()
@@ -232,6 +257,9 @@ func (p *Pipeline) runAudioSender() {
 			log.Printf("[stt] SendAudio error%s: %v", suffix, err)
 			p.reportError(err)
 			return err
+		}
+		if msg.eos {
+			p.eosSentCount.Add(1)
 		}
 		return nil
 	}
@@ -279,4 +307,52 @@ func (p *Pipeline) sendEOS(warnMsg string) {
 	default:
 		log.Println(warnMsg)
 	}
+}
+
+func (p *Pipeline) armInactivityTimer() {
+	if p.inactivityTimeout <= 0 {
+		return
+	}
+	p.inactivityMu.Lock()
+	defer p.inactivityMu.Unlock()
+	if p.inactivityTimer == nil {
+		p.inactivityTimer = time.AfterFunc(p.inactivityTimeout, p.handleInactivityTimeout)
+		return
+	}
+	p.inactivityTimer.Reset(p.inactivityTimeout)
+}
+
+func (p *Pipeline) stopInactivityTimer() {
+	p.inactivityMu.Lock()
+	defer p.inactivityMu.Unlock()
+	if p.inactivityTimer != nil {
+		p.inactivityTimer.Stop()
+		p.inactivityTimer = nil
+	}
+}
+
+func (p *Pipeline) handleInactivityTimeout() {
+	p.inactivityMu.Lock()
+	p.inactivityTimer = nil
+	p.inactivityMu.Unlock()
+
+	p.vadMu.Lock()
+	if p.destroyed.Load() {
+		p.vadMu.Unlock()
+		return
+	}
+	isSpeaking := p.sileroVAD.IsSpeaking()
+	if isSpeaking {
+		p.sileroVAD.Reset()
+	}
+	p.vadMu.Unlock()
+	if !isSpeaking {
+		return
+	}
+
+	log.Println("[vad] Input inactivity detected — sending EOS")
+	p.ringMu.Lock()
+	_ = p.ringBuf.Flush()
+	p.ringMu.Unlock()
+	p.sendEOS("[WARN] Audio channel full, dropping inactivity EOS signal")
 }

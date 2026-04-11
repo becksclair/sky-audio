@@ -185,6 +185,54 @@ func TestHandleTrackEndedClearsRingBufferAndDoesNotBlockWhenEOSBackpressured(t *
 	}
 }
 
+func TestHandlePCMInactivityTimeoutSendsEOS(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	stt := &fakeSTTClient{}
+	var processCalls int
+	var vadEngine *fakeVAD
+	vadEngine = &fakeVAD{
+		processFunc: func(_ []float32) ([]vad.Event, error) {
+			processCalls++
+			if processCalls == 1 {
+				vadEngine.isSpeaking = true
+				return []vad.Event{vad.EventSpeechStart}, nil
+			}
+			return nil, nil
+		},
+	}
+	p := newPipelineWithDeps(ctx, stt, vadEngine, false)
+	p.inactivityTimeout = 40 * time.Millisecond
+
+	p.HandlePCM([]byte{1, 2, 3, 4})
+
+	select {
+	case first := <-p.audioCh:
+		if first.eos {
+			t.Fatalf("first message should be audio, got EOS")
+		}
+		if len(first.data) == 0 {
+			t.Fatal("first message should contain audio")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for initial audio message")
+	}
+
+	select {
+	case msg := <-p.audioCh:
+		if !msg.eos {
+			t.Fatalf("expected inactivity EOS, got %+v", msg)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for inactivity EOS")
+	}
+
+	if vadEngine.resetCount != 1 {
+		t.Fatalf("Reset called %d times, want 1", vadEngine.resetCount)
+	}
+}
+
 func TestRunAudioSenderReportsSendError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

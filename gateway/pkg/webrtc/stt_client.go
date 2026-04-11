@@ -72,15 +72,28 @@ func (c *STTClient) Recv() (*pb.Transcript, error) {
 	return c.stream.Recv()
 }
 
-func (c *STTClient) Close() error {
+func (c *STTClient) CloseSend() error {
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
 
 	if c.stream != nil {
-		_ = c.stream.CloseSend()
-	}
-	if c.conn != nil {
-		return c.conn.Close()
+		return c.stream.CloseSend()
 	}
 	return nil
+}
+
+func (c *STTClient) Close() error {
+	// Always close the connection, even if CloseSend fails.
+	// Aggregate errors to ensure connection is not leaked.
+	// Note: We prioritize closeSendErr over connErr because the stream error
+	// is typically the root cause and more actionable for debugging.
+	closeSendErr := c.CloseSend()
+	var connErr error
+	if c.conn != nil {
+		connErr = c.conn.Close()
+	}
+	if closeSendErr != nil {
+		return closeSendErr
+	}
+	return connErr
 }
