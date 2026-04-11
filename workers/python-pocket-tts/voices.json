@@ -1,9 +1,26 @@
 {
-  "default": "default",
-  "default_temperature": 0.75,
-  "default_cfg_coef": 1.5,
-  "default_padding": 0,
+  "default": "alba",
   "voices": [
-    "default"
+    "alba",
+    "anna",
+    "azelma",
+    "bill_boerst",
+    "caro_davy",
+    "charles",
+    "cosette",
+    "eponine",
+    "eve",
+    "fantine",
+    "george",
+    "jane",
+    "javert",
+    "jean",
+    "marius",
+    "mary",
+    "michael",
+    "paul",
+    "peter_yearsley",
+    "stuart_bell",
+    "vera"
   ]
 }

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -23,6 +24,8 @@ import (
 const defaultRealtimeClientSecretTTL = 60 * time.Second
 const realtimeAudioDeltaChunkBytes = 4096
 const maxRealtimeInputAudioBytes = MaxAudioFileSize
+const maxRealtimeClientSecretsBodyBytes = 16 * 1024
+const maxRealtimeWSMessageBytes = 1 << 20
 
 const realtimeIncludeInputAudioLogprobs = "item.input_audio_transcription.logprobs"
 
@@ -192,10 +195,16 @@ func ClientSecretsHandler(store *ClientSecretStore) http.HandlerFunc {
 			Session RealtimeSession `json:"session"`
 		}
 		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, maxRealtimeClientSecretsBodyBytes)
 			defer r.Body.Close()
 		}
 		if r.ContentLength != 0 {
-			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			decoder := json.NewDecoder(r.Body)
+			if err := decoder.Decode(&req); err != nil {
+				writeError(w, http.StatusBadRequest, "invalid_request_error", "Invalid JSON body")
+				return
+			}
+			if err := decoder.Decode(&struct{}{}); err != io.EOF {
 				writeError(w, http.StatusBadRequest, "invalid_request_error", "Invalid JSON body")
 				return
 			}
@@ -225,6 +234,7 @@ func RealtimeHandler(opts RealtimeHandlerOptions) http.HandlerFunc {
 		if err != nil {
 			return
 		}
+		conn.SetReadLimit(maxRealtimeWSMessageBytes)
 		defer conn.Close(websocket.StatusNormalClosure, "")
 
 		ctx := r.Context()
@@ -460,13 +470,29 @@ func (s *realtimeTranscriptionSession) appendInputAudio(encodedAudio string) err
 	if encodedAudio == "" {
 		return fmt.Errorf("audio is required")
 	}
-	rawAudio, err := base64.StdEncoding.DecodeString(encodedAudio)
+
+	decodedCap := base64.StdEncoding.DecodedLen(len(encodedAudio))
+	if decodedCap <= 0 {
+		return fmt.Errorf("audio is required")
+	}
+
+	s.mu.Lock()
+	remaining := maxRealtimeInputAudioBytes - s.inputAudio.Len()
+	s.mu.Unlock()
+	if decodedCap > remaining {
+		return fmt.Errorf("input audio buffer exceeds maximum size of %d bytes", maxRealtimeInputAudioBytes)
+	}
+
+	rawAudio := make([]byte, decodedCap)
+	decodedLen, err := base64.StdEncoding.Decode(rawAudio, []byte(encodedAudio))
 	if err != nil {
 		return fmt.Errorf("audio must be base64-encoded input bytes")
 	}
+	rawAudio = rawAudio[:decodedLen]
 	if len(rawAudio) == 0 {
 		return fmt.Errorf("audio is required")
 	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.inputAudio.Len()+len(rawAudio) > maxRealtimeInputAudioBytes {

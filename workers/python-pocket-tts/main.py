@@ -137,7 +137,9 @@ class TextToSpeechServicer(audio_engine_pb2_grpc.TextToSpeechServicer):
             await context.abort(grpc.StatusCode.INTERNAL, "synthesis failed")
 
     def _resolve_voice_source(self, voice_selector: str) -> tuple[str, Path]:
-        voice_name = voice_selector.strip() or self._default_voice
+        voice_name = voice_selector.strip()
+        if voice_name == "" or voice_name == "default":
+            voice_name = self._default_voice
         if voice_name in self._known_voices:
             local_path = VOICE_ASSETS_DIR / "embeddings_v3" / f"{voice_name}.safetensors"
             if not local_path.exists():
@@ -191,43 +193,58 @@ class WorkerControlServicer(audio_engine_pb2_grpc.WorkerControlServicer):
 async def serve() -> None:
     logging.basicConfig(level=logging.INFO, format="[%(name)s] %(levelname)s: %(message)s")
 
+    # Clean up any stale socket file before we start
     try:
         os.remove(SOCKET_PATH)
     except OSError:
         pass
 
-    model = load_model()
-    default_voice, known_voices = load_voice_catalog()
-    servicer = TextToSpeechServicer(model, default_voice, known_voices)
-    _, default_voice_state = servicer._get_voice_state(default_voice)
-    logger.info(
-        "PocketTTS loaded (default_voice=%s, sample_rate=%d, catalog=%d, cache=%d)",
-        default_voice,
-        model.sample_rate,
-        len(known_voices),
-        len(servicer._voice_state_cache) if default_voice_state is not None else 0,
-    )
-
-    server = grpc.aio.server(futures.ThreadPoolExecutor(max_workers=4))
-    audio_engine_pb2_grpc.add_TextToSpeechServicer_to_server(servicer, server)
-    audio_engine_pb2_grpc.add_WorkerControlServicer_to_server(WorkerControlServicer(), server)
-    port = server.add_insecure_port(f"unix://{SOCKET_PATH}")
-    if port == 0:
-        raise RuntimeError(f"Failed to bind to unix://{SOCKET_PATH}")
-
-    await server.start()
-    logger.info("TTS-Pocket worker listening on unix://%s", SOCKET_PATH)
-
-    stop_event = asyncio.Event()
+    # Install signal handlers BEFORE model loading to handle SIGTERM gracefully
+    shutdown_event = asyncio.Event()
+    socket_created = False
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        def _stop() -> None:
-            _ = stop_event.set()
-        loop.add_signal_handler(sig, _stop)
+        loop.add_signal_handler(sig, shutdown_event.set)
 
-    await stop_event.wait()
-    logger.info("Shutting down...")
-    await server.stop(grace=5)
+    model: Any | None = None
+    server: grpc.aio.Server | None = None
+    servicer: TextToSpeechServicer | None = None
+
+    try:
+        model = load_model()
+        default_voice, known_voices = load_voice_catalog()
+        servicer = TextToSpeechServicer(model, default_voice, known_voices)
+        _, default_voice_state = servicer._get_voice_state(default_voice)
+        logger.info(
+            "PocketTTS loaded (default_voice=%s, sample_rate=%d, catalog=%d, cache=%d)",
+            default_voice,
+            model.sample_rate,
+            len(known_voices),
+            len(servicer._voice_state_cache) if default_voice_state is not None else 0,
+        )
+
+        server = grpc.aio.server(futures.ThreadPoolExecutor(max_workers=4))
+        audio_engine_pb2_grpc.add_TextToSpeechServicer_to_server(servicer, server)
+        audio_engine_pb2_grpc.add_WorkerControlServicer_to_server(WorkerControlServicer(), server)
+        port = server.add_insecure_port(f"unix://{SOCKET_PATH}")
+        if port == 0:
+            raise RuntimeError(f"Failed to bind to unix://{SOCKET_PATH}")
+        socket_created = True
+
+        await server.start()
+        logger.info("TTS-Pocket worker listening on unix://%s", SOCKET_PATH)
+
+        await shutdown_event.wait()
+        logger.info("Shutting down...")
+    finally:
+        # Ensure socket cleanup happens even if we exit during model load
+        if server is not None:
+            await server.stop(grace=5)
+        if socket_created:
+            try:
+                os.remove(SOCKET_PATH)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":
