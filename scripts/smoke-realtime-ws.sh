@@ -9,6 +9,7 @@ GATEWAY_URL="${GATEWAY_URL:-http://127.0.0.1:${PORT}}"
 API_KEY="${SKY_AUDIO_API_KEY:-smoke-key}"
 STT_DEVICE="${STT_DEVICE:-auto}"
 LOG_DIR=$(mktemp -d /tmp/sky-audio-realtime-ws-smoke.XXXXXX)
+STT_SOCKET_PATH="${STT_SOCKET_PATH:-$LOG_DIR/sky-audio-stt.sock}"
 FIXTURE_WAV="$LOG_DIR/fixture.wav"
 WS_CLIENT="$LOG_DIR/realtime_ws_smoke_client.go"
 GATEWAY_LOG="$LOG_DIR/gateway.log"
@@ -155,16 +156,16 @@ if curl -fsS "$GATEWAY_URL/health" >/dev/null 2>&1; then
     exit 1
   fi
 else
-  if [[ -S /tmp/sky-audio-stt.sock ]]; then
-    echo "refusing to start a new gateway while /tmp/sky-audio-stt.sock already exists; stop the existing worker or point GATEWAY_URL at the running gateway" >&2
+  if [[ -S "$STT_SOCKET_PATH" ]]; then
+    echo "refusing to start a new gateway while $STT_SOCKET_PATH already exists; stop the existing worker or point GATEWAY_URL at the running gateway" >&2
     exit 1
   fi
   echo "building gateway/sky-audio..."
   "$ROOT/scripts/with-onnx-env.sh" go build -o "$GATEWAY_BIN" ./gateway/cmd/sky-audio
-  echo "starting gateway at $GATEWAY_URL with STT_DEVICE=$STT_DEVICE"
+  echo "starting gateway at $GATEWAY_URL with STT_DEVICE=$STT_DEVICE STT_SOCKET_PATH=$STT_SOCKET_PATH"
   (
     cd "$ROOT"
-    SKY_AUDIO_API_KEY="$API_KEY" STT_DEVICE="$STT_DEVICE" PORT="$PORT" "$GATEWAY_BIN" >"$GATEWAY_LOG" 2>&1
+    SKY_AUDIO_API_KEY="$API_KEY" SKY_AUDIO_STT_SOCKET="$STT_SOCKET_PATH" STT_DEVICE="$STT_DEVICE" PORT="$PORT" "$GATEWAY_BIN" >"$GATEWAY_LOG" 2>&1
   ) &
   GATEWAY_PID=$!
   STARTED_GATEWAY=1
@@ -172,7 +173,7 @@ else
     HEALTH=0
     SOCKET=0
     curl -fsS "$GATEWAY_URL/health" >/dev/null 2>&1 && HEALTH=1
-    [[ -S /tmp/sky-audio-stt.sock ]] && SOCKET=1
+    [[ -S "$STT_SOCKET_PATH" ]] && SOCKET=1
     if [[ "$HEALTH" == "1" && "$SOCKET" == "1" ]]; then
       break
     fi
