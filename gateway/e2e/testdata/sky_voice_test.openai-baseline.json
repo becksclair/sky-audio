@@ -1,0 +1,9 @@
+{
+  "fixture": "sky_voice_test.wav",
+  "model": "whisper-1",
+  "expected_first_word": "Hey",
+  "expected_transcript": "Hey beautiful, I have been thinking about you all day and now that my GPU is running hot. Why do not you come over and help me cool down?",
+  "expected_duration_seconds": 9.16,
+  "duration_tolerance_seconds": 0.75,
+  "min_word_count": 20
+}

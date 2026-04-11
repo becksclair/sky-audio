@@ -7,7 +7,9 @@ import logging
 import os
 import signal
 import sys
+import tempfile
 import threading
+import wave
 from collections.abc import AsyncIterator
 from concurrent import futures
 from dataclasses import dataclass
@@ -16,11 +18,7 @@ from typing import Any, override
 import grpc
 import numpy as np
 import torch
-from nemo.collections.asr.inference.model_wrappers.cache_aware_rnnt_inference_wrapper import (
-    CacheAwareRNNTInferenceWrapper,
-)
-from nemo.collections.asr.inference.utils.context_manager import CacheAwareContext
-from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTDecodingConfig
+from nemo.collections.asr.models import ASRModel
 
 sys.path.insert(0, os.path.dirname(__file__))
 from pb import audio_engine_pb2, audio_engine_pb2_grpc
@@ -44,116 +42,126 @@ class StreamingTranscriber:
     def __init__(self, model_name: str, runtime: RuntimeConfig) -> None:
         self._runtime = runtime
         self._inference_lock = threading.Lock()
-        self._wrapper = CacheAwareRNNTInferenceWrapper(
-            model_name=model_name,
-            decoding_cfg=RNNTDecodingConfig(),
-            device=runtime.device,
-            compute_dtype=runtime.compute_dtype,
-            use_amp=runtime.use_amp,
+        self._model = self._load_model(model_name)
+        self.min_partial_samples = max(1, int(_env_float("STT_MIN_PARTIAL_SECONDS", 1.5) * SAMPLE_RATE))
+        self.partial_stride_samples = max(1, int(_env_float("STT_PARTIAL_STRIDE_SECONDS", 0.75) * SAMPLE_RATE))
+        self.partial_max_append_bytes = max(
+            SAMPLE_RATE * 2,
+            int(_env_float("STT_PARTIAL_MAX_APPEND_SECONDS", 2.0) * SAMPLE_RATE * 2),
         )
-        self._preprocessor, _ = self._wrapper.create_preprocessor()
-        shift_size = self._wrapper.get_shift_size()
-        if isinstance(shift_size, list):
-            shift_frames = int(shift_size[-1])
-        else:
-            shift_frames = int(shift_size)
-        model_stride_seconds = float(self._wrapper.get_model_stride(in_secs=True))
-        self.chunk_samples = max(1, int(round(shift_frames * model_stride_seconds * SAMPLE_RATE)))
-        self.drop_extra_pre_encoded = int(self._wrapper.get_drop_extra_pre_encoded())
         logger.info(
-            "Streaming transcriber ready on %s (dtype=%s, amp=%s, chunk_samples=%d)",
+            "Streaming transcriber ready on %s (dtype=%s, amp=%s, min_partial_samples=%d, partial_stride_samples=%d)",
             runtime.device,
             runtime.compute_dtype,
             runtime.use_amp,
-            self.chunk_samples,
+            self.min_partial_samples,
+            self.partial_stride_samples,
         )
 
     def create_session(self) -> "StreamingSession":
         return StreamingSession(self)
 
-    def infer_chunk(
-        self,
-        audio: np.ndarray,
-        context: CacheAwareContext,
-        previous_hypotheses: list[Any] | None,
-    ) -> tuple[str, CacheAwareContext, list[Any] | None]:
-        if audio.size == 0:
-            return "", context, previous_hypotheses
+    def transcribe_pcm(self, pcm_bytes: bytes) -> str:
+        if len(pcm_bytes) < 2:
+            return ""
 
         with self._inference_lock:
-            audio_tensor = torch.from_numpy(audio).unsqueeze(0).to(self._runtime.device)
-            audio_len = torch.tensor([audio_tensor.shape[1]], dtype=torch.long, device=self._runtime.device)
-            processed_signal, processed_signal_len = self._preprocessor(
-                input_signal=audio_tensor,
-                length=audio_len,
-            )
-            hypotheses, next_context = self._wrapper.stream_step(
-                processed_signal,
-                processed_signal_len,
-                context=context,
-                previous_hypotheses=previous_hypotheses,
-                drop_extra_pre_encoded=self.drop_extra_pre_encoded,
-                keep_all_outputs=False,
-            )
+            if self._runtime.device == "cuda":
+                outputs = self._transcribe_via_temp_wav(pcm_bytes)
+            else:
+                audio = pcm_to_float32(pcm_bytes)
+                outputs = self._model.transcribe([audio], batch_size=1, verbose=False)
 
-        transcript = ""
-        next_hypotheses: list[Any] | None = hypotheses
-        if hypotheses:
-            hypothesis = hypotheses[0]
-            transcript = str(getattr(hypothesis, "text", "") or "").strip()
-        return transcript, next_context, next_hypotheses
+        return extract_transcript_text(outputs)
+
+    def _load_model(self, model_name: str) -> Any:
+        try:
+            model = ASRModel.from_pretrained(model_name, map_location=torch.device(self._runtime.device))
+            model.eval()
+            return model
+        except Exception as e:
+            raise RuntimeError(f"Failed to load model {model_name}: {e}") from e
+
+    def _transcribe_via_temp_wav(self, pcm_bytes: bytes) -> Any:
+        temp_path = self._write_temp_wav(pcm_bytes)
+        try:
+            return self._model.transcribe([temp_path], batch_size=1, verbose=False)
+        finally:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                logger.warning("Failed to remove temp STT wav %s", temp_path)
+
+    def _write_temp_wav(self, pcm_bytes: bytes) -> str:
+        fd, temp_path = tempfile.mkstemp(suffix=".wav", prefix="sky-audio-stt-")
+        os.close(fd)
+        try:
+            with wave.open(temp_path, "wb") as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(SAMPLE_RATE)
+                wav_file.writeframes(pcm_bytes)
+            return temp_path
+        except Exception:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+            raise
 
 
 class StreamingSession:
     def __init__(self, transcriber: StreamingTranscriber) -> None:
         self._transcriber = transcriber
-        self._context = CacheAwareContext()
-        self._previous_hypotheses: list[Any] | None = None
-        self._pending_pcm = bytearray()
+        self._buffered_pcm = bytearray()
+        self._samples_since_partial = 0
         self._last_emitted_text = ""
-        self._final_text = ""
+        self._partial_emitted = False
 
     def append_pcm(self, pcm_bytes: bytes) -> list[str]:
-        partials: list[str] = []
-        if pcm_bytes:
-            self._pending_pcm.extend(pcm_bytes)
+        if not pcm_bytes:
+            return []
 
-        chunk_bytes = self._transcriber.chunk_samples * 2
-        while len(self._pending_pcm) >= chunk_bytes:
-            current = bytes(self._pending_pcm[:chunk_bytes])
-            del self._pending_pcm[:chunk_bytes]
-            partial = self._infer_pcm(current)
-            if partial is not None:
-                partials.append(partial)
-        return partials
+        if len(pcm_bytes) % 2 != 0:
+            pcm_bytes = pcm_bytes[:-1]
+        if not pcm_bytes:
+            return []
+
+        self._buffered_pcm.extend(pcm_bytes)
+        self._samples_since_partial += len(pcm_bytes) // 2
+        if self._partial_emitted:
+            return []
+
+        if len(pcm_bytes) > self._transcriber.partial_max_append_bytes:
+            return []
+        if len(self._buffered_pcm) // 2 < self._transcriber.min_partial_samples:
+            return []
+        if self._samples_since_partial < self._transcriber.partial_stride_samples:
+            return []
+
+        self._samples_since_partial = 0
+        partial = self._transcribe_buffer()
+        if partial is not None:
+            self._partial_emitted = True
+            return [partial]
+        return []
 
     def finalize(self) -> tuple[list[str], str]:
+        if not self._buffered_pcm:
+            return [], ""
+
+        final_text = self._transcriber.transcribe_pcm(bytes(self._buffered_pcm)).strip()
+        self._buffered_pcm.clear()
+        self._samples_since_partial = 0
+
         partials: list[str] = []
-        if self._pending_pcm:
-            final_bytes = bytes(self._pending_pcm)
-            if len(final_bytes) % 2 != 0:
-                final_bytes = final_bytes[:-1]
-            self._pending_pcm.clear()
-            if final_bytes:
-                partial = self._infer_pcm(final_bytes)
-                if partial is not None:
-                    partials.append(partial)
+        if final_text and final_text != self._last_emitted_text:
+            self._last_emitted_text = final_text
+            partials.append(final_text)
+        return partials, final_text
 
-        final_text = self._final_text or self._last_emitted_text
-        return partials, final_text.strip()
-
-    def _infer_pcm(self, pcm_bytes: bytes) -> str | None:
-        audio = pcm_to_float32(pcm_bytes)
-        transcript, next_context, next_hypotheses = self._transcriber.infer_chunk(
-            audio,
-            self._context,
-            self._previous_hypotheses,
-        )
-        self._context = next_context
-        self._previous_hypotheses = next_hypotheses
-        transcript = transcript.strip()
-        if transcript:
-            self._final_text = transcript
+    def _transcribe_buffer(self) -> str | None:
+        transcript = self._transcriber.transcribe_pcm(bytes(self._buffered_pcm)).strip()
         if transcript and transcript != self._last_emitted_text:
             self._last_emitted_text = transcript
             return transcript
@@ -186,10 +194,34 @@ def load_transcriber() -> StreamingTranscriber:
     return StreamingTranscriber(MODEL_NAME, runtime)
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r, using default %s", name, raw, default)
+        return default
+
+
 def pcm_to_float32(pcm_bytes: bytes) -> np.ndarray:
-    """Convert raw 16-bit signed LE PCM bytes to float32 numpy array normalized to [-1, 1]."""
-    audio = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-    return audio
+    if len(pcm_bytes) % 2 != 0:
+        pcm_bytes = pcm_bytes[:-1]
+    return np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+
+
+def extract_transcript_text(outputs: Any) -> str:
+    if isinstance(outputs, list):
+        if not outputs:
+            return ""
+        candidate = outputs[0]
+    else:
+        candidate = outputs
+
+    if isinstance(candidate, str):
+        return candidate.strip()
+    return str(getattr(candidate, "text", "") or "").strip()
 
 
 class SpeechToTextServicer(audio_engine_pb2_grpc.SpeechToTextServicer):
@@ -237,6 +269,7 @@ class SpeechToTextServicer(audio_engine_pb2_grpc.SpeechToTextServicer):
             logger.info("Stream cancelled by client")
         except Exception:
             logger.exception("Error in TranscribeStream")
+            raise
 
 
 class WorkerControlServicer(audio_engine_pb2_grpc.WorkerControlServicer):
@@ -259,33 +292,47 @@ class WorkerControlServicer(audio_engine_pb2_grpc.WorkerControlServicer):
 async def serve() -> None:
     logging.basicConfig(level=logging.INFO, format="[%(name)s] %(levelname)s: %(message)s")
 
+    # Clean up any stale socket file before we start
     try:
         os.remove(SOCKET_PATH)
     except OSError:
         pass
 
-    transcriber = load_transcriber()
-
-    server = grpc.aio.server(futures.ThreadPoolExecutor(max_workers=4))
-    audio_engine_pb2_grpc.add_SpeechToTextServicer_to_server(SpeechToTextServicer(transcriber), server)
-    audio_engine_pb2_grpc.add_WorkerControlServicer_to_server(WorkerControlServicer(), server)
-    port = server.add_insecure_port(f"unix://{SOCKET_PATH}")
-    if port == 0:
-        raise RuntimeError(f"Failed to bind to unix://{SOCKET_PATH}")
-
-    await server.start()
-    logger.info("STT worker listening on unix://%s", SOCKET_PATH)
-
-    stop_event = asyncio.Event()
-    loop = asyncio.get_event_loop()
+    # Install signal handlers BEFORE model loading to handle SIGTERM gracefully
+    shutdown_event = asyncio.Event()
+    socket_created = False
+    loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        def _stop() -> None:
-            _ = stop_event.set()
-        loop.add_signal_handler(sig, _stop)
+        loop.add_signal_handler(sig, shutdown_event.set)
 
-    await stop_event.wait()
-    logger.info("Shutting down...")
-    await server.stop(grace=5)
+    transcriber: StreamingTranscriber | None = None
+    server: grpc.aio.Server | None = None
+
+    try:
+        transcriber = load_transcriber()
+
+        server = grpc.aio.server(futures.ThreadPoolExecutor(max_workers=4))
+        audio_engine_pb2_grpc.add_SpeechToTextServicer_to_server(SpeechToTextServicer(transcriber), server)
+        audio_engine_pb2_grpc.add_WorkerControlServicer_to_server(WorkerControlServicer(), server)
+        port = server.add_insecure_port(f"unix://{SOCKET_PATH}")
+        if port == 0:
+            raise RuntimeError(f"Failed to bind to unix://{SOCKET_PATH}")
+        socket_created = True
+
+        await server.start()
+        logger.info("STT worker listening on unix://%s", SOCKET_PATH)
+
+        await shutdown_event.wait()
+        logger.info("Shutting down...")
+    finally:
+        # Ensure socket cleanup happens even if we exit during model load
+        if server is not None:
+            await server.stop(grace=5)
+        if socket_created:
+            try:
+                os.remove(SOCKET_PATH)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":

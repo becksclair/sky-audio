@@ -15,7 +15,9 @@
     "e2e": "playwright test",
     "e2e:ui": "playwright test --ui",
     "e2e:debug": "playwright test --debug",
-    "e2e:install": "playwright install chromium"
+    "e2e:install": "playwright install chromium",
+    "e2e:live-webrtc": "PLAYWRIGHT_LIVE_WEBRTC=1 playwright test e2e/webrtc-connect.live.spec.ts",
+    "e2e:live-webrtc:cuda": "PLAYWRIGHT_LIVE_WEBRTC=1 PLAYWRIGHT_LIVE_STT_DEVICE=cuda playwright test e2e/webrtc-connect.live.spec.ts"
   },
   "peerDependencies": {
     "@preact/signals": "^2.8.1",
