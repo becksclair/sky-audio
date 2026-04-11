@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -42,11 +43,13 @@ const (
 	defaultSTTEndOfSpeechMs  = 150
 	maxTTSTextLen            = 2000
 	maxTTSBodyBytes          = 25600
+	sttSocketEnvVarName      = "SKY_AUDIO_STT_SOCKET"
 	sttEndOfSpeechEnvVarName = "STT_END_OF_SPEECH_MS"
 )
 
 type sseClient struct {
-	ch chan string
+	ch        chan string
+	closeOnce sync.Once
 }
 
 type transcriptEvent struct {
@@ -91,6 +94,22 @@ func resolveSTTEndOfSpeechMs() (int, string) {
 	return ms, sttEndOfSpeechEnvVarName
 }
 
+func resolveSTTSocketPath() string {
+	value := strings.TrimSpace(os.Getenv(sttSocketEnvVarName))
+	if value == "" {
+		return sttSocketPath
+	}
+	return value
+}
+
+func resolvePythonWorkerLauncher(dir string) (string, []string) {
+	venvPython := filepath.Join(dir, ".venv", "bin", "python")
+	if info, err := os.Stat(venvPython); err == nil && !info.IsDir() {
+		return filepath.Join(".venv", "bin", "python"), []string{"main.py"}
+	}
+	return "uv", []string{"run", "python", "main.py"}
+}
+
 func activeTTSVoiceCatalogPaths(engine string) map[string]string {
 	switch engine {
 	case "kyutai":
@@ -130,7 +149,7 @@ func (h *transcriptHub) Subscribe(sessionID string) *sseClient {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if _, ok := h.active[sessionID]; !ok {
-		close(client.ch)
+		client.closeOnce.Do(func() { close(client.ch) })
 		return client
 	}
 	if h.clients[sessionID] == nil {
@@ -146,13 +165,15 @@ func (h *transcriptHub) Unsubscribe(sessionID string, client *sseClient) {
 
 	clients := h.clients[sessionID]
 	if clients == nil {
+		client.closeOnce.Do(func() { close(client.ch) })
 		return
 	}
 	if _, ok := clients[client]; !ok {
+		client.closeOnce.Do(func() { close(client.ch) })
 		return
 	}
 	delete(clients, client)
-	close(client.ch)
+	client.closeOnce.Do(func() { close(client.ch) })
 	if len(clients) == 0 {
 		delete(h.clients, sessionID)
 	}
@@ -175,15 +196,13 @@ func (h *transcriptHub) Publish(sessionID string, transcript *pb.Transcript) {
 	payloadStr := string(payload)
 
 	h.mu.Lock()
-	clients := make([]*sseClient, 0, len(h.clients[sessionID]))
-	for client := range h.clients[sessionID] {
-		clients = append(clients, client)
-	}
-	h.mu.Unlock()
+	defer h.mu.Unlock()
 
-	// Send to clients outside of lock
+	// Send to clients while holding lock to prevent send-on-closed-channel race
+	// with Unsubscribe/CloseSession. Use non-blocking send to avoid blocking
+	// on slow clients.
 	dropped := 0
-	for _, client := range clients {
+	for client := range h.clients[sessionID] {
 		select {
 		case client.ch <- payloadStr:
 		default:
@@ -206,7 +225,7 @@ func (h *transcriptHub) CloseSession(sessionID string) {
 		return
 	}
 	for client := range clients {
-		close(client.ch)
+		client.closeOnce.Do(func() { close(client.ch) })
 	}
 	delete(h.clients, sessionID)
 }
@@ -372,6 +391,11 @@ func (l *lazySTTLoader) EnsureRunning() func() {
 		for l.spawning {
 			l.cond.Wait()
 		}
+		// Re-check shutdown state after waking - Stop() may have been called
+		if l.inShutdown || l.killing {
+			l.mu.Unlock()
+			return nil
+		}
 		// Spawn completed, check result
 		if l.running && l.runtime.IsRunning(l.spec.Name) {
 			l.sessionCount++
@@ -483,12 +507,16 @@ func (l *lazySTTLoader) RemoveSession() {
 
 func (l *lazySTTLoader) shutdown() {
 	l.mu.Lock()
+	// Set killing=true FIRST to prevent EnsureRunning from adding sessions
+	// while we decide whether to proceed with shutdown. This prevents TOCTOU race.
+	l.killing = true
 	if l.sessionCount > 0 || !l.running || l.inShutdown || l.spawning {
+		l.killing = false
+		l.cond.Broadcast() // wake waiters that were waiting for killing=false
 		l.mu.Unlock()
 		return
 	}
 
-	l.killing = true // Prevent EnsureRunning from racing with kill
 	socketPath := l.spec.SocketPath
 	l.mu.Unlock()
 
@@ -772,17 +800,23 @@ func (l *lazyTTSLoader) EnsureRunning() (*skywebrtc.TTSClient, func()) {
 func (l *lazyTTSLoader) makeCleanup() func() {
 	return func() {
 		l.mu.Lock()
-		defer l.mu.Unlock()
 		l.reqCount--
 		if l.reqCount < 0 {
 			l.reqCount = 0
 		}
-		if l.reqCount == 0 && l.running && !l.inShutdown {
-			// Stop any existing timer before setting new one to prevent timer leaks
+		needsTimer := l.reqCount == 0 && l.running && !l.inShutdown
+		l.mu.Unlock()
+
+		if needsTimer {
+			// Stop any existing timer before setting new one to prevent timer leaks.
+			// This runs with lock released to avoid deadlock if timer callback
+			// panics or if shutdown() needs to acquire the lock.
+			l.mu.Lock()
 			if l.idleTimer != nil {
 				l.idleTimer.Stop()
 			}
 			l.idleTimer = time.AfterFunc(l.idleTimeout, l.shutdown)
+			l.mu.Unlock()
 		}
 	}
 }
@@ -971,17 +1005,20 @@ func (l *lazySTTLoader) Stop() {
 }
 
 type audioSession struct {
-	id           string
-	ctx          context.Context
-	hub          *transcriptHub
-	cancel       context.CancelFunc
-	streamCancel context.CancelFunc
-	sttClient    *skywebrtc.STTClient
-	pipeline     *speech.Pipeline
-	onFatal      func()
-	startOnce    sync.Once
-	closeOnce    sync.Once
-	closed       atomic.Bool
+	id                   string
+	ctx                  context.Context
+	hub                  *transcriptHub
+	cancel               context.CancelFunc
+	streamCancel         context.CancelFunc
+	sttClient            *skywebrtc.STTClient
+	pipeline             *speech.Pipeline
+	onFatal              func()
+	startOnce            sync.Once
+	closeOnce            sync.Once
+	closed               atomic.Bool
+	receivedAudio        atomic.Bool
+	finalTranscriptCount atomic.Uint64 // incremented for each final transcript received
+	trackEndedAt         atomic.Int64  // timestamp when HandleTrackEnded was called (UnixNano)
 }
 
 type realtimeCallSession struct {
@@ -1044,6 +1081,9 @@ func newAudioSession(
 		log.Printf("[trace=%s][stt][session=%s][final=%v][chars=%d] received", traceID, peerID, transcript.IsFinal, utf8.RuneCountInString(transcript.Text))
 		log.Printf("[trace=%s][stt][session=%s][publish_ms=%d] published", traceID, peerID, time.Since(receivedAt).Milliseconds())
 		hub.Publish(peerID, transcript)
+		if transcript.IsFinal {
+			session.finalTranscriptCount.Add(1)
+		}
 		if onTranscript != nil {
 			onTranscript(transcript)
 		}
@@ -1072,6 +1112,9 @@ func (s *audioSession) HandlePCM(pcm []byte) {
 	if s.closed.Load() {
 		return
 	}
+	if len(pcm) > 0 {
+		s.receivedAudio.Store(true)
+	}
 	s.pipeline.HandlePCM(pcm)
 }
 
@@ -1079,20 +1122,57 @@ func (s *audioSession) HandleTrackEnded() {
 	if s.closed.Load() {
 		return
 	}
+	s.trackEndedAt.Store(time.Now().UnixNano())
 	s.pipeline.HandleTrackEnded()
+}
+
+func shouldWaitForOutstandingFinalTranscript(receivedAudio bool, finalCountBefore, eosSentCount uint64) bool {
+	if !receivedAudio {
+		return false
+	}
+	return eosSentCount > finalCountBefore
 }
 
 func (s *audioSession) Close() {
 	s.closeOnce.Do(func() {
 		s.closed.Store(true)
+		// Snapshot final transcript count before signaling track ended
+		finalCountBefore := s.finalTranscriptCount.Load()
 		s.pipeline.HandleTrackEnded()
+		s.trackEndedAt.Store(time.Now().UnixNano())
 		s.cancel()
+		// Wait for pipeline sender to finish flushing audio to STT.
+		// This must complete before we signal EOF, or the worker won't receive all audio.
+		senderTimedOut := false
 		select {
 		case <-s.pipeline.SenderDone():
-		case <-time.After(500 * time.Millisecond):
+		case <-time.After(2500 * time.Millisecond):
+			senderTimedOut = true
+			log.Printf("[WARN] Session %s sender flush timed out; forcing stream shutdown", s.id)
+			// Force-cancel the stream first so any blocked SendAudio call can unwind.
 			s.streamCancel()
-			<-s.pipeline.SenderDone()
 		}
+		if !senderTimedOut {
+			// Signal EOF to gRPC stream AFTER SenderDone to avoid racing with Send() calls.
+			// The STT server will send a final transcript after receiving EOF.
+			if err := s.sttClient.CloseSend(); err != nil {
+				log.Printf("[WARN] Session %s STT close-send failed: %v", s.id, err)
+			}
+			// Now wait for any final transcripts that arrive after signaling EOF.
+			// The STT server typically sends the final transcript after receiving EOF.
+			expectedFinalCount := s.pipeline.EOSSentCount()
+			if shouldWaitForOutstandingFinalTranscript(s.receivedAudio.Load(), finalCountBefore, expectedFinalCount) {
+				deadline := time.Now().Add(1500 * time.Millisecond)
+				for time.Now().Before(deadline) {
+					// Wait only while an EOS is still unmatched by a final transcript.
+					if s.finalTranscriptCount.Load() >= expectedFinalCount {
+						break
+					}
+					time.Sleep(20 * time.Millisecond)
+				}
+			}
+		}
+		// Now it's safe to close the stream - we got final transcripts, or forced shutdown on timeout.
 		if err := s.sttClient.Close(); err != nil {
 			log.Printf("[WARN] Session %s STT close failed: %v", s.id, err)
 		}
@@ -1220,6 +1300,22 @@ func main() {
 
 	log.Println("[INFO] Starting sky-audio gateway...")
 
+	// Determine bind address early for auth middleware configuration
+	addr := "127.0.0.1:8585"
+	if p := os.Getenv("PORT"); p != "" {
+		addr = ":" + p
+	}
+
+	// Security: Require API key for non-loopback binds
+	// Supports IPv4 loopback (127.x.x.x), IPv6 loopback ([::1]), and localhost
+	isLoopbackBind := strings.HasPrefix(addr, "127.") ||
+		strings.HasPrefix(addr, "localhost") ||
+		strings.HasPrefix(addr, "[::1]") ||
+		addr == "[::1]"
+	if !isLoopbackBind && os.Getenv("SKY_AUDIO_API_KEY") == "" {
+		log.Fatal("[FATAL] SKY_AUDIO_API_KEY is required when binding to non-loopback address: " + addr)
+	}
+
 	if stats, err := vram.Query(0); err != nil {
 		log.Printf("[WARN] NVML unavailable: %v", err)
 	} else {
@@ -1229,21 +1325,26 @@ func main() {
 	mgr := process.NewManager()
 	workerRuntime := worker.NewRuntime(mgr)
 	ttsEngine := resolveTTSEngine()
+	resolvedSTTSocketPath := resolveSTTSocketPath()
+	sttCommand, sttArgs := resolvePythonWorkerLauncher("workers/python-nemo")
+	ttsPocketCommand, ttsPocketArgs := resolvePythonWorkerLauncher("workers/python-pocket-tts")
+	ttsKyutaiCommand, ttsKyutaiArgs := resolvePythonWorkerLauncher("workers/python-kyutai-tts")
 	log.Printf("[INFO] Active TTS engine: %s", ttsEngine)
 
 	sttSpec := worker.Spec{
 		Name:           "stt-worker",
-		Command:        "uv",
-		Args:           []string{"run", "python", "main.py"},
+		Command:        sttCommand,
+		Args:           sttArgs,
 		Dir:            "workers/python-nemo",
-		SocketPath:     sttSocketPath,
+		Env:            []string{"STT_SOCKET=" + resolvedSTTSocketPath},
+		SocketPath:     resolvedSTTSocketPath,
 		SocketTimeout:  120 * time.Second,
 		ReadinessProbe: "stt-worker",
 	}
 	ttsPocketSpec := worker.Spec{
 		Name:           "tts-pocket",
-		Command:        "uv",
-		Args:           []string{"run", "python", "main.py"},
+		Command:        ttsPocketCommand,
+		Args:           ttsPocketArgs,
 		Dir:            "workers/python-pocket-tts",
 		SocketPath:     ttsPocketSocketPath,
 		SocketTimeout:  120 * time.Second,
@@ -1251,8 +1352,8 @@ func main() {
 	}
 	ttsKyutaiSpec := worker.Spec{
 		Name:           "tts-kyutai",
-		Command:        "uv",
-		Args:           []string{"run", "python", "main.py"},
+		Command:        ttsKyutaiCommand,
+		Args:           ttsKyutaiArgs,
 		Dir:            "workers/python-kyutai-tts",
 		SocketPath:     ttsKyutaiSocketPath,
 		SocketTimeout:  180 * time.Second,
@@ -1307,6 +1408,9 @@ func main() {
 		SpeechPadMs:          30,
 	}
 	log.Printf("[INFO] Per-session speech pipeline enabled (stt_end_of_speech_ms=%d source=%s)", sttEndOfSpeechMs, sttEndOfSpeechSource)
+
+	// Initialize realtime secrets store early for auth middleware usage
+	realtimeSecrets := openaihttp.NewClientSecretStore(60 * time.Second)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -1383,38 +1487,45 @@ func main() {
 		}, nil
 	}
 
-	// WebRTC endpoint - require auth when binding to non-loopback
 	webrtcHandler := skywebrtc.OfferHandler(skywebrtc.PeerConfig{NewSession: newPeerSession}, peerRegistry)
-	mux.Handle("/webrtc/offer", openaihttp.OptionalAuthMiddleware(webrtcHandler))
+	// Protect /webrtc/offer with standard auth middleware.
+	mux.Handle("/webrtc/offer", openaihttp.OptionalAuthMiddlewareWithValidator(webrtcHandler, nil))
 
-	// API endpoints - require auth when binding to non-loopback
 	apiMux := http.NewServeMux()
 	apiMux.HandleFunc("/api/stt/stream", sseHandler(transcripts))
 	apiMux.HandleFunc("GET /api/tts/voices", ttsVoicesHandler(voiceCatalogMgr))
 	apiMux.HandleFunc("POST /api/tts/voices/default", ttsSetDefaultHandler(voiceCatalogMgr))
 	apiMux.HandleFunc("DELETE /api/tts/voices/{engine}/{voice...}", ttsDeleteVoiceHandler(voiceCatalogMgr))
 	apiMux.HandleFunc("POST /api/tts/synthesize", ttsHandlerLazy(ttsLazy, ttsEngine))
-	mux.Handle("/api/", openaihttp.OptionalAuthMiddleware(apiMux))
+	// Protect /api/* endpoints with standard auth middleware.
+	mux.Handle("/api/", openaihttp.OptionalAuthMiddlewareWithValidator(apiMux, nil))
 
 	// OpenAI-compatible endpoints for OpenClaw integration
-	// These provide /v1/audio/speech, /v1/audio/transcriptions, and /v1/models
-	openaiMux := http.NewServeMux()
+	// These provide /v1/audio/speech, /v1/audio/transcriptions, /v1/models, and realtime routes.
+	openaiCoreMux := http.NewServeMux()
+	openaiRealtimeMux := http.NewServeMux()
 	availableTTSEngines := map[string]struct{}{ttsEngine: {}}
-	realtimeSecrets := openaihttp.NewClientSecretStore(60 * time.Second)
+	// realtimeSecrets already initialized earlier for auth middleware
 	// Build synthesizer map for the active TTS engine
 	synthesizers := make(map[string]openaihttp.TTSSynthesizer, 1)
 	if ttsLazy != nil {
 		synthesizers[ttsEngine] = &lazyTTSSynthesizer{loader: ttsLazy}
 	}
-	openaiMux.HandleFunc("GET /v1/models", openaihttp.ModelsHandlerWithAvailableTTSEngines(availableTTSEngines))
-	openaiMux.HandleFunc("GET /v1/models/{model}", openaihttp.ModelsRetrieveHandlerWithAvailableTTSEngines(availableTTSEngines))
-	openaiMux.HandleFunc("GET /v1/realtime", openaihttp.RealtimeHandler(openaihttp.RealtimeHandlerOptions{SocketPath: sttSpec.SocketPath, EnsureRunning: sttLazy.EnsureRunning, Synthesizers: synthesizers}))
-	openaiMux.HandleFunc("POST /v1/realtime/client_secrets", openaihttp.ClientSecretsHandler(realtimeSecrets))
-	openaiMux.Handle("POST /v1/realtime/calls", skywebrtc.RawSDPHandler(skywebrtc.PeerConfig{NewSession: newRealtimePeerSession}, peerRegistry))
-	openaiMux.HandleFunc("POST /v1/audio/speech", openaihttp.TTSHandlerWithSynth(synthesizers))
-	openaiMux.HandleFunc("POST /v1/audio/transcriptions", openaihttp.TranscriptionsHandlerWithEnsureRunning(sttSpec.SocketPath, sttLazy.EnsureRunning))
-	// Apply optional auth middleware (requires SKY_AUDIO_API_KEY env var to enable)
-	mux.Handle("/v1/", openaihttp.OptionalAuthMiddlewareWithValidator(openaiMux, realtimeSecrets.Validate))
+	openaiCoreMux.HandleFunc("GET /v1/models", openaihttp.ModelsHandlerWithAvailableTTSEngines(availableTTSEngines))
+	openaiCoreMux.HandleFunc("GET /v1/models/{model}", openaihttp.ModelsRetrieveHandlerWithAvailableTTSEngines(availableTTSEngines))
+	openaiCoreMux.HandleFunc("POST /v1/audio/speech", openaihttp.TTSHandlerWithSynth(synthesizers))
+	openaiCoreMux.HandleFunc("POST /v1/audio/transcriptions", openaihttp.TranscriptionsHandlerWithEnsureRunning(sttSpec.SocketPath, sttLazy.EnsureRunning))
+
+	openaiRealtimeMux.HandleFunc("GET /v1/realtime", openaihttp.RealtimeHandler(openaihttp.RealtimeHandlerOptions{SocketPath: sttSpec.SocketPath, EnsureRunning: sttLazy.EnsureRunning, Synthesizers: synthesizers}))
+	openaiRealtimeMux.Handle("POST /v1/realtime/calls", skywebrtc.RawSDPHandler(skywebrtc.PeerConfig{NewSession: newRealtimePeerSession}, peerRegistry))
+
+	// Apply auth middleware to /v1 routes.
+	// Core /v1 endpoints and client secret minting accept only the master API key.
+	mux.Handle("/v1/", openaihttp.OptionalAuthMiddleware(openaiCoreMux))
+	mux.Handle("POST /v1/realtime/client_secrets", openaihttp.OptionalAuthMiddleware(openaihttp.ClientSecretsHandler(realtimeSecrets)))
+	// Realtime session endpoints accept master API key and realtime ephemeral tokens.
+	mux.Handle("/v1/realtime", openaihttp.OptionalAuthMiddlewareWithValidator(openaiRealtimeMux, realtimeSecrets.Validate))
+	mux.Handle("/v1/realtime/", openaihttp.OptionalAuthMiddlewareWithValidator(openaiRealtimeMux, realtimeSecrets.Validate))
 	log.Println("[INFO] OpenAI-compatible endpoints enabled at /v1/ (for OpenClaw integration)")
 
 	dashFS, err := fs.Sub(dashboard.Assets, "dist")
@@ -1423,21 +1534,6 @@ func main() {
 	}
 	mux.Handle("/dashboard/", http.StripPrefix("/dashboard/", http.FileServer(http.FS(dashFS))))
 	log.Println("[INFO] Dashboard available at /dashboard/")
-
-	addr := "127.0.0.1:8585"
-	if p := os.Getenv("PORT"); p != "" {
-		addr = ":" + p
-	}
-
-	// Security: Require API key for non-loopback binds
-	// Supports IPv4 loopback (127.x.x.x), IPv6 loopback ([::1]), and localhost
-	isLoopback := strings.HasPrefix(addr, "127.") ||
-		strings.HasPrefix(addr, "localhost") ||
-		strings.HasPrefix(addr, "[::1]") ||
-		addr == "[::1]"
-	if !isLoopback && os.Getenv("SKY_AUDIO_API_KEY") == "" {
-		log.Fatal("[FATAL] SKY_AUDIO_API_KEY is required when binding to non-loopback address: " + addr)
-	}
 
 	srv := &http.Server{
 		Addr:              addr,

@@ -17,6 +17,7 @@ type Spec struct {
 	Command        string
 	Args           []string
 	Dir            string
+	Env            []string
 	SocketPath     string
 	SocketTimeout  time.Duration
 	ReadinessProbe string
@@ -31,12 +32,18 @@ func NewRuntime(manager *process.Manager) *Runtime {
 }
 
 func (r *Runtime) Spawn(ctx context.Context, spec Spec) error {
+	if spec.SocketPath != "" {
+		if err := os.Remove(spec.SocketPath); err != nil && !os.IsNotExist(err) {
+			log.Printf("[WARN] Failed to remove stale socket for %s: %v", spec.Name, err)
+		}
+	}
 	log.Printf("[INFO] Spawning %s...", spec.ReadinessProbe)
 	if err := r.manager.Spawn(ctx, process.SpawnConfig{
 		Name:    spec.Name,
 		Command: spec.Command,
 		Args:    spec.Args,
 		Dir:     spec.Dir,
+		Env:     spec.Env,
 		OnStdout: func(line string) {
 			log.Printf("[%s] %s", spec.Name, line)
 		},

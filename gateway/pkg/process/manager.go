@@ -4,10 +4,13 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"log"
+	"os"
 	"os/exec"
 	"sync"
 	"syscall"
+	"time"
 )
 
 type SpawnConfig struct {
@@ -15,16 +18,20 @@ type SpawnConfig struct {
 	Command  string
 	Args     []string
 	Dir      string // working directory; empty = inherit
+	Env      []string
 	OnStdout func(line string)
 	OnStderr func(line string)
 	OnExit   func(code int)
 }
 
 type worker struct {
-	cmd    *exec.Cmd
-	done   chan struct{}
-	err    error
-	killed bool // set if Kill() was called during spawn
+	cmd      *exec.Cmd
+	done     chan struct{}
+	doneOnce sync.Once
+	err      error
+	killed   bool // set if Kill() was called during spawn
+	timedOut bool // set if spawn timed out - used to orphan prevention
+	canceled bool // set if context was canceled during spawn - used to orphan prevention
 }
 
 type Manager struct {
@@ -38,62 +45,247 @@ func NewManager() *Manager {
 	}
 }
 
-func (m *Manager) Spawn(ctx context.Context, cfg SpawnConfig) error {
+func killProcessGroup(pid int) error {
+	if pid <= 0 {
+		return fmt.Errorf("invalid pid: %d", pid)
+	}
+	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil {
+		if err == syscall.ESRCH {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+type spawnResult struct {
+	stdout io.ReadCloser
+	stderr io.ReadCloser
+	err    error
+}
+
+func closeWorkerDone(w *worker) {
+	if w == nil {
+		return
+	}
+	w.doneOnce.Do(func() {
+		close(w.done)
+	})
+}
+
+// cleanupSpawnFailure removes a placeholder worker from the map, closes its done
+// channel, and closes any open pipes. It must be called after the spawn goroutine
+// has exited (i.e., after receiving from spawnDone).
+func cleanupSpawnFailure(m *Manager, name string, placeholder *worker, res spawnResult) {
+	if res.stdout != nil {
+		res.stdout.Close()
+	}
+	if res.stderr != nil {
+		res.stderr.Close()
+	}
 	m.mu.Lock()
-	if _, exists := m.workers[cfg.Name]; exists {
-		m.mu.Unlock()
-		return fmt.Errorf("worker %q already exists", cfg.Name)
+	if m.workers[name] == placeholder {
+		delete(m.workers, name)
+	}
+	m.mu.Unlock()
+	closeWorkerDone(placeholder)
+}
+
+func (m *Manager) Spawn(ctx context.Context, cfg SpawnConfig) error {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("spawn %s canceled before start: %w", cfg.Name, err)
+		}
+	}
+	m.mu.Lock()
+	if existing, exists := m.workers[cfg.Name]; exists {
+		// Allow replacing stale timed-out/canceled placeholders that can occur
+		// when spawn setup hangs and times out.
+		if existing.cmd == nil && (existing.timedOut || existing.canceled) {
+			delete(m.workers, cfg.Name)
+			closeWorkerDone(existing)
+		} else {
+			m.mu.Unlock()
+			return fmt.Errorf("worker %q already exists", cfg.Name)
+		}
 	}
 	// Reserve the slot under the lock to prevent TOCTOU races.
 	placeholder := &worker{done: make(chan struct{})}
 	m.workers[cfg.Name] = placeholder
 	m.mu.Unlock()
 
-	cmd := exec.CommandContext(ctx, cfg.Command, cfg.Args...)
+	cmd := exec.Command(cfg.Command, cfg.Args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL, Setpgid: true}
 	if cfg.Dir != "" {
 		cmd.Dir = cfg.Dir
 	}
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		m.mu.Lock()
-		delete(m.workers, cfg.Name)
-		m.mu.Unlock()
-		close(placeholder.done)
-		return fmt.Errorf("stdout pipe: %w", err)
+	if len(cfg.Env) > 0 {
+		cmd.Env = append(os.Environ(), cfg.Env...)
 	}
 
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		m.mu.Lock()
-		delete(m.workers, cfg.Name)
-		m.mu.Unlock()
-		stdout.Close()
-		close(placeholder.done)
-		return fmt.Errorf("stderr pipe: %w", err)
+	// Wrap pipe creation and process start in a timeout context to prevent indefinite blocking.
+	// These operations can hang on resource exhaustion, fork failures, or system-level delays.
+	spawnCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	spawnDone := make(chan spawnResult, 1)
+	var ctxDone <-chan struct{}
+	if ctx != nil {
+		ctxDone = ctx.Done()
 	}
 
-	if err := cmd.Start(); err != nil {
+	go func() {
+		var res spawnResult
+		res.stdout, res.err = cmd.StdoutPipe()
+		if res.err != nil {
+			spawnDone <- res
+			return
+		}
+		res.stderr, res.err = cmd.StderrPipe()
+		if res.err != nil {
+			spawnDone <- res
+			return
+		}
+		res.err = cmd.Start()
+		spawnDone <- res
+	}()
+
+	var stdout, stderr io.ReadCloser
+	select {
+	case <-spawnCtx.Done():
+		// Mark and evict the placeholder immediately so caller can retry with the same
+		// worker name and lifecycle operations cannot hang on stale entries.
 		m.mu.Lock()
-		delete(m.workers, cfg.Name)
+		if w := m.workers[cfg.Name]; w == placeholder {
+			placeholder.timedOut = true
+			delete(m.workers, cfg.Name)
+		}
 		m.mu.Unlock()
-		stdout.Close()
-		stderr.Close()
-		close(placeholder.done)
-		return fmt.Errorf("start %s: %w", cfg.Name, err)
+		closeWorkerDone(placeholder)
+		// Do NOT block on spawnDone here - if pipe creation or Start() is hung,
+		// we would block forever. Hand off cleanup to a background goroutine.
+		go func() {
+			res := <-spawnDone
+			// If spawn succeeded despite timeout, kill the process we just started
+			if res.err == nil && cmd.Process != nil {
+				if err := killProcessGroup(cmd.Process.Pid); err != nil {
+					cmd.Process.Kill()
+				}
+				// Reap the process
+				_ = cmd.Wait()
+			}
+			cleanupSpawnFailure(m, cfg.Name, placeholder, res)
+		}()
+		return fmt.Errorf("spawn %s timed out after 30s", cfg.Name)
+	case <-ctxDone:
+		m.mu.Lock()
+		if w := m.workers[cfg.Name]; w == placeholder {
+			placeholder.canceled = true
+			delete(m.workers, cfg.Name)
+		}
+		m.mu.Unlock()
+		closeWorkerDone(placeholder)
+		go func() {
+			res := <-spawnDone
+			if res.err == nil && cmd.Process != nil {
+				if err := killProcessGroup(cmd.Process.Pid); err != nil {
+					cmd.Process.Kill()
+				}
+				_ = cmd.Wait()
+			}
+			cleanupSpawnFailure(m, cfg.Name, placeholder, res)
+		}()
+		if ctx != nil {
+			return fmt.Errorf("spawn %s was canceled: %w", cfg.Name, ctx.Err())
+		}
+		return fmt.Errorf("spawn %s was canceled", cfg.Name)
+	case res := <-spawnDone:
+		if res.err != nil {
+			cleanupSpawnFailure(m, cfg.Name, placeholder, res)
+			return fmt.Errorf("start %s: %w", cfg.Name, res.err)
+		}
+		// Check if timeout fired (either via timedOut flag or spawnCtx.Err()).
+		// This handles the race where spawnDone and timeout are both ready.
+		m.mu.Lock()
+		timedOut := placeholder.timedOut
+		m.mu.Unlock()
+		if timedOut || spawnCtx.Err() != nil {
+			// Spawn completed but timeout already fired - kill the process we just started
+			if res.err == nil && res.stdout != nil && res.stderr != nil {
+				if cmd.Process != nil {
+					if err := killProcessGroup(cmd.Process.Pid); err != nil {
+						cmd.Process.Kill()
+					}
+					// Reap the process
+					_ = cmd.Wait()
+				}
+			}
+			cleanupSpawnFailure(m, cfg.Name, placeholder, res)
+			return fmt.Errorf("spawn %s timed out after 30s", cfg.Name)
+		}
+		if ctx != nil && ctx.Err() != nil {
+			if cmd.Process != nil {
+				if err := killProcessGroup(cmd.Process.Pid); err != nil {
+					if killErr := cmd.Process.Kill(); killErr != nil && killErr != syscall.ESRCH {
+						log.Printf("[process/%s] context cancel cleanup failed: %v (group kill error: %v)", cfg.Name, killErr, err)
+					}
+				}
+				_ = cmd.Wait()
+			}
+			cleanupSpawnFailure(m, cfg.Name, placeholder, res)
+			return fmt.Errorf("spawn %s was canceled: %w", cfg.Name, ctx.Err())
+		}
+		stdout, stderr = res.stdout, res.stderr
 	}
 
-	// Check if Kill() was called during spawn (before cmd was set)
+	if ctx != nil {
+		go func() {
+			select {
+			case <-ctx.Done():
+				// Context canceled - check if worker still exists before killing
+				m.mu.Lock()
+				// Only kill if the placeholder is still in the map (worker hasn't exited normally)
+				if m.workers[cfg.Name] != placeholder {
+					m.mu.Unlock()
+					return // Worker already exited normally, nothing to do
+				}
+				// Mark as canceled so spawn goroutine will kill process if it completes later
+				placeholder.canceled = true
+				wasSpawnComplete := placeholder.cmd != nil
+				m.mu.Unlock()
+
+				// If spawn already completed, we kill the process here.
+				// If spawn hasn't completed yet, we rely on the spawn goroutine
+				// to check the canceled flag and kill the process when it completes.
+				if wasSpawnComplete && cmd.Process != nil {
+					if err := killProcessGroup(cmd.Process.Pid); err != nil {
+						if killErr := cmd.Process.Kill(); killErr != nil && killErr != syscall.ESRCH {
+							log.Printf("[process/%s] context cancel cleanup failed: %v (group kill error: %v)", cfg.Name, killErr, err)
+						}
+					}
+				}
+			case <-placeholder.done:
+				// Worker exited normally before context was canceled, nothing to do
+				return
+			}
+		}()
+	}
+
+	// Check if Kill() was called during spawn (before cmd was set), if spawn timed out,
+	// or if context was canceled during spawn
 	m.mu.Lock()
 	placeholder.cmd = cmd
 	wasKilled := placeholder.killed
+	wasTimedOut := placeholder.timedOut
+	wasCanceled := placeholder.canceled
 	m.mu.Unlock()
-	if wasKilled {
-		// Kill the process we just started and clean up properly
+	if wasKilled || wasTimedOut || wasCanceled {
+		// Kill the process group we just started and clean up properly
 		if cmd.Process != nil {
-			if err := cmd.Process.Kill(); err != nil {
-				log.Printf("[process/%s] Error killing process during spawn abort: %v", cfg.Name, err)
+			if err := killProcessGroup(cmd.Process.Pid); err != nil {
+				if killErr := cmd.Process.Kill(); killErr != nil && killErr != syscall.ESRCH {
+					log.Printf("[process/%s] Error killing process during spawn abort: %v (group kill error: %v)", cfg.Name, killErr, err)
+				}
 			}
 		}
 		// Close pipes to prevent leaks
@@ -103,9 +295,17 @@ func (m *Manager) Spawn(ctx context.Context, cfg SpawnConfig) error {
 		_ = cmd.Wait()
 		// Clean up from map and close done channel
 		m.mu.Lock()
-		delete(m.workers, cfg.Name)
+		if m.workers[cfg.Name] == placeholder {
+			delete(m.workers, cfg.Name)
+		}
 		m.mu.Unlock()
-		close(placeholder.done)
+		closeWorkerDone(placeholder)
+		if wasTimedOut {
+			return fmt.Errorf("spawn %s timed out after 30s", cfg.Name)
+		}
+		if wasCanceled {
+			return fmt.Errorf("spawn %s was canceled", cfg.Name)
+		}
 		return fmt.Errorf("worker %s was killed during spawn", cfg.Name)
 	}
 
@@ -164,7 +364,7 @@ func (m *Manager) Spawn(ctx context.Context, cfg SpawnConfig) error {
 				delete(m.workers, cfg.Name)
 			}
 			m.mu.Unlock()
-			close(placeholder.done)
+			closeWorkerDone(placeholder)
 		}()
 
 		scanWg.Wait()
@@ -209,6 +409,12 @@ func (m *Manager) Kill(name string) error {
 
 	// If cmd is nil, worker is still spawning. Set killed flag so Spawn() will clean up.
 	if w.cmd == nil {
+		if w.timedOut || w.canceled {
+			delete(m.workers, name)
+			m.mu.Unlock()
+			closeWorkerDone(w)
+			return nil
+		}
 		w.killed = true
 		m.mu.Unlock()
 		// Wait for spawn to complete and clean up
@@ -218,11 +424,10 @@ func (m *Manager) Kill(name string) error {
 	m.mu.Unlock()
 
 	if w.cmd.Process != nil {
-		// Kill the entire process group to also reap torch compile workers and other subprocesses
-		pgid := w.cmd.Process.Pid
-		if killErr := syscall.Kill(-pgid, syscall.SIGKILL); killErr != nil {
+		// Kill the entire process group to also reap subprocesses.
+		if killErr := killProcessGroup(w.cmd.Process.Pid); killErr != nil {
 			// Fallback to killing just the direct process
-			if err := w.cmd.Process.Kill(); err != nil {
+			if err := w.cmd.Process.Kill(); err != nil && err != syscall.ESRCH {
 				<-w.done
 				return fmt.Errorf("kill %s: %w", name, err)
 			}
@@ -257,6 +462,11 @@ func (m *Manager) KillAll() error {
 	var toWait []*worker
 
 	for name, w := range m.workers {
+		if w.cmd == nil && (w.timedOut || w.canceled) {
+			delete(m.workers, name)
+			closeWorkerDone(w)
+			continue
+		}
 		toWait = append(toWait, w)
 		if w.cmd == nil {
 			// Worker is still spawning, set killed flag
@@ -264,8 +474,10 @@ func (m *Manager) KillAll() error {
 			continue
 		}
 		if w.cmd.Process != nil {
-			if err := w.cmd.Process.Kill(); err != nil && firstErr == nil {
-				firstErr = fmt.Errorf("kill %s: %w", name, err)
+			if err := killProcessGroup(w.cmd.Process.Pid); err != nil {
+				if killErr := w.cmd.Process.Kill(); killErr != nil && killErr != syscall.ESRCH && firstErr == nil {
+					firstErr = fmt.Errorf("kill %s: %w", name, killErr)
+				}
 			}
 		}
 	}

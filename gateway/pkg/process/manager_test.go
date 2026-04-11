@@ -261,7 +261,7 @@ func TestManagerKillAllWithMultipleWorkers(t *testing.T) {
 
 	// Verify all running
 	for i := 0; i < 3; i++ {
-		name := "worker-" + string(rune('a' + i))
+		name := "worker-" + string(rune('a'+i))
 		if !m.IsRunning(name) {
 			t.Errorf("Worker %s should be running", name)
 		}
@@ -280,9 +280,30 @@ func TestManagerKillAllWithMultipleWorkers(t *testing.T) {
 
 	// Verify all workers are stopped
 	for i := 0; i < 3; i++ {
-		name := "worker-" + string(rune('a' + i))
+		name := "worker-" + string(rune('a'+i))
 		if m.IsRunning(name) {
 			t.Errorf("Worker %s should not be running after KillAll", name)
 		}
+	}
+}
+
+func TestManagerKillAllSkipsTimedOutPlaceholders(t *testing.T) {
+	m := NewManager()
+	placeholder := &worker{done: make(chan struct{}), timedOut: true}
+	closeWorkerDone(placeholder)
+
+	m.mu.Lock()
+	m.workers["timedout"] = placeholder
+	m.mu.Unlock()
+
+	if err := m.KillAll(); err != nil {
+		t.Fatalf("KillAll failed: %v", err)
+	}
+
+	m.mu.Lock()
+	_, exists := m.workers["timedout"]
+	m.mu.Unlock()
+	if exists {
+		t.Fatal("timed-out placeholder should be removed from workers map")
 	}
 }

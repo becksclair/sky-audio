@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -235,6 +236,54 @@ func TestTrackedSession(t *testing.T) {
 	}
 }
 
+func TestShouldWaitForOutstandingFinalTranscript(t *testing.T) {
+	tests := []struct {
+		name             string
+		receivedAudio    bool
+		finalCountBefore uint64
+		eosSentCount     uint64
+		want             bool
+	}{
+		{
+			name:             "no audio received",
+			receivedAudio:    false,
+			finalCountBefore: 0,
+			eosSentCount:     1,
+			want:             false,
+		},
+		{
+			name:             "outstanding eos waits for final",
+			receivedAudio:    true,
+			finalCountBefore: 0,
+			eosSentCount:     1,
+			want:             true,
+		},
+		{
+			name:             "already matched final does not wait",
+			receivedAudio:    true,
+			finalCountBefore: 1,
+			eosSentCount:     1,
+			want:             false,
+		},
+		{
+			name:             "multiple prior turns wait only for unmatched final",
+			receivedAudio:    true,
+			finalCountBefore: 1,
+			eosSentCount:     2,
+			want:             true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := shouldWaitForOutstandingFinalTranscript(tt.receivedAudio, tt.finalCountBefore, tt.eosSentCount)
+			if got != tt.want {
+				t.Fatalf("shouldWaitForOutstandingFinalTranscript(%v, %d, %d) = %v, want %v", tt.receivedAudio, tt.finalCountBefore, tt.eosSentCount, got, tt.want)
+			}
+		})
+	}
+}
+
 // mockPeerSession is a minimal implementation for testing
 type mockPeerSession struct{}
 
@@ -283,14 +332,32 @@ func (m *mockRealtimeTTSSynthesizer) SynthesizeStream(ctx context.Context, text,
 }
 
 type mockPeerAudioSink struct {
+	mu     sync.Mutex
 	chunks [][]byte
 	closed bool
 }
 
 func (m *mockPeerAudioSink) WritePCM(pcm []byte, sampleRate int32) error {
 	copied := append([]byte(nil), pcm...)
+	m.mu.Lock()
 	m.chunks = append(m.chunks, copied)
+	m.mu.Unlock()
 	return nil
+}
+
+func (m *mockPeerAudioSink) snapshotChunks() [][]byte {
+	m.mu.Lock()
+	result := make([][]byte, len(m.chunks))
+	copy(result, m.chunks)
+	m.mu.Unlock()
+	return result
+}
+
+func (m *mockPeerAudioSink) lenChunks() int {
+	m.mu.Lock()
+	result := len(m.chunks)
+	m.mu.Unlock()
+	return result
 }
 
 func (m *mockPeerAudioSink) Clear() error {
@@ -302,15 +369,42 @@ func (m *mockPeerAudioSink) Close() error {
 	return nil
 }
 
+// eventCollector is a thread-safe collector for test events
+type eventCollector struct {
+	mu     sync.Mutex
+	events []map[string]any
+}
+
+func (c *eventCollector) append(event map[string]any) {
+	c.mu.Lock()
+	c.events = append(c.events, event)
+	c.mu.Unlock()
+}
+
+func (c *eventCollector) snapshot() []map[string]any {
+	c.mu.Lock()
+	result := make([]map[string]any, len(c.events))
+	copy(result, c.events)
+	c.mu.Unlock()
+	return result
+}
+
+func (c *eventCollector) len() int {
+	c.mu.Lock()
+	result := len(c.events)
+	c.mu.Unlock()
+	return result
+}
+
 // TestPreencodeVoiceCatalogs verifies successful JSON encoding
-func newMockRealtimeCallSession(t *testing.T, synth openaihttp.TTSSynthesizer) (*realtimeCallSession, *[]map[string]any, *mockPeerAudioSink) {
+func newMockRealtimeCallSession(t *testing.T, synth openaihttp.TTSSynthesizer) (*realtimeCallSession, *eventCollector, *mockPeerAudioSink) {
 	t.Helper()
-	emitted := make([]map[string]any, 0, 8)
+	collector := &eventCollector{events: make([]map[string]any, 0, 8)}
 	audioSink := &mockPeerAudioSink{}
 	session := &realtimeCallSession{
 		emitter: realtimeevents.NewTranscriptEmitter("peer-test"),
 		eventSink: func(event map[string]any) error {
-			emitted = append(emitted, event)
+			collector.append(event)
 			return nil
 		},
 		audioSink: audioSink,
@@ -327,7 +421,7 @@ func newMockRealtimeCallSession(t *testing.T, synth openaihttp.TTSSynthesizer) (
 		func(pcm []byte, sampleRate int32) error { return session.audioSink.WritePCM(pcm, sampleRate) },
 		false,
 	)
-	return session, &emitted, audioSink
+	return session, collector, audioSink
 }
 
 func TestRealtimeCallSessionHandlesResponseCreate(t *testing.T) {
@@ -345,26 +439,27 @@ func TestRealtimeCallSessionHandlesResponseCreate(t *testing.T) {
 	}
 
 	deadline := time.Now().Add(2 * time.Second)
-	for len(audioSink.chunks) < 2 && time.Now().Before(deadline) {
+	for audioSink.lenChunks() < 2 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if len(audioSink.chunks) != 2 {
-		t.Fatalf("expected 2 audio chunks, got %d", len(audioSink.chunks))
+	if audioSink.lenChunks() != 2 {
+		t.Fatalf("expected 2 audio chunks, got %d", audioSink.lenChunks())
 	}
-	if len(*emitted) != 4 {
-		t.Fatalf("expected 4 metadata events, got %d", len(*emitted))
+	events := emitted.snapshot()
+	if len(events) != 4 {
+		t.Fatalf("expected 4 metadata events, got %d", len(events))
 	}
-	if (*emitted)[0]["type"] != "response.created" {
-		t.Fatalf("expected response.created, got %#v", (*emitted)[0])
+	if events[0]["type"] != "response.created" {
+		t.Fatalf("expected response.created, got %#v", events[0])
 	}
-	if (*emitted)[1]["type"] != "response.output_item.added" {
-		t.Fatalf("expected response.output_item.added, got %#v", (*emitted)[1])
+	if events[1]["type"] != "response.output_item.added" {
+		t.Fatalf("expected response.output_item.added, got %#v", events[1])
 	}
-	if (*emitted)[2]["type"] != "response.audio.done" {
-		t.Fatalf("expected response.audio.done, got %#v", (*emitted)[2])
+	if events[2]["type"] != "response.audio.done" {
+		t.Fatalf("expected response.audio.done, got %#v", events[2])
 	}
-	if (*emitted)[3]["type"] != "response.done" {
-		t.Fatalf("expected response.done, got %#v", (*emitted)[3])
+	if events[3]["type"] != "response.done" {
+		t.Fatalf("expected response.done, got %#v", events[3])
 	}
 }
 
@@ -382,30 +477,32 @@ func TestRealtimeCallSessionCancelsResponse(t *testing.T) {
 		t.Fatalf("HandleEvent(response.create): %v", err)
 	}
 	deadline := time.Now().Add(2 * time.Second)
-	for len(*emitted) < 2 && time.Now().Before(deadline) {
+	for emitted.len() < 2 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if len(*emitted) < 2 {
-		t.Fatalf("expected initial response events, got %d", len(*emitted))
+	if emitted.len() < 2 {
+		t.Fatalf("expected initial response events, got %d", emitted.len())
 	}
-	responsePayload := (*emitted)[0]["response"].(map[string]any)
+	events := emitted.snapshot()
+	responsePayload := events[0]["response"].(map[string]any)
 	responseID, _ := responsePayload["id"].(string)
 	if err := session.HandleEvent(map[string]any{"type": "response.cancel", "response_id": responseID}); err != nil {
 		t.Fatalf("HandleEvent(response.cancel): %v", err)
 	}
 	deadline = time.Now().Add(2 * time.Second)
-	for len(*emitted) < 3 && time.Now().Before(deadline) {
+	for emitted.len() < 3 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if (*emitted)[len(*emitted)-1]["type"] != "response.done" {
-		t.Fatalf("expected final response.done, got %#v", (*emitted)[len(*emitted)-1])
+	events = emitted.snapshot()
+	if events[len(events)-1]["type"] != "response.done" {
+		t.Fatalf("expected final response.done, got %#v", events[len(events)-1])
 	}
-	responseDone := (*emitted)[len(*emitted)-1]["response"].(map[string]any)
+	responseDone := events[len(events)-1]["response"].(map[string]any)
 	if responseDone["status"] != "cancelled" {
-		t.Fatalf("expected cancelled response, got %#v", (*emitted)[len(*emitted)-1])
+		t.Fatalf("expected cancelled response, got %#v", events[len(events)-1])
 	}
-	if len(audioSink.chunks) != 1 {
-		t.Fatalf("expected 1 audio chunk before cancel, got %d", len(audioSink.chunks))
+	if audioSink.lenChunks() != 1 {
+		t.Fatalf("expected 1 audio chunk before cancel, got %d", audioSink.lenChunks())
 	}
 }
 
@@ -423,11 +520,12 @@ func TestRealtimeCallSessionHandlesMixedTextAndAudio(t *testing.T) {
 		t.Fatalf("HandleEvent(response.create): %v", err)
 	}
 	deadline := time.Now().Add(2 * time.Second)
-	for len(*emitted) < 6 && time.Now().Before(deadline) {
+	for emitted.len() < 6 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	types := []string{}
-	for _, event := range *emitted {
+	events := emitted.snapshot()
+	for _, event := range events {
 		typeName, _ := event["type"].(string)
 		types = append(types, typeName)
 	}
@@ -441,8 +539,8 @@ func TestRealtimeCallSessionHandlesMixedTextAndAudio(t *testing.T) {
 	if !strings.Contains(joined, "response.audio.done") {
 		t.Fatalf("expected audio done in %s", joined)
 	}
-	if (*emitted)[len(*emitted)-1]["type"] != "response.done" {
-		t.Fatalf("expected response.done last, got %#v", (*emitted)[len(*emitted)-1])
+	if events[len(events)-1]["type"] != "response.done" {
+		t.Fatalf("expected response.done last, got %#v", events[len(events)-1])
 	}
 }
 
