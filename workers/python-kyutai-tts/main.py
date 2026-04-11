@@ -172,7 +172,6 @@ class TextToSpeechServicer(audio_engine_pb2_grpc.TextToSpeechServicer):
                                     entries: Any = model.prepare_script(
                                         [full_text], padding_between=padding_between
                                     )
-                                    # Save original temperature, apply request override
                                     original_temp = model.temp
                                     model.temp = temperature
                                     try:
@@ -299,45 +298,60 @@ class WorkerControlServicer(audio_engine_pb2_grpc.WorkerControlServicer):
 async def serve() -> None:
     logging.basicConfig(level=logging.INFO, format="[%(name)s] %(levelname)s: %(message)s")
 
+    # Clean up any stale socket file before we start
     try:
         os.remove(SOCKET_PATH)
     except OSError:
         pass
 
-    model = load_model()
-    default_voice, known_voices = load_voice_catalog()
-    generate_lock = asyncio.Lock()
-    busy = threading.Event()
-    servicer = TextToSpeechServicer(model, default_voice, known_voices, generate_lock, busy)
-    # Warm up voice cache with default voice and default CFG coefficient
-    servicer._get_condition_attributes(default_voice, servicer.DEFAULT_CFG_COEF)
-    logger.info(
-        "Kyutai voice catalog ready (default_voice=%s, catalog=%d, cache=%d)",
-        default_voice,
-        len(known_voices),
-        len(servicer._voice_cache),
-    )
-
-    server = grpc.aio.server(futures.ThreadPoolExecutor(max_workers=4))
-    audio_engine_pb2_grpc.add_TextToSpeechServicer_to_server(servicer, server)
-    audio_engine_pb2_grpc.add_WorkerControlServicer_to_server(WorkerControlServicer(busy), server)
-    port = server.add_insecure_port(f"unix://{SOCKET_PATH}")
-    if port == 0:
-        raise RuntimeError(f"Failed to bind to unix://{SOCKET_PATH}")
-
-    await server.start()
-    logger.info("TTS-Kyutai worker listening on unix://%s", SOCKET_PATH)
-
-    stop_event = asyncio.Event()
+    # Install signal handlers BEFORE model loading to handle SIGTERM gracefully
+    shutdown_event = asyncio.Event()
+    socket_created = False
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        def _stop() -> None:
-            _ = stop_event.set()
-        loop.add_signal_handler(sig, _stop)
+        loop.add_signal_handler(sig, shutdown_event.set)
 
-    await stop_event.wait()
-    logger.info("Shutting down...")
-    await server.stop(grace=5)
+    model: Any | None = None
+    server: grpc.aio.Server | None = None
+    servicer: TextToSpeechServicer | None = None
+
+    try:
+        model = load_model()
+        default_voice, known_voices = load_voice_catalog()
+        generate_lock = asyncio.Lock()
+        busy = threading.Event()
+        servicer = TextToSpeechServicer(model, default_voice, known_voices, generate_lock, busy)
+        # Warm up voice cache with default voice and default CFG coefficient
+        servicer._get_condition_attributes(default_voice, servicer.DEFAULT_CFG_COEF)
+        logger.info(
+            "Kyutai voice catalog ready (default_voice=%s, catalog=%d, cache=%d)",
+            default_voice,
+            len(known_voices),
+            len(servicer._voice_cache),
+        )
+
+        server = grpc.aio.server(futures.ThreadPoolExecutor(max_workers=4))
+        audio_engine_pb2_grpc.add_TextToSpeechServicer_to_server(servicer, server)
+        audio_engine_pb2_grpc.add_WorkerControlServicer_to_server(WorkerControlServicer(busy), server)
+        port = server.add_insecure_port(f"unix://{SOCKET_PATH}")
+        if port == 0:
+            raise RuntimeError(f"Failed to bind to unix://{SOCKET_PATH}")
+        socket_created = True
+
+        await server.start()
+        logger.info("TTS-Kyutai worker listening on unix://%s", SOCKET_PATH)
+
+        await shutdown_event.wait()
+        logger.info("Shutting down...")
+    finally:
+        # Ensure socket cleanup happens even if we exit during model load
+        if server is not None:
+            await server.stop(grace=5)
+        if socket_created:
+            try:
+                os.remove(SOCKET_PATH)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":

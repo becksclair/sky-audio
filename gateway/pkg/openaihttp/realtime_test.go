@@ -75,6 +75,92 @@ func TestClientSecretsHandlerReturnsEphemeralSecret(t *testing.T) {
 	}
 }
 
+func TestClientSecretsHandlerRejectsOversizedBody(t *testing.T) {
+	store := NewClientSecretStore(90 * time.Second)
+	handler := ClientSecretsHandler(store)
+
+	oversized := bytes.Repeat([]byte("x"), maxRealtimeClientSecretsBodyBytes+1)
+	req := httptest.NewRequest(http.MethodPost, "/v1/realtime/client_secrets", bytes.NewReader(oversized))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected bad request for oversized body, got %d", rr.Code)
+	}
+}
+
+func TestClientSecretsHandlerAllowsUnknownSessionFields(t *testing.T) {
+	store := NewClientSecretStore(90 * time.Second)
+	handler := ClientSecretsHandler(store)
+
+	body := bytes.NewBufferString(`{
+		"session": {
+			"type": "transcription",
+			"audio": {
+				"input": {
+					"transcription": {"model": "whisper-1"},
+					"format": {"type": "audio/pcm", "rate": 16000}
+				}
+			},
+			"turn_detection": {"type": "server_vad"}
+		}
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/realtime/client_secrets", body)
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected unknown session fields to be ignored, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestRealtimeClientSecretsRequiresMasterKey(t *testing.T) {
+	t.Setenv("SKY_AUDIO_API_KEY", "master-key")
+
+	store := NewClientSecretStore(90 * time.Second)
+	realtimeMux := http.NewServeMux()
+	realtimeMux.HandleFunc("GET /v1/realtime", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	root := http.NewServeMux()
+	root.Handle("POST /v1/realtime/client_secrets", OptionalAuthMiddleware(ClientSecretsHandler(store)))
+	root.Handle("/v1/realtime", OptionalAuthMiddlewareWithValidator(realtimeMux, store.Validate))
+	root.Handle("/v1/realtime/", OptionalAuthMiddlewareWithValidator(realtimeMux, store.Validate))
+
+	ephemeral := store.Create(RealtimeSession{Type: "transcription"}).Value
+
+	ephemeralReq := httptest.NewRequest(http.MethodPost, "/v1/realtime/client_secrets", bytes.NewBufferString(`{"session":{"type":"transcription"}}`))
+	ephemeralReq.Header.Set("Content-Type", "application/json")
+	ephemeralReq.Header.Set("Authorization", "Bearer "+ephemeral)
+	ephemeralRR := httptest.NewRecorder()
+	root.ServeHTTP(ephemeralRR, ephemeralReq)
+	if ephemeralRR.Code != http.StatusUnauthorized {
+		t.Fatalf("ephemeral token should not mint client secrets: status = %d, want %d", ephemeralRR.Code, http.StatusUnauthorized)
+	}
+
+	masterReq := httptest.NewRequest(http.MethodPost, "/v1/realtime/client_secrets", bytes.NewBufferString(`{"session":{"type":"transcription"}}`))
+	masterReq.Header.Set("Content-Type", "application/json")
+	masterReq.Header.Set("Authorization", "Bearer master-key")
+	masterRR := httptest.NewRecorder()
+	root.ServeHTTP(masterRR, masterReq)
+	if masterRR.Code != http.StatusOK {
+		t.Fatalf("master key should mint client secrets: status = %d, want %d", masterRR.Code, http.StatusOK)
+	}
+
+	realtimeReq := httptest.NewRequest(http.MethodGet, "/v1/realtime", nil)
+	realtimeReq.Header.Set("Sec-WebSocket-Protocol", "realtime, openai-insecure-api-key."+ephemeral)
+	realtimeRR := httptest.NewRecorder()
+	root.ServeHTTP(realtimeRR, realtimeReq)
+	if realtimeRR.Code != http.StatusOK {
+		t.Fatalf("ephemeral token should access realtime route: status = %d, want %d", realtimeRR.Code, http.StatusOK)
+	}
+}
+
 func TestRealtimeHandlerNegotiatesRequestedSubprotocol(t *testing.T) {
 	handler := RealtimeHandler(RealtimeHandlerOptions{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -97,6 +183,38 @@ func TestRealtimeHandlerNegotiatesRequestedSubprotocol(t *testing.T) {
 	}
 }
 
+func TestRealtimeHandlerRejectsOversizedWebsocketMessage(t *testing.T) {
+	handler := RealtimeHandler(RealtimeHandlerOptions{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handler.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/v1/realtime"
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial realtime websocket: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+
+	var created map[string]any
+	if err := wsjson.Read(ctx, conn, &created); err != nil {
+		t.Fatalf("read session.created: %v", err)
+	}
+
+	oversized := strings.Repeat("a", maxRealtimeWSMessageBytes+1)
+	if err := wsjson.Write(ctx, conn, map[string]any{"type": oversized}); err != nil {
+		t.Fatalf("write oversized message: %v", err)
+	}
+
+	var event map[string]any
+	if err := wsjson.Read(ctx, conn, &event); err == nil {
+		t.Fatal("expected read to fail after oversized message")
+	}
+}
 func TestRealtimeHandlerEmitsSessionLifecycle(t *testing.T) {
 	handler := RealtimeHandler(RealtimeHandlerOptions{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
