@@ -125,18 +125,19 @@ type peerEventSink struct {
 }
 
 type peerAudioSink struct {
-	mu       sync.Mutex
-	track    *webrtc.TrackLocalStaticRTP
-	enc      *audio.OpusEncoder
-	queue    chan []byte
-	pending  []byte
-	done     chan struct{}
-	doneOnce sync.Once
-	closed   bool
-	seq      uint16
-	ts       uint32
-	ssrc     uint32
-	wg       sync.WaitGroup
+	mu        sync.Mutex
+	track     *webrtc.TrackLocalStaticRTP
+	enc       *audio.OpusEncoder
+	queue     chan []byte
+	pending   []byte
+	done      chan struct{}
+	doneOnce  sync.Once
+	closeOnce atomic.Bool
+	closed    bool
+	seq       uint16
+	ts        uint32
+	ssrc      uint32
+	wg        sync.WaitGroup
 }
 
 func newPeerEventSink(pc *webrtc.PeerConnection, handler PeerEventHandler) (func(map[string]any) error, error) {
@@ -292,11 +293,14 @@ func (s *peerAudioSink) writeFrame(frame []byte, first bool, ticker *time.Ticker
 }
 
 func (s *peerAudioSink) markClosed() {
+	if !s.closeOnce.CompareAndSwap(false, true) {
+		return
+	}
+	s.mu.Lock()
+	s.closed = true
+	s.mu.Unlock()
 	s.doneOnce.Do(func() {
-		s.mu.Lock()
-		s.closed = true
 		close(s.done)
-		s.mu.Unlock()
 	})
 }
 
@@ -349,6 +353,9 @@ func (s *peerAudioSink) Clear() error {
 }
 
 func (s *peerAudioSink) Close() error {
+	if !s.closeOnce.CompareAndSwap(false, true) {
+		return nil
+	}
 	const frameBytes = audio.EncodeSamples * 2
 	var padded []byte
 	s.mu.Lock()
@@ -370,7 +377,9 @@ func (s *peerAudioSink) Close() error {
 			log.Printf("[webrtc] audio sink close: dropped final partial frame (queue full)")
 		}
 	}
-	s.markClosed()
+	s.doneOnce.Do(func() {
+		close(s.done)
+	})
 	waitDone := make(chan struct{})
 	go func() {
 		s.wg.Wait()
@@ -496,6 +505,22 @@ var (
 	errICETimeout   = errors.New("ice gathering timed out")
 )
 
+func normalizeSDPLineEndings(raw string) string {
+	if raw == "" {
+		return raw
+	}
+	normalized := strings.ReplaceAll(raw, "\r\n", "\n")
+	normalized = strings.ReplaceAll(normalized, "\r", "\n")
+	parts := strings.Split(normalized, "\n")
+	for len(parts) > 0 && strings.TrimSpace(parts[len(parts)-1]) == "" {
+		parts = parts[:len(parts)-1]
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, "\r\n") + "\r\n"
+}
+
 func establishPeerSession(ctx context.Context, cfg PeerConfig, registry *PeerRegistry, offerSDP string) (offerResponse, error) {
 	if cfg.NewSession == nil {
 		return offerResponse{}, fmt.Errorf("PeerConfig.NewSession is required")
@@ -516,9 +541,10 @@ func establishPeerSession(ctx context.Context, cfg PeerConfig, registry *PeerReg
 
 	registry.Add(peerID, pc, session.Close)
 
+	normalizedOfferSDP := normalizeSDPLineEndings(offerSDP)
 	if err := pc.SetRemoteDescription(webrtc.SessionDescription{
 		Type: webrtc.SDPTypeOffer,
-		SDP:  offerSDP,
+		SDP:  normalizedOfferSDP,
 	}); err != nil {
 		registry.Close(peerID)
 		log.Printf("[webrtc] set remote error: %v", err)
