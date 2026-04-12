@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"syscall"
 	"time"
 )
 
@@ -23,6 +24,9 @@ const (
 
 	// TargetSampleRate is the required output sample rate (16kHz).
 	TargetSampleRate = 16000
+
+	// BytesPerSample is the size of a 16-bit PCM sample (2 bytes).
+	BytesPerSample = 2
 
 	// MaxStderrBytes limits stderr capture to prevent memory exhaustion.
 	MaxStderrBytes = 64 * 1024
@@ -234,8 +238,14 @@ func (b *boundedBuffer) Bytes() []byte {
 }
 
 // defaultFfmpegRunner executes ffmpeg with stdin/stdout pipes.
+// It properly handles context cancellation by killing the entire process group.
 func defaultFfmpegRunner(ctx context.Context, stdin []byte, args ...string) ([]byte, []byte, error) {
 	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+
+	// Create a new process group so we can kill all child processes on cancellation
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setpgid: true,
+	}
 
 	// Set up stdin pipe
 	stdinPipe, err := cmd.StdinPipe()
@@ -257,6 +267,30 @@ func defaultFfmpegRunner(ctx context.Context, stdin []byte, args ...string) ([]b
 	if err := cmd.Start(); err != nil {
 		return nil, nil, fmt.Errorf("ffmpeg start: %w", err)
 	}
+
+	// Ensure process is reaped and pipes are closed even on panic
+	defer func() {
+		stdinPipe.Close()
+		stdoutPipe.Close()
+	}()
+
+	// Create a channel to signal when the process has exited
+	processDone := make(chan struct{})
+
+	// Start a goroutine to handle context cancellation
+	// This goroutine will kill the process group when the context is cancelled
+	go func() {
+		select {
+		case <-ctx.Done():
+			// Context cancelled - kill the entire process group
+			// Use negative PID to kill the entire process group
+			if cmd.Process != nil {
+				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			}
+		case <-processDone:
+			// Process exited normally, nothing to do
+		}
+	}()
 
 	// Write input data to stdin in a goroutine
 	stdinDone := make(chan error, 1)
@@ -283,12 +317,15 @@ func defaultFfmpegRunner(ctx context.Context, stdin []byte, args ...string) ([]b
 		if n > 0 {
 			stdout = append(stdout, tmpBuf[:n]...)
 			if len(stdout) > MaxDecodedPCMBytes {
-				// Force kill the process, we've hit the limit
-				_ = cmd.Process.Kill()
+				// Force kill the process group, we've hit the limit
+				if cmd.Process != nil {
+					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				}
 				// Drain stdin goroutine before returning
 				<-stdinDone
 				// Wait for process to fully terminate and reap it
 				_ = cmd.Wait()
+				close(processDone)
 				return nil, stderrBuf.Bytes(), errors.New("decoded output exceeds size limit")
 			}
 		}
@@ -301,8 +338,14 @@ func defaultFfmpegRunner(ctx context.Context, stdin []byte, args ...string) ([]b
 		}
 	}
 
+	// Close stdout pipe to signal we're done reading
+	stdoutPipe.Close()
+
 	// Wait for command to complete
 	waitErr := cmd.Wait()
+
+	// Signal that the process has exited (stops the kill goroutine)
+	close(processDone)
 
 	// Always drain stdin goroutine before returning
 	<-stdinDone

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -190,6 +191,14 @@ func TestPeerAudioSinkWritePCMRejectsAfterClose(t *testing.T) {
 	}
 	if err := sink.WritePCM(make([]byte, audio.EncodeSamples*2), audio.SampleRate); err == nil || !strings.Contains(err.Error(), "audio sink closed") {
 		t.Fatalf("expected closed sink error, got %v", err)
+	}
+}
+
+func TestPeerAudioSinkWritePCMRejectsAfterMarkClosed(t *testing.T) {
+	sink := &peerAudioSink{queue: make(chan []byte, 1), done: make(chan struct{})}
+	sink.markClosed()
+	if err := sink.WritePCM([]byte{1, 2}, audio.SampleRate); err == nil || !strings.Contains(err.Error(), "audio sink closed") {
+		t.Fatalf("expected closed sink error after markClosed, got %v", err)
 	}
 }
 
@@ -512,5 +521,71 @@ func TestRawSDPHandlerRejectsMissingBody(t *testing.T) {
 
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("Expected 400, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// Regression test for CRIT-001: concurrent Close() calls must not panic
+func TestPeerAudioSinkConcurrentCloseNoPanic(t *testing.T) {
+	sink := &peerAudioSink{
+		queue: make(chan []byte, 10),
+		done:  make(chan struct{}),
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = sink.Close() // Should not panic on concurrent calls
+		}()
+	}
+	wg.Wait()
+
+	// Verify channel is actually closed
+	select {
+	case <-sink.done:
+		// Good - channel is closed
+	case <-time.After(time.Second):
+		t.Fatal("done channel was not closed after concurrent Close() calls")
+	}
+
+	// Verify subsequent Close() calls return without error/panic
+	if err := sink.Close(); err != nil {
+		t.Fatalf("subsequent Close() should return nil, got %v", err)
+	}
+}
+
+// Regression test for CRIT-001: concurrent Close() + markClosed() must not panic
+func TestPeerAudioSinkConcurrentCloseAndMarkClosed(t *testing.T) {
+	sink := &peerAudioSink{
+		queue: make(chan []byte, 10),
+		done:  make(chan struct{}),
+	}
+
+	var wg sync.WaitGroup
+	// Multiple goroutines calling Close()
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = sink.Close()
+		}()
+	}
+	// Multiple goroutines calling markClosed() directly
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sink.markClosed()
+		}()
+	}
+	wg.Wait()
+
+	// Verify channel is actually closed
+	select {
+	case <-sink.done:
+		// Good - channel is closed
+	case <-time.After(time.Second):
+		t.Fatal("done channel was not closed after concurrent Close()/markClosed() calls")
 	}
 }
