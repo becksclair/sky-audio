@@ -1,6 +1,7 @@
 import type { JSX } from 'preact';
 
 import { cx } from '../lib/cx';
+import { resolveFieldId } from '../lib/field-id';
 
 export interface TextFieldProps
   extends Omit<JSX.InputHTMLAttributes<HTMLInputElement>, 'children'> {
@@ -20,18 +21,19 @@ export function TextField({
   inputClassName,
   ...props
 }: TextFieldProps) {
-  const descriptionId = description && id ? `${id}-description` : undefined;
-  const errorId = error && id ? `${id}-error` : undefined;
+  const fieldID = resolveFieldId(id);
+  const descriptionId = description && fieldID ? `${fieldID}-description` : undefined;
+  const errorId = error && fieldID ? `${fieldID}-error` : undefined;
   const describedBy = [descriptionId, errorId].filter(Boolean).join(' ') || undefined;
 
   return (
     <div class={cx('grid gap-2', fieldClassName)}>
-      <label for={id} class="label">
+      <label for={fieldID} class="label">
         {label}
       </label>
       <input
         {...props}
-        id={id}
+        id={fieldID}
         class={cx('input', inputClassName)}
         aria-invalid={error ? 'true' : undefined}
         aria-describedby={describedBy}

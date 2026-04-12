@@ -22,7 +22,6 @@ type inputItem struct {
 	id        string
 	committed bool
 	lastText  string
-	closed    bool
 }
 
 func NewTranscriptEmitter(sessionID string) *TranscriptEmitter {
@@ -66,10 +65,6 @@ func (e *TranscriptEmitter) HandleTranscript(text string, isFinal bool) error {
 	e.mu.Lock()
 	item := e.current
 	if item == nil {
-		if text == "" && !isFinal {
-			e.mu.Unlock()
-			return nil
-		}
 		item = &inputItem{id: randomID("item")}
 		e.current = item
 	}
@@ -77,7 +72,6 @@ func (e *TranscriptEmitter) HandleTranscript(text string, isFinal bool) error {
 	lastText := item.lastText
 	itemID := item.id
 	if isFinal {
-		item.closed = true
 		e.current = nil
 	} else {
 		item.lastText = text

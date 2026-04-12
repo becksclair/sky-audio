@@ -5,9 +5,9 @@ import { cx } from '../lib/cx';
 
 export interface ChatComposerProps {
   value: string;
-  onValueChange(value: string): void;
-  onSubmit(): void | Promise<void>;
-  onCancel?(): void;
+  onValueChange: (value: string) => void;
+  onSubmit: () => void | Promise<void>;
+  onCancel?: () => void;
   disabled?: boolean;
   busy?: boolean;
   placeholder?: string;
@@ -59,9 +59,7 @@ export function ChatComposer({
           value={value}
           disabled={disabled || busy}
           placeholder={placeholder}
-          onInput={(event) =>
-            onValueChange((event.currentTarget as HTMLTextAreaElement).value)
-          }
+          onInput={(event) => onValueChange(event.currentTarget.value)}
           onKeyDown={handleKeyDown}
         />
 

@@ -26,13 +26,6 @@ export const SUPPORTED_EMOTIONS = [
 
 export type EmotionLabel = typeof SUPPORTED_EMOTIONS[number];
 
-// Synthesis tuning parameters for Kyutai TTS
-export interface SynthesisOptions {
-  temperature: number;    // 0.0 - 2.0, default 0.75
-  cfgCoef: number;        // 0.0 - 3.0, default 1.5
-  paddingBetween: number; // 0 - 10, default 0
-}
-
 export interface TTSVoiceCatalog {
   default: string;
   voices: string[];
@@ -44,16 +37,55 @@ export interface TTSVoiceCatalog {
 type TTSVoiceCatalogMap = Partial<Record<TTSEngine, TTSVoiceCatalog>>;
 type TTSVoiceSelectionMap = Record<TTSEngine, string>;
 
-interface OfferResponse {
-  sdp: string;
-  type: RTCSdpType;
-  sessionId: string;
+interface RealtimeSessionCreatedEvent {
+  type: "session.created";
+  session?: {
+    id?: string;
+  };
 }
 
-interface TranscriptPayload {
-  text: string;
-  isFinal?: boolean;
+interface RealtimeTranscriptDeltaEvent {
+  type: "conversation.item.input_audio_transcription.delta";
+  item_id?: string;
+  delta?: string;
 }
+
+interface RealtimeTranscriptCompletedEvent {
+  type: "conversation.item.input_audio_transcription.completed";
+  item_id?: string;
+  transcript?: string;
+}
+
+interface RealtimeResponseCreatedEvent {
+  type: "response.created";
+  response?: {
+    id?: string;
+    status?: string;
+  };
+}
+
+interface RealtimeResponseDoneEvent {
+  type: "response.done";
+  response?: {
+    id?: string;
+    status?: string;
+  };
+}
+
+interface RealtimeErrorEvent {
+  type: "error";
+  message?: string;
+  code?: string;
+}
+
+type RealtimeCallEvent =
+  | RealtimeSessionCreatedEvent
+  | RealtimeTranscriptDeltaEvent
+  | RealtimeTranscriptCompletedEvent
+  | RealtimeResponseCreatedEvent
+  | RealtimeResponseDoneEvent
+  | RealtimeErrorEvent
+  | Record<string, unknown>;
 
 type TTSVoiceFavoritesMap = Record<TTSEngine, Set<string>>;
 
@@ -181,18 +213,98 @@ export const AudioPlaygroundModel = createModel(
 
     let pc: RTCPeerConnection | null = null;
     let mediaStream: MediaStream | null = null;
-    let eventSource: EventSource | null = null;
+    let realtimeEventChannel: RTCDataChannel | null = null;
+    let remoteAudioStream: MediaStream | null = null;
+    let remoteAudioElement: HTMLAudioElement | null = null;
     let audioContext: AudioContext | null = null;
-    let transcriptStreamDisconnected = true;
     let connectSeq = 0;
     let voiceCatalogPromise: Promise<void> | null = null;
     let currentTTSSource: AudioBufferSourceNode | null = null;
     let currentSynthesisAbort: AbortController | null = null;
+    let activeResponseID: string | null = null;
+    const partialTranscriptByItemID = new Map<string, string>();
+    const transcriptLineIndexByItemID = new Map<string, number>();
 
-    function addTranscript(text: string) {
+    function configuredAPIKey(): string {
+      const query = new URLSearchParams(window.location.search);
+      const fromQuery = query.get("api_key") ?? query.get("token") ?? "";
+      if (fromQuery.trim().length > 0) {
+        return fromQuery.trim();
+      }
+      try {
+        const fromStorage = localStorage.getItem("sky-audio:api-key") ?? "";
+        return fromStorage.trim();
+      } catch {
+        return "";
+      }
+    }
+
+    function authHeaders(extra: Record<string, string> = {}): Record<string, string> {
+      const apiKey = configuredAPIKey();
+      if (!apiKey) {
+        return extra;
+      }
+      return {
+        ...extra,
+        Authorization: `Bearer ${apiKey}`,
+      };
+    }
+
+    function debugToConsole(message: string, payload?: unknown) {
+      if (payload === undefined) {
+        window.console.debug(`[sky-audio] ${message}`);
+        return;
+      }
+      window.console.debug(`[sky-audio] ${message}`, payload);
+    }
+
+    function shiftRealtimeLineIndexes(trimmedCount: number) {
+      if (trimmedCount <= 0) {
+        return;
+      }
+      for (const [itemID, index] of transcriptLineIndexByItemID.entries()) {
+        const nextIndex = index - trimmedCount;
+        if (nextIndex < 0) {
+          transcriptLineIndexByItemID.delete(itemID);
+          partialTranscriptByItemID.delete(itemID);
+          continue;
+        }
+        transcriptLineIndexByItemID.set(itemID, nextIndex);
+      }
+    }
+
+    function appendTranscript(text: string): number {
       const next = [...transcripts.value, text];
-      transcripts.value =
-        next.length > MAX_TRANSCRIPTS ? next.slice(-MAX_TRANSCRIPTS) : next;
+      if (next.length <= MAX_TRANSCRIPTS) {
+        transcripts.value = next;
+        return next.length - 1;
+      }
+
+      const trimmedCount = next.length - MAX_TRANSCRIPTS;
+      transcripts.value = next.slice(-MAX_TRANSCRIPTS);
+      shiftRealtimeLineIndexes(trimmedCount);
+      return transcripts.value.length - 1;
+    }
+
+    function replaceTranscript(index: number, text: string): number {
+      if (index < 0 || index >= transcripts.value.length) {
+        return appendTranscript(text);
+      }
+      const next = [...transcripts.value];
+      next[index] = text;
+      transcripts.value = next;
+      return index;
+    }
+
+    function upsertRealtimeTranscript(itemID: string, text: string) {
+      const existingIndex = transcriptLineIndexByItemID.get(itemID);
+      if (existingIndex === undefined) {
+        const index = appendTranscript(text);
+        transcriptLineIndexByItemID.set(itemID, index);
+        return;
+      }
+      const index = replaceTranscript(existingIndex, text);
+      transcriptLineIndexByItemID.set(itemID, index);
     }
 
     function newTraceId(prefix: string): string {
@@ -211,7 +323,7 @@ export const AudioPlaygroundModel = createModel(
     }
 
     async function ensureTTSVoicesLoaded() {
-      if (ttsCatalogs.value.pocket && ttsCatalogs.value.kyutai) {
+      if (ttsCatalogs.value[ttsEngine.value]) {
         return;
       }
       if (voiceCatalogPromise) {
@@ -222,35 +334,47 @@ export const AudioPlaygroundModel = createModel(
         ttsCatalogBusy.value = true;
         ttsCatalogError.value = null;
         try {
-          const resp = await fetch("/api/tts/voices");
+          const resp = await fetch("/api/tts/voices", {
+            headers: authHeaders(),
+          });
           if (!resp.ok) {
             throw new Error(`voice catalog request failed (${resp.status})`);
           }
 
           const payload = (await resp.json()) as TTSVoiceCatalogMap;
-          const pocketCatalog = payload.pocket;
-          const kyutaiCatalog = payload.kyutai;
-          if (!pocketCatalog || !kyutaiCatalog) {
-            throw new Error("voice catalog response was incomplete");
+          const nextCatalogs: TTSVoiceCatalogMap = {};
+          if (payload.pocket) {
+            nextCatalogs.pocket = payload.pocket;
+          }
+          if (payload.kyutai) {
+            nextCatalogs.kyutai = payload.kyutai;
+          }
+          const availableEngines = Object.keys(nextCatalogs) as TTSEngine[];
+          if (availableEngines.length === 0) {
+            throw new Error("voice catalog response was empty");
           }
 
-          ttsCatalogs.value = {
-            pocket: pocketCatalog,
-            kyutai: kyutaiCatalog,
-          };
+          ttsCatalogs.value = nextCatalogs;
+
           ttsVoiceSelections.value = {
-            pocket: ttsVoiceSelections.value.pocket || pocketCatalog.default || "",
-            kyutai: ttsVoiceSelections.value.kyutai || kyutaiCatalog.default || "",
+            pocket: ttsVoiceSelections.value.pocket || nextCatalogs.pocket?.default || "",
+            kyutai: ttsVoiceSelections.value.kyutai || nextCatalogs.kyutai?.default || "",
           };
-          // Set synthesis defaults from Kyutai catalog (if not already set by user)
-          if (kyutaiCatalog.default_temperature !== undefined) {
-            ttsTemperature.value = kyutaiCatalog.default_temperature;
+
+          const activeEngine = nextCatalogs[ttsEngine.value] ? ttsEngine.value : availableEngines[0];
+          if (activeEngine && activeEngine !== ttsEngine.value) {
+            ttsEngine.value = activeEngine;
           }
-          if (kyutaiCatalog.default_cfg_coef !== undefined) {
-            ttsCfgCoef.value = kyutaiCatalog.default_cfg_coef;
+          const activeCatalog = activeEngine ? nextCatalogs[activeEngine] : null;
+
+          if (activeCatalog?.default_temperature !== undefined) {
+            ttsTemperature.value = activeCatalog.default_temperature;
           }
-          if (kyutaiCatalog.default_padding !== undefined) {
-            ttsPaddingBetween.value = kyutaiCatalog.default_padding;
+          if (activeCatalog?.default_cfg_coef !== undefined) {
+            ttsCfgCoef.value = activeCatalog.default_cfg_coef;
+          }
+          if (activeCatalog?.default_padding !== undefined) {
+            ttsPaddingBetween.value = activeCatalog.default_padding;
           }
         } catch (caught) {
           const message = caught instanceof Error ? caught.message : String(caught);
@@ -265,8 +389,15 @@ export const AudioPlaygroundModel = createModel(
     }
 
     async function setTTSEngine(value: TTSEngine) {
-      ttsEngine.value = value;
       await ensureTTSVoicesLoaded();
+      if (ttsCatalogs.value[value]) {
+        ttsEngine.value = value;
+        return;
+      }
+      const available = (Object.keys(ttsCatalogs.value) as TTSEngine[])[0];
+      if (available) {
+        ttsEngine.value = available;
+      }
     }
 
     function setTTSVoice(value: string) {
@@ -299,18 +430,46 @@ export const AudioPlaygroundModel = createModel(
       return audioContext;
     }
 
-    function closeTranscriptStream() {
-      transcriptStreamDisconnected = true;
-      if (eventSource) {
-        eventSource.close();
-        eventSource = null;
+    function getRemoteAudioElement() {
+      if (!remoteAudioElement) {
+        const audioEl = document.createElement("audio");
+        audioEl.autoplay = true;
+        audioEl.setAttribute("playsinline", "true");
+        remoteAudioElement = audioEl;
       }
+      return remoteAudioElement;
+    }
+
+    function closeRealtimeChannel() {
+      const hadRealtimeChannel = realtimeEventChannel !== null;
+      if (realtimeEventChannel) {
+        try {
+          realtimeEventChannel.close();
+        } catch {
+          // ignore close errors
+        }
+        realtimeEventChannel = null;
+      }
+      if (hadRealtimeChannel || activeResponseID) {
+        ttsBusy.value = false;
+      }
+      activeResponseID = null;
+      partialTranscriptByItemID.clear();
+      transcriptLineIndexByItemID.clear();
     }
 
     function closeWebRTC() {
+      closeRealtimeChannel();
       if (mediaStream) {
         mediaStream.getTracks().forEach((track) => track.stop());
         mediaStream = null;
+      }
+      if (remoteAudioStream) {
+        remoteAudioStream.getTracks().forEach((track) => track.stop());
+        remoteAudioStream = null;
+      }
+      if (remoteAudioElement) {
+        remoteAudioElement.srcObject = null;
       }
       if (pc) {
         pc.close();
@@ -320,18 +479,129 @@ export const AudioPlaygroundModel = createModel(
 
     function disconnectInternal(addNote: boolean) {
       connectSeq += 1;
-      closeTranscriptStream();
       closeWebRTC();
       sessionId.value = null;
       status.value = "disconnected";
       if (addNote) {
-        addTranscript("[Disconnected]");
+        appendTranscript("Disconnected.");
+      }
+    }
+
+    function parseSessionIDFromLocation(locationHeader: string | null): string | null {
+      if (!locationHeader) {
+        return null;
+      }
+      const trimmed = locationHeader.trim();
+      if (!trimmed) {
+        return null;
+      }
+      const slash = trimmed.lastIndexOf("/");
+      if (slash === -1 || slash === trimmed.length - 1) {
+        return null;
+      }
+      return trimmed.slice(slash + 1);
+    }
+
+    function sendRealtimeEvent(event: Record<string, unknown>) {
+      if (!realtimeEventChannel || realtimeEventChannel.readyState !== "open") {
+        throw new Error("Realtime events channel is not ready. Connect WebRTC first.");
+      }
+      realtimeEventChannel.send(JSON.stringify(event));
+    }
+
+    function handleRealtimeEvent(event: RealtimeCallEvent) {
+      const eventType = typeof event.type === "string" ? event.type : "";
+      switch (eventType) {
+        case "session.created": {
+          const created = event as RealtimeSessionCreatedEvent;
+          if (!sessionId.value && typeof created.session?.id === "string" && created.session.id) {
+            sessionId.value = created.session.id;
+          }
+          debugToConsole("realtime session created", created);
+          break;
+        }
+        case "conversation.item.input_audio_transcription.delta": {
+          const deltaEvent = event as RealtimeTranscriptDeltaEvent;
+          const itemID = typeof deltaEvent.item_id === "string" ? deltaEvent.item_id : "";
+          const delta = typeof deltaEvent.delta === "string" ? deltaEvent.delta : "";
+          if (!itemID || !delta) {
+            break;
+          }
+
+          const nextText = (partialTranscriptByItemID.get(itemID) ?? "") + delta;
+          partialTranscriptByItemID.set(itemID, nextText);
+
+          const visibleText = nextText.trim();
+          if (!visibleText) {
+            break;
+          }
+
+          upsertRealtimeTranscript(itemID, visibleText);
+          debugToConsole("realtime partial", { itemID, text: visibleText });
+          break;
+        }
+        case "conversation.item.input_audio_transcription.completed": {
+          const completedEvent = event as RealtimeTranscriptCompletedEvent;
+          const itemID = typeof completedEvent.item_id === "string" ? completedEvent.item_id : "";
+          const partial = itemID ? (partialTranscriptByItemID.get(itemID) ?? "").trim() : "";
+          const transcript = typeof completedEvent.transcript === "string" ? completedEvent.transcript.trim() : "";
+          const finalText = transcript || partial;
+
+          if (itemID) {
+            partialTranscriptByItemID.delete(itemID);
+          }
+
+          if (finalText) {
+            if (itemID) {
+              const lineIndex = transcriptLineIndexByItemID.get(itemID);
+              if (lineIndex === undefined) {
+                appendTranscript(finalText);
+              } else {
+                replaceTranscript(lineIndex, finalText);
+              }
+            } else {
+              appendTranscript(finalText);
+            }
+          }
+
+          if (itemID) {
+            transcriptLineIndexByItemID.delete(itemID);
+          }
+          debugToConsole("realtime final", { itemID, text: finalText });
+          break;
+        }
+        case "response.created": {
+          const createdEvent = event as RealtimeResponseCreatedEvent;
+          const responseID = createdEvent.response?.id;
+          if (typeof responseID === "string" && responseID) {
+            activeResponseID = responseID;
+          }
+          debugToConsole("realtime response created", createdEvent);
+          break;
+        }
+        case "response.done": {
+          const doneEvent = event as RealtimeResponseDoneEvent;
+          const responseID = doneEvent.response?.id;
+          if (!responseID || responseID === activeResponseID) {
+            activeResponseID = null;
+            ttsBusy.value = false;
+          }
+          debugToConsole("realtime response done", doneEvent);
+          break;
+        }
+        case "error": {
+          const errorEvent = event as RealtimeErrorEvent;
+          const message = typeof errorEvent.message === "string" ? errorEvent.message : "Realtime error";
+          error.value = message;
+          ttsBusy.value = false;
+          debugToConsole("realtime error", errorEvent);
+          break;
+        }
       }
     }
 
     async function connect() {
       const seq = ++connectSeq;
-      closeTranscriptStream();
       closeWebRTC();
       sessionId.value = null;
       status.value = "connecting";
@@ -351,7 +621,57 @@ export const AudioPlaygroundModel = createModel(
 
         const nextPC = new RTCPeerConnection();
         pc = nextPC;
-        mediaStream.getTracks().forEach((track) => nextPC.addTrack(track, mediaStream!));
+        mediaStream.getTracks().forEach((track) => nextPC.addTrack(track, nextMediaStream));
+
+        nextPC.createDataChannel("client-probe");
+
+        nextPC.ondatachannel = (event) => {
+          if (seq !== connectSeq) {
+            return;
+          }
+          const channel = event.channel;
+          if (channel.label !== "oai-events") {
+            return;
+          }
+
+          realtimeEventChannel = channel;
+          channel.onmessage = (message) => {
+            if (seq !== connectSeq) {
+              return;
+            }
+            try {
+              handleRealtimeEvent(JSON.parse(message.data) as RealtimeCallEvent);
+            } catch {
+              debugToConsole("unparsed realtime event", message.data);
+            }
+          };
+          channel.onclose = () => {
+            if (seq !== connectSeq) {
+              return;
+            }
+            if (realtimeEventChannel === channel) {
+              realtimeEventChannel = null;
+            }
+            activeResponseID = null;
+            ttsBusy.value = false;
+          };
+        };
+
+        nextPC.ontrack = (event) => {
+          if (seq !== connectSeq) {
+            return;
+          }
+          if (!remoteAudioStream) {
+            remoteAudioStream = new MediaStream();
+            getRemoteAudioElement().srcObject = remoteAudioStream;
+          }
+          if (!remoteAudioStream.getTracks().some((track) => track.id === event.track.id)) {
+            remoteAudioStream.addTrack(event.track);
+          }
+          void getRemoteAudioElement().play().catch(() => {
+            debugToConsole("realtime audio output waiting for autoplay permission");
+          });
+        };
 
         nextPC.oniceconnectionstatechange = () => {
           if (seq !== connectSeq) {
@@ -359,9 +679,9 @@ export const AudioPlaygroundModel = createModel(
           }
           if (
             nextPC.iceConnectionState === "disconnected" ||
-            nextPC.iceConnectionState === "failed"
+            nextPC.iceConnectionState === "failed" ||
+            nextPC.iceConnectionState === "closed"
           ) {
-            closeTranscriptStream();
             closeWebRTC();
             sessionId.value = null;
             status.value = "disconnected";
@@ -371,81 +691,63 @@ export const AudioPlaygroundModel = createModel(
         const offer = await nextPC.createOffer();
         await nextPC.setLocalDescription(offer);
 
-        const resp = await fetch("/webrtc/offer", {
+        await new Promise<void>((resolve) => {
+          if (nextPC.iceGatheringState === "complete") {
+            resolve();
+            return;
+          }
+
+          const onGatheringStateChange = () => {
+            if (nextPC.iceGatheringState !== "complete") {
+              return;
+            }
+            nextPC.removeEventListener("icegatheringstatechange", onGatheringStateChange);
+            clearTimeout(timeout);
+            resolve();
+          };
+
+          const timeout = window.setTimeout(() => {
+            nextPC.removeEventListener("icegatheringstatechange", onGatheringStateChange);
+            resolve();
+          }, 1200);
+
+          nextPC.addEventListener("icegatheringstatechange", onGatheringStateChange);
+        });
+
+        const offerSDP = nextPC.localDescription?.sdp ?? "";
+        if (!offerSDP.trim()) {
+          throw new Error("Missing local SDP offer");
+        }
+
+        const resp = await fetch("/v1/realtime/calls", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ sdp: offer.sdp, type: offer.type }),
+          headers: authHeaders({ "Content-Type": "application/sdp" }),
+          body: offerSDP,
         });
         if (!resp.ok) {
-          throw new Error(`Server returned ${resp.status}`);
+          throw new Error(`Realtime call setup failed (${resp.status})`);
         }
 
-        const answer = (await resp.json()) as Partial<OfferResponse>;
-        if (seq !== connectSeq) {
-          return;
-        }
-        if (
-          typeof answer.sdp !== "string" ||
-          typeof answer.type !== "string" ||
-          typeof answer.sessionId !== "string" ||
-          !answer.sdp ||
-          !answer.type ||
-          !answer.sessionId
-        ) {
-          throw new Error("Invalid SDP answer from server");
+        const locationSessionID = parseSessionIDFromLocation(resp.headers.get("Location"));
+        const answerSDP = await resp.text();
+        if (!answerSDP.trim()) {
+          throw new Error("Missing realtime SDP answer");
         }
 
-        await nextPC.setRemoteDescription(
-          new RTCSessionDescription({ sdp: answer.sdp, type: answer.type }),
-        );
+        await nextPC.setRemoteDescription({ type: "answer", sdp: answerSDP });
         if (seq !== connectSeq) {
           return;
         }
 
         status.value = "connected";
-        sessionId.value = answer.sessionId;
-        addTranscript("[Connected — speak into your microphone]");
-
-        transcriptStreamDisconnected = false;
-        const nextEventSource = new EventSource(
-          `/api/stt/stream?session=${encodeURIComponent(answer.sessionId)}`,
-        );
-        eventSource = nextEventSource;
-
-        nextEventSource.onopen = () => {
-          if (seq !== connectSeq) {
-            return;
-          }
-          transcriptStreamDisconnected = false;
-        };
-
-        nextEventSource.onmessage = (event) => {
-          if (seq !== connectSeq) {
-            return;
-          }
-          transcriptStreamDisconnected = false;
-          try {
-            const payload = JSON.parse(event.data) as TranscriptPayload;
-            if (payload.text) {
-              addTranscript(`[trace:${newTraceId("stt")}][sse] ${payload.text}`);
-            }
-          } catch {
-            addTranscript(`[trace:${newTraceId("stt")}][sse] ${event.data}`);
-          }
-        };
-
-        nextEventSource.onerror = () => {
-          if (seq !== connectSeq || transcriptStreamDisconnected) {
-            return;
-          }
-          transcriptStreamDisconnected = true;
-          addTranscript("[SSE transcript stream disconnected]");
-        };
+        if (locationSessionID) {
+          sessionId.value = locationSessionID;
+        }
+        appendTranscript("Connected. Speak into your microphone.");
       } catch (caught) {
         if (seq !== connectSeq) {
           return;
         }
-        closeTranscriptStream();
         closeWebRTC();
         sessionId.value = null;
         status.value = "disconnected";
@@ -470,23 +772,64 @@ export const AudioPlaygroundModel = createModel(
       const selectedVoice = ttsVoice.value.trim();
       const traceId = newTraceId("tts");
 
-      // Build text with emotion tag if emotion is selected
       const emotion = ttsEmotion.value;
       const textToSend = emotion !== "not-set" ? `[emotion:${emotion}] ${text}` : text;
 
-      addTranscript(
-        `[trace:${traceId}][TTS:${ttsEngine.value}${selectedVoice ? `:${selectedVoice}` : ""}${emotion !== "not-set" ? `:${emotion}` : ""}] "${text}"`,
-      );
+      debugToConsole("tts requested", {
+        traceId,
+        engine: ttsEngine.value,
+        voice: selectedVoice,
+        emotion,
+        text,
+      });
+
+      const canUseRealtime = status.value === "connected" && realtimeEventChannel?.readyState === "open";
+      if (canUseRealtime) {
+        try {
+          if (activeResponseID) {
+            sendRealtimeEvent({ type: "response.cancel", response_id: activeResponseID });
+          }
+
+          const responseBody: {
+            modalities: string[];
+            input_text: string;
+            model: string;
+            voice?: string;
+            temperature?: number;
+            cfg_coef?: number;
+            padding_between?: number;
+          } = {
+            modalities: ["audio", "text"],
+            input_text: textToSend,
+            model: `sky-${ttsEngine.value}`,
+          };
+
+          if (selectedVoice) {
+            responseBody.voice = selectedVoice;
+          }
+          if (ttsEngine.value === "kyutai") {
+            responseBody.temperature = ttsTemperature.value;
+            responseBody.cfg_coef = ttsCfgCoef.value;
+            responseBody.padding_between = ttsPaddingBetween.value;
+          }
+
+          sendRealtimeEvent({ type: "response.create", response: responseBody });
+          ttsInput.value = "";
+          return;
+        } catch (caught) {
+          ttsBusy.value = false;
+          error.value = caught instanceof Error ? caught.message : String(caught);
+          return;
+        }
+      }
 
       try {
-        // Cancel any in-flight synthesis request
         if (currentSynthesisAbort) {
           currentSynthesisAbort.abort();
         }
         currentSynthesisAbort = new AbortController();
         const thisAbort = currentSynthesisAbort;
 
-        // Stop any currently playing TTS audio before starting new playback
         if (currentTTSSource) {
           try {
             currentTTSSource.stop();
@@ -496,7 +839,6 @@ export const AudioPlaygroundModel = createModel(
           currentTTSSource = null;
         }
 
-        // Build request body with synthesis options for Kyutai
         const requestBody: {
           text: string;
           engine: TTSEngine;
@@ -511,8 +853,7 @@ export const AudioPlaygroundModel = createModel(
           voice: selectedVoice,
           trace_id: traceId,
         };
-        
-        // Only include synthesis options for Kyutai engine
+
         if (ttsEngine.value === "kyutai") {
           requestBody.temperature = ttsTemperature.value;
           requestBody.cfg_coef = ttsCfgCoef.value;
@@ -521,49 +862,52 @@ export const AudioPlaygroundModel = createModel(
 
         const resp = await fetch("/api/tts/synthesize", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: authHeaders({ "Content-Type": "application/json" }),
           body: JSON.stringify(requestBody),
           signal: thisAbort.signal,
         });
-        
-        // If this request was aborted (superseded by a newer request), don't continue
+
         if (thisAbort.signal.aborted) {
           return;
         }
-        
+
         if (!resp.ok) {
           const body = await resp.text();
           throw new Error(`TTS failed (${resp.status}): ${body}`);
         }
 
         const arrayBuffer = await resp.arrayBuffer();
-        
-        // Check again if aborted before decoding
         if (thisAbort.signal.aborted) {
           return;
         }
-        
+
         const ctx = getAudioContext();
         const decodeStartedAt = performance.now();
         const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
         const source = ctx.createBufferSource();
         source.buffer = audioBuffer;
         source.connect(ctx.destination);
-        
-        // Track the current source and clean up when done
+
         currentTTSSource = source;
         source.onended = () => {
           if (currentTTSSource === source) {
             currentTTSSource = null;
           }
-          addTranscript(`[trace:${traceId}][TTS:${ttsEngine.value}${selectedVoice ? `:${selectedVoice}` : ""}] playback ended`);
+          debugToConsole("tts playback ended", {
+            traceId,
+            engine: ttsEngine.value,
+            voice: selectedVoice,
+          });
         };
-        
-        source.start();
 
-        addTranscript(
-          `[trace:${traceId}][TTS:${ttsEngine.value}${selectedVoice ? `:${selectedVoice}` : ""}] ▶ Playing ${audioBuffer.duration.toFixed(1)}s audio (decode ${Math.round(performance.now() - decodeStartedAt)}ms)`,
-        );
+        source.start();
+        debugToConsole("tts playback started", {
+          traceId,
+          engine: ttsEngine.value,
+          voice: selectedVoice,
+          durationSeconds: Number(audioBuffer.duration.toFixed(1)),
+          decodeMs: Math.round(performance.now() - decodeStartedAt),
+        });
         ttsInput.value = "";
       } catch (caught) {
         error.value = caught instanceof Error ? caught.message : String(caught);
@@ -603,7 +947,7 @@ export const AudioPlaygroundModel = createModel(
       try {
         const resp = await fetch("/api/tts/voices/default", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: authHeaders({ "Content-Type": "application/json" }),
           body: JSON.stringify({ engine, voice }),
         });
         if (!resp.ok) {
@@ -612,7 +956,7 @@ export const AudioPlaygroundModel = createModel(
         }
         // Refresh catalog to get updated default
         await refreshVoiceCatalog();
-        addTranscript(`[Voice] Set ${engine} default to ${voice}`);
+        debugToConsole("tts voice default updated", { engine, voice });
       } catch (caught) {
         error.value = caught instanceof Error ? caught.message : String(caught);
         throw caught;
@@ -629,6 +973,7 @@ export const AudioPlaygroundModel = createModel(
       try {
         const resp = await fetch(`/api/tts/voices/${encodeURIComponent(engine)}/${encodeURIComponent(voice)}`, {
           method: "DELETE",
+          headers: authHeaders(),
         });
         if (!resp.ok) {
           const body = await resp.text();
@@ -638,13 +983,23 @@ export const AudioPlaygroundModel = createModel(
         await refreshVoiceCatalog();
         // If we deleted the currently selected voice, clear it
         if (ttsVoiceSelections.value[engine] === voice) {
-          setTTSVoice("");
+          ttsVoiceSelections.value = {
+            ...ttsVoiceSelections.value,
+            [engine]: "",
+          };
         }
         // Remove from favorites if it was there
-        if (isTTSVoiceFavorite(voice)) {
-          toggleTTSVoiceFavorite(voice);
+        const engineFavorites = ttsVoiceFavoritesMap.value[engine] ?? new Set<string>();
+        if (engineFavorites.has(voice)) {
+          const nextFavorites = new Set(engineFavorites);
+          nextFavorites.delete(voice);
+          ttsVoiceFavoritesMap.value = {
+            ...ttsVoiceFavoritesMap.value,
+            [engine]: nextFavorites,
+          };
+          saveFavoritesToStorage(ttsVoiceFavoritesMap.value);
         }
-        addTranscript(`[Voice] Deleted ${voice} from ${engine}`);
+        debugToConsole("tts voice deleted", { engine, voice });
       } catch (caught) {
         error.value = caught instanceof Error ? caught.message : String(caught);
         throw caught;
