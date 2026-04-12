@@ -132,6 +132,7 @@ def service_urls() -> tuple[str, str]:
 def ensure_prerequisites() -> None:
     required_paths = [
         REPO_ROOT / "gateway/sky-audio",
+        REPO_ROOT / "gateway/models/silero_vad.onnx",
         REPO_ROOT / "workers/python-pocket-tts/voices.json",
         REPO_ROOT / "workers/python-pocket-tts/voices",
         REPO_ROOT / "workers/python-kyutai-tts/voices.json",
@@ -190,6 +191,7 @@ def stage_payload() -> None:
     STAGING_ROOT.mkdir(parents=True)
 
     copy_file(REPO_ROOT / "gateway/sky-audio", STAGING_ROOT / "sky-audio")
+    copy_file(REPO_ROOT / "gateway/models/silero_vad.onnx", STAGING_ROOT / "gateway/models/silero_vad.onnx")
 
     staged_workers_root = STAGING_ROOT / "workers"
     staged_workers_root.mkdir(parents=True, exist_ok=True)
