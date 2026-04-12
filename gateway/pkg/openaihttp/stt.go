@@ -90,6 +90,20 @@ func (t *sttTranscriber) Transcribe(ctx context.Context, audioData []byte, sampl
 }
 
 func (t *sttTranscriber) TranscribeStream(ctx context.Context, audioData []byte, sampleRate int32, onTranscript func(text string, isFinal bool)) error {
+	// Validate sample rate - must be one of the supported values
+	// The STT worker expects 16000Hz specifically
+	validSampleRates := []int32{8000, 16000, 22050, 44100, 48000}
+	isValid := false
+	for _, validRate := range validSampleRates {
+		if sampleRate == validRate {
+			isValid = true
+			break
+		}
+	}
+	if !isValid {
+		return fmt.Errorf("invalid sample rate: %d Hz; must be one of: 8000, 16000, 22050, 44100, 48000", sampleRate)
+	}
+
 	client, err := skywebrtc.NewSTTClient(t.socketPath)
 	if err != nil {
 		return fmt.Errorf("connect to STT worker: %w", err)
@@ -273,7 +287,7 @@ func handleTranscription(w http.ResponseWriter, r *http.Request, transcriber STT
 			Text:     text,
 			Task:     "transcribe",
 			Language: req.Language,
-			Duration: float64(len(pcmData)) / float64(sampleRate*2), // rough estimate
+			Duration: float64(len(pcmData)) / float64(sampleRate*audio.BytesPerSample), // rough estimate
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -284,7 +298,7 @@ func handleTranscription(w http.ResponseWriter, r *http.Request, transcriber STT
 		// Simple SRT/VTT generation with single entry
 		w.Header().Set("Content-Type", "text/plain")
 		w.WriteHeader(http.StatusOK)
-		duration := float64(len(pcmData)) / float64(sampleRate*2)
+		duration := float64(len(pcmData)) / float64(sampleRate*audio.BytesPerSample)
 		if format == "srt" {
 			if _, err := fmt.Fprintf(w, "1\n00:00:00,000 --> %s\n%s\n", formatDurationSRT(duration), text); err != nil {
 				log.Printf("[stt] write srt response error: %v", err)

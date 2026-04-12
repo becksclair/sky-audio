@@ -975,6 +975,40 @@ func TestOptionalAuthMiddlewareWithValidator(t *testing.T) {
 	}
 }
 
+func TestOptionalAuthMiddlewareAllowLoopback(t *testing.T) {
+	t.Setenv("SKY_AUDIO_API_KEY", "secret-key")
+
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	middleware := OptionalAuthMiddlewareAllowLoopback(inner)
+
+	loopbackReq := httptest.NewRequest(http.MethodGet, "/api/tts/voices", nil)
+	loopbackReq.RemoteAddr = "127.0.0.1:12345"
+	loopbackRR := httptest.NewRecorder()
+	middleware.ServeHTTP(loopbackRR, loopbackReq)
+	if loopbackRR.Code != http.StatusOK {
+		t.Fatalf("loopback request should bypass auth: status = %d, want %d", loopbackRR.Code, http.StatusOK)
+	}
+
+	remoteReq := httptest.NewRequest(http.MethodGet, "/api/tts/voices", nil)
+	remoteReq.RemoteAddr = "203.0.113.10:23456"
+	remoteRR := httptest.NewRecorder()
+	middleware.ServeHTTP(remoteRR, remoteReq)
+	if remoteRR.Code != http.StatusUnauthorized {
+		t.Fatalf("non-loopback request without auth should fail: status = %d, want %d", remoteRR.Code, http.StatusUnauthorized)
+	}
+
+	authedRemoteReq := httptest.NewRequest(http.MethodGet, "/api/tts/voices", nil)
+	authedRemoteReq.RemoteAddr = "203.0.113.10:34567"
+	authedRemoteReq.Header.Set("Authorization", "Bearer secret-key")
+	authedRemoteRR := httptest.NewRecorder()
+	middleware.ServeHTTP(authedRemoteRR, authedRemoteReq)
+	if authedRemoteRR.Code != http.StatusOK {
+		t.Fatalf("non-loopback request with valid auth should pass: status = %d, want %d", authedRemoteRR.Code, http.StatusOK)
+	}
+}
+
 // createTestWAV creates a minimal valid WAV file for STT testing
 func createTestWAV(durationMs int) []byte {
 	sampleRate := 16000

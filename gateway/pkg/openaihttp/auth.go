@@ -2,6 +2,7 @@ package openaihttp
 
 import (
 	"crypto/subtle"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -82,14 +83,28 @@ func AuthMiddleware(next http.Handler) http.Handler {
 // even without auth (for load balancer probes).
 // Also supports ?token= query parameter for EventSource/SSE which cannot send custom headers.
 func OptionalAuthMiddleware(next http.Handler) http.Handler {
-	return OptionalAuthMiddlewareWithValidator(next, nil)
+	return optionalAuthMiddleware(next, nil, nil)
 }
 
 func OptionalAuthMiddlewareWithValidator(next http.Handler, extraValidator func(string) bool) http.Handler {
+	return optionalAuthMiddleware(next, extraValidator, nil)
+}
+
+// OptionalAuthMiddlewareAllowLoopback allows unauthenticated requests from loopback clients
+// while keeping API key checks for non-loopback requests when SKY_AUDIO_API_KEY is set.
+func OptionalAuthMiddlewareAllowLoopback(next http.Handler) http.Handler {
+	return optionalAuthMiddleware(next, nil, isLoopbackRequest)
+}
+
+func optionalAuthMiddleware(next http.Handler, extraValidator func(string) bool, bypass func(*http.Request) bool) http.Handler {
 	expectedKey := os.Getenv("SKY_AUDIO_API_KEY")
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v1/health" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if bypass != nil && bypass(r) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -110,4 +125,17 @@ func OptionalAuthMiddlewareWithValidator(next http.Handler, extraValidator func(
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+func isLoopbackRequest(r *http.Request) bool {
+	host := r.RemoteAddr
+	if parsedHost, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		host = parsedHost
+	}
+	host = strings.TrimSpace(host)
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
