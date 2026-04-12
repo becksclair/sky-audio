@@ -25,7 +25,9 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -371,27 +373,67 @@ func validateExplicitVoice(engine, voice string) (string, error) {
 	if trimmedVoice == "" {
 		return "", nil
 	}
+
+	// Check for URL-encoded path traversal patterns before decoding
+	urlEncodedTraversal := []string{"%2e%2e", "%2e.", ".%2e", "%252e%252e", "%2f", "%5c", "%252f", "%255c"}
+	lowerVoice := strings.ToLower(trimmedVoice)
+	for _, pattern := range urlEncodedTraversal {
+		if strings.Contains(lowerVoice, pattern) {
+			return "", fmt.Errorf("voice contains URL-encoded path traversal")
+		}
+	}
+
+	// Decode URL-encoded characters and re-validate
+	decodedVoice, err := url.PathUnescape(trimmedVoice)
+	if err == nil && decodedVoice != trimmedVoice {
+		// Re-check the decoded string for traversal patterns
+		trimmedVoice = strings.TrimSpace(decodedVoice)
+		lowerVoice = strings.ToLower(trimmedVoice)
+		for _, pattern := range urlEncodedTraversal {
+			if strings.Contains(lowerVoice, pattern) {
+				return "", fmt.Errorf("voice contains URL-encoded path traversal")
+			}
+		}
+	}
+
+	// Check for backslash path separators (Windows-style)
 	if strings.Contains(trimmedVoice, "\\") {
 		return "", fmt.Errorf("voice contains invalid path separators")
 	}
+
+	// Check for null bytes and control characters
 	for _, r := range trimmedVoice {
 		if r == 0 || unicode.IsControl(r) {
 			return "", fmt.Errorf("voice contains invalid characters")
 		}
 	}
+
+	// Check for absolute paths
 	if path.IsAbs(trimmedVoice) {
 		return "", fmt.Errorf("voice must be a catalog voice id")
 	}
+
+	// Use filepath.IsLocal (Go 1.20+) for comprehensive local path validation
+	if !filepath.IsLocal(trimmedVoice) {
+		return "", fmt.Errorf("voice must be a local catalog voice id")
+	}
+
+	// Additional path traversal checks
 	cleaned := path.Clean(trimmedVoice)
 	if cleaned == "." || cleaned != trimmedVoice || strings.HasPrefix(cleaned, "../") || cleaned == ".." {
 		return "", fmt.Errorf("voice must be a normalized catalog voice id")
 	}
+
+	// Double-check for explicit path traversal sequences
 	if strings.Contains(trimmedVoice, "..") {
 		return "", fmt.Errorf("voice must not contain path traversal")
 	}
+
+	// Pocket engine specific: no slashes allowed
 	if engine == "pocket" && strings.Contains(trimmedVoice, "/") {
 		return "", fmt.Errorf("voice must be a pocket catalog voice id")
 	}
+
 	return trimmedVoice, nil
 }
 
