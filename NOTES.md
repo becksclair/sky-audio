@@ -1,0 +1,14 @@
+# NOTES
+
+- Local compose deployment uses a shared named volume for Unix sockets at `/sockets`; gateway attaches to external workers when `SKY_AUDIO_EXTERNAL_STT=1` and `SKY_AUDIO_EXTERNAL_TTS=1` are set.
+- Pocket compose deployments also need a shared state volume at `/state/pocket` so the gateway and Pocket worker see the same `voices.json`, `voices.local.json`, and copied local `.safetensors`. Without that shared volume, dashboard/admin catalog changes drift away from runtime synthesis.
+- Treat `mise run docker:down*` as non-destructive shutdown only. If you actually want to wipe `/state/pocket` and other named Compose volumes, use the explicit `docker:reset*` tasks instead of hiding volume deletion in the normal down flow.
+- Pocket startup should reconcile baked worker state into `/state/pocket` on every boot, not just seed missing files. The reconcile step must refresh rebuilt cloned voices/overlay data while preserving any valid runtime-selected default already stored in the shared volume.
+- That boot reconcile must keep the shared base catalog baked-complete and preserve deletions in the overlay instead: use `deleted_builtin_voices` tombstones for built-ins, and `deleted_voices` plus `deleted_voice_hashes` for local clones so rebuilt same-id clones can reappear when their baked content hash changes.
+- When the Pocket worker detects a shared overlay refresh, it must evict cached local voice prompt state; otherwise replaced `.safetensors` keep using stale cached embeddings until the process restarts.
+- In external TTS attach mode, cached gRPC clients must be health-probed with `GetStatus()` before reuse; a restarted Pocket/Kyutai worker otherwise leaves the gateway holding a dead client until idle-timeout cleanup.
+- `workers/python-pocket-tts/sync_custom_voices.py` should preserve unknown keys from `voices.local.json` and write atomically; the overlay is now intentionally forward-compatible and shared with live services.
+- Use `docker-compose.yml` for the default Pocket + GPU STT lane and `docker-compose.kyutai.yml` for the alternate Kyutai + CPU STT lane.
+- Keep the lane split hard-pinned in compose/tasks rather than relying on ad-hoc `TTS_ENGINE` or `STT_DEVICE` overrides; otherwise it is too easy to end up with the wrong gateway mode and no matching worker.
+- On this machine's 8GB RTX 4060, NeMo STT and Kyutai TTS do not fit concurrently in VRAM when both try to use CUDA; keep STT on CPU in the Kyutai lane.
+- After interrupted `docker compose build` / `up` runs, stale compose processes can leave containers stuck in `Created` or trigger phantom name conflicts. Kill the orphaned `docker compose` processes and clean the partial containers before retrying.

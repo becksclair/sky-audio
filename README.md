@@ -33,16 +33,54 @@ Kyutai and PocketTTS voice assets are intentionally vendored into this repo so t
 
 ## Deployment
 
-Run `mise run deploy` to rebuild the gateway, copy the runtime payload into `/home/bex/Apps/services/sky-audio`, install or update the `sky-audio.service` systemd user unit, recreate worker environments with `uv sync --frozen`, restart the service, and verify it is healthy.
+### Recommended local deployment: Docker Compose
+
+The canonical local deployment path is the compose-first split stack defined by:
+
+- `/home/bex/projects/sky/sky-audio/Dockerfile.compose`
+- `/home/bex/projects/sky/sky-audio/docker-compose.yml` for the default Pocket + GPU STT lane
+- `/home/bex/projects/sky/sky-audio/docker-compose.kyutai.yml` for the alternate Kyutai + CPU STT lane
+
+```bash
+mise run docker:build
+mise run docker:up
+docker compose ps
+mise run docker:logs
+```
+
+Alternate Kyutai mode:
+
+```bash
+mise run docker:build:kyutai
+mise run docker:up:kyutai
+docker compose -f docker-compose.kyutai.yml ps
+mise run docker:logs:kyutai
+```
 
 Operational notes:
-- The deployed service runs from `/home/bex/Apps/services/sky-audio`.
-- Optional overrides live in `~/.config/sky-audio/sky-audio.env`.
-- The deploy verification checks `http://127.0.0.1:<port>/health` and `http://127.0.0.1:<port>/api/tts/voices`, using `PORT` from the env file when set.
-- If `SKY_AUDIO_API_KEY` is set in the env file, the deploy verification uses it for the authenticated API probe.
-- The unit sets an explicit stable `PATH` so the gateway can spawn worker processes via `uv` under systemd without depending on a version-specific install directory.
-- Setting `PORT` makes the gateway bind to all interfaces (`:<port>`), so set `SKY_AUDIO_API_KEY` in the env file before doing that.
-- Set `STT_END_OF_SPEECH_MS` in the env file to control how long the gateway waits for silence before finalizing live speech. Default: `150`.
+- The compose stack exposes the gateway on `http://127.0.0.1:8585` by default.
+- The default local lane is:
+  - Pocket TTS on CPU
+  - NeMo STT on CUDA
+- The alternate Kyutai lane is:
+  - Kyutai TTS on CUDA
+  - NeMo STT on CPU
+- The compose file sets a local default API key of `sky-audio-local-dev` so the Dockerized gateway can bind inside the container without weakening the repo's non-loopback safety check.
+- `docker-compose.yml` hard-pins the default lane to `TTS_ENGINE=pocket` with `STT_DEVICE=cuda`.
+- `docker-compose.kyutai.yml` hard-pins the alternate lane to `TTS_ENGINE=kyutai` with `STT_DEVICE=cpu`.
+- The `mise` Docker up/down tasks use `--remove-orphans` so switching lanes does not leave the previous worker stack hanging around.
+- `mise run docker:down` and `mise run docker:down:kyutai` preserve the named Compose volumes, including Pocket shared state under `/state/pocket`.
+- Use `mise run docker:reset` or `mise run docker:reset:kyutai` only when you explicitly want to wipe persistent Compose volumes and start from a clean state.
+- `gpus: all` is enabled only for the services that benefit from it in each lane, which keeps the gateway and Pocket worker out of the GPU path and avoids the Kyutai/STT VRAM knife fight on smaller cards.
+- Pocket cloned voices are baked into the Pocket worker image and the gateway's Pocket overlay manifest from `./custom-voices` at build time. Rebuild the compose stack after changing local cloned voices.
+- NeMo and Kyutai bake their model assets into their own worker images so the compose stack can start and synthesize/transcribe offline once built.
+- Override `SKY_AUDIO_API_KEY` before binding beyond loopback or exposing the `/v1/` endpoints to other clients.
+
+### Legacy non-Docker deployment
+
+`mise run deploy` still exists for the older user-systemd lane. It rebuilds the gateway, copies the runtime payload into `/home/bex/Apps/services/sky-audio`, installs or updates the `sky-audio.service` user unit, recreates worker environments with `uv sync --frozen`, restarts the service, and verifies it is healthy.
+
+That path is no longer the preferred local deployment flow on this machine.
 
 ## Test split
 

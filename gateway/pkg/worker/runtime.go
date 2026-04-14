@@ -21,6 +21,7 @@ type Spec struct {
 	SocketPath     string
 	SocketTimeout  time.Duration
 	ReadinessProbe string
+	Managed        bool
 }
 
 type Runtime struct {

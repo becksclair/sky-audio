@@ -41,6 +41,7 @@ COMMON_PATH_ENTRIES = [
 ]
 
 UV_PATH: Path | None = None
+SYNC_CUSTOM_POCKET_VOICES = REPO_ROOT / "workers/python-pocket-tts/sync_custom_voices.py"
 
 
 def log(message: str) -> None:
@@ -75,6 +76,10 @@ def resolve_uv_path() -> Path:
     if not uv_path:
         fail("uv is not available on PATH")
     return Path(uv_path).resolve()
+
+
+def sync_local_pocket_cloned_voices() -> None:
+    run([sys.executable, str(SYNC_CUSTOM_POCKET_VOICES)], cwd=REPO_ROOT)
 
 
 def service_path_env() -> str:
@@ -390,6 +395,7 @@ def main() -> None:
     deployment_healthy = False
     service_stopped = False
     try:
+        sync_local_pocket_cloned_voices()
         ensure_prerequisites()
         stage_payload()
         sync_worker_envs(STAGING_ROOT)

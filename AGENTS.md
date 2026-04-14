@@ -55,6 +55,12 @@ mise run smoke:realtime-calls
   - Runs a live gateway-level WebRTC smoke against `POST /v1/realtime/calls`.
   - Normalizes the checked-in voice fixture, verifies partials/final transcript, and compares against batch STT.
 
+### Python linting and type checking
+
+- For Python changes, run `ruff` and `basedpyright` on the touched worker files before calling the seam done.
+- In this repo, prefer `uvx ruff check ...` and `uvx basedpyright ...` unless the worker already carries the tool in its own `.venv`.
+- Use the worker-local `pyrightconfig.json` when present by running `basedpyright` from that worker directory.
+
 ## Notes
 
 - `build.sh` and `mise` tasks already export the CGO and linker flags needed for the Silero/ONNX-backed gateway build.

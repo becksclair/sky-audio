@@ -3,6 +3,10 @@ gateway/sky-audio
 gateway/pkg/dashboard/dist/
 dashboard/dist/
 dashboard/node_modules/
+custom-voices/*
+!custom-voices/.gitkeep
+workers/python-pocket-tts/voices.local.json
+workers/python-pocket-tts/voices/local/
 __pycache__/
 *.pyc
 
