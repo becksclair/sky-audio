@@ -137,12 +137,16 @@ depends = ["tts:prefetch:pocket", "tts:prefetch:kyutai"]
 
 [tasks."docker:build"]
 description = "Build the default local Docker Compose stack (gateway + Pocket + STT)"
-run = "docker compose build gateway pocket stt"
+run = """
+DOCKER_BUILDKIT=0 docker build --target gateway-runtime -t sky-audio-gateway:latest -f Dockerfile.compose .
+DOCKER_BUILDKIT=0 docker build --target pocket-worker-runtime -t sky-audio-pocket-worker:latest -f Dockerfile.compose .
+DOCKER_BUILDKIT=0 docker build --target stt-worker-runtime -t sky-audio-stt-worker:latest -f Dockerfile.compose .
+"""
 
 [tasks."docker:up"]
 description = "Rebuild and run the default Pocket + GPU STT Docker deployment locally"
 depends = ["docker:build"]
-run = "docker compose up -d --force-recreate --remove-orphans gateway pocket stt"
+run = "docker compose up -d --force-recreate --remove-orphans --no-build gateway pocket stt"
 
 [tasks."docker:down"]
 description = "Stop the local Docker deployment without deleting persistent volumes"
@@ -158,12 +162,16 @@ run = "docker compose logs -f gateway pocket stt"
 
 [tasks."docker:build:kyutai"]
 description = "Build the alternate Kyutai + CPU STT Docker deployment images"
-run = "docker compose -f docker-compose.kyutai.yml build gateway stt kyutai"
+run = """
+DOCKER_BUILDKIT=0 docker build --target gateway-runtime -t sky-audio-gateway:latest -f Dockerfile.compose .
+DOCKER_BUILDKIT=0 docker build --target stt-worker-runtime -t sky-audio-stt-worker:latest -f Dockerfile.compose .
+DOCKER_BUILDKIT=0 docker build --target kyutai-worker-runtime -t sky-audio-kyutai-worker:latest -f Dockerfile.compose .
+"""
 
 [tasks."docker:up:kyutai"]
 description = "Run the alternate Kyutai + CPU STT Docker deployment locally"
 depends = ["docker:build:kyutai"]
-run = "docker compose -f docker-compose.kyutai.yml up -d --force-recreate --remove-orphans gateway stt kyutai"
+run = "docker compose -f docker-compose.kyutai.yml up -d --force-recreate --remove-orphans --no-build gateway stt kyutai"
 
 [tasks."docker:down:kyutai"]
 description = "Stop the alternate Kyutai + CPU STT Docker deployment without deleting persistent volumes"
