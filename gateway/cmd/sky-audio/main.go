@@ -39,12 +39,18 @@ const (
 	ttsPocketSocketPath = "/tmp/sky-audio-tts-pocket.sock"
 	ttsKyutaiSocketPath = "/tmp/sky-audio-tts-kyutai.sock"
 
-	defaultTTSEngine         = "pocket"
-	defaultSTTEndOfSpeechMs  = 150
-	maxTTSTextLen            = 2000
-	maxTTSBodyBytes          = 25600
-	sttSocketEnvVarName      = "SKY_AUDIO_STT_SOCKET"
-	sttEndOfSpeechEnvVarName = "STT_END_OF_SPEECH_MS"
+	defaultTTSEngine          = "pocket"
+	defaultSTTEndOfSpeechMs   = 150
+	maxTTSTextLen             = 2000
+	maxTTSBodyBytes           = 25600
+	sttSocketEnvVarName       = "SKY_AUDIO_STT_SOCKET"
+	ttsPocketCatalogEnvVar    = "SKY_AUDIO_TTS_POCKET_BASE_CATALOG"
+	ttsPocketOverlayEnvVar    = "SKY_AUDIO_TTS_POCKET_OVERLAY"
+	ttsPocketSocketEnvVarName = "SKY_AUDIO_TTS_POCKET_SOCKET"
+	ttsKyutaiSocketEnvVarName = "SKY_AUDIO_TTS_KYUTAI_SOCKET"
+	externalSTTEnvVarName     = "SKY_AUDIO_EXTERNAL_STT"
+	externalTTSEnvVarName     = "SKY_AUDIO_EXTERNAL_TTS"
+	sttEndOfSpeechEnvVarName  = "STT_END_OF_SPEECH_MS"
 )
 
 type sseClient struct {
@@ -102,6 +108,58 @@ func resolveSTTSocketPath() string {
 	return value
 }
 
+func resolveTTSPocketSocketPath() string {
+	value := strings.TrimSpace(os.Getenv(ttsPocketSocketEnvVarName))
+	if value == "" {
+		return ttsPocketSocketPath
+	}
+	return value
+}
+
+func resolveTTSPocketCatalogFiles() voiceCatalogFiles {
+	basePath := strings.TrimSpace(os.Getenv(ttsPocketCatalogEnvVar))
+	if basePath == "" {
+		basePath = "workers/python-pocket-tts/voices.json"
+	}
+	overlayPath := strings.TrimSpace(os.Getenv(ttsPocketOverlayEnvVar))
+	if overlayPath == "" {
+		overlayPath = "workers/python-pocket-tts/voices.local.json"
+	}
+	return voiceCatalogFiles{
+		BasePath:    basePath,
+		OverlayPath: overlayPath,
+	}
+}
+
+func resolveTTSKyutaiSocketPath() string {
+	value := strings.TrimSpace(os.Getenv(ttsKyutaiSocketEnvVarName))
+	if value == "" {
+		return ttsKyutaiSocketPath
+	}
+	return value
+}
+
+func envTruthy(name string) bool {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return false
+	}
+	switch strings.ToLower(value) {
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
+}
+
+func shouldManageSTTWorker() bool {
+	return !envTruthy(externalSTTEnvVarName)
+}
+
+func shouldManageTTSWorker() bool {
+	return !envTruthy(externalTTSEnvVarName)
+}
+
 func resolvePythonWorkerLauncher(dir string) (string, []string) {
 	venvPython := filepath.Join(dir, ".venv", "bin", "python")
 	if info, err := os.Stat(venvPython); err == nil && !info.IsDir() {
@@ -110,15 +168,33 @@ func resolvePythonWorkerLauncher(dir string) (string, []string) {
 	return "uv", []string{"run", "python", "main.py"}
 }
 
-func activeTTSVoiceCatalogPaths(engine string) map[string]string {
+func shouldPreloadSTTWorker() bool {
+	value := strings.TrimSpace(os.Getenv("SKY_AUDIO_PRELOAD_STT"))
+	if value == "" {
+		return true
+	}
+	switch strings.ToLower(value) {
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
+}
+
+type voiceCatalogFiles struct {
+	BasePath    string
+	OverlayPath string
+}
+
+func activeTTSVoiceCatalogPaths(engine string) map[string]voiceCatalogFiles {
 	switch engine {
 	case "kyutai":
-		return map[string]string{
-			"kyutai": "workers/python-kyutai-tts/voices.json",
+		return map[string]voiceCatalogFiles{
+			"kyutai": {BasePath: "workers/python-kyutai-tts/voices.json"},
 		}
 	default:
-		return map[string]string{
-			"pocket": "workers/python-pocket-tts/voices.json",
+		return map[string]voiceCatalogFiles{
+			"pocket": resolveTTSPocketCatalogFiles(),
 		}
 	}
 }
@@ -338,6 +414,7 @@ type lazySTTLoader struct {
 	sessionCount int
 	idleTimer    *time.Timer
 	inShutdown   bool // prevents new spawns during shutdown
+	ownedWorker  bool
 }
 
 func newLazySTTLoader(ctx context.Context, runtime *worker.Runtime, spec worker.Spec, idleTimeout time.Duration) *lazySTTLoader {
@@ -374,7 +451,7 @@ func (l *lazySTTLoader) EnsureRunning() func() {
 	}
 
 	// If already running, just add session and return cleanup
-	if l.running && l.runtime.IsRunning(l.spec.Name) {
+	if l.running && (!l.ownedWorker || l.runtime.IsRunning(l.spec.Name)) {
 		l.sessionCount++
 		if l.idleTimer != nil {
 			l.idleTimer.Stop()
@@ -415,19 +492,31 @@ func (l *lazySTTLoader) EnsureRunning() func() {
 
 	// We are the goroutine that will spawn
 	l.spawning = true
-
-	// Clean up any stale socket file before spawning to avoid false readiness
-	if err := os.Remove(l.spec.SocketPath); err != nil && !os.IsNotExist(err) {
-		log.Printf("[WARN] Failed to remove stale STT socket before spawn: %v", err)
+	attachOnly := !l.spec.Managed
+	if !attachOnly {
+		if _, err := os.Stat(l.spec.SocketPath); err == nil {
+			attachOnly = true
+			log.Println("[INFO] Found existing STT socket, attempting attach...")
+		} else if !os.IsNotExist(err) {
+			log.Printf("[WARN] Failed to stat STT socket before spawn: %v", err)
+		}
 	}
 
-	log.Println("[INFO] Spawning STT worker on demand...")
-	if err := l.runtime.Spawn(l.ctx, l.spec); err != nil {
-		l.spawning = false
-		l.cond.Broadcast() // No kill needed, just wake waiters
-		log.Printf("[ERROR] Failed to spawn STT worker: %v", err)
-		l.mu.Unlock()
-		return nil
+	if !attachOnly {
+		// Clean up any stale socket file before spawning to avoid false readiness
+		if err := os.Remove(l.spec.SocketPath); err != nil && !os.IsNotExist(err) {
+			log.Printf("[WARN] Failed to remove stale STT socket before spawn: %v", err)
+		}
+
+		log.Println("[INFO] Spawning STT worker on demand...")
+		if err := l.runtime.Spawn(l.ctx, l.spec); err != nil {
+			l.spawning = false
+			l.cond.Broadcast() // No kill needed, just wake waiters
+			log.Printf("[ERROR] Failed to spawn STT worker: %v", err)
+			l.mu.Unlock()
+			return nil
+		}
+		l.ownedWorker = true
 	}
 
 	// Wait for socket (outside lock to not block other operations)
@@ -447,6 +536,12 @@ func (l *lazySTTLoader) EnsureRunning() func() {
 
 	if socketErr != nil {
 		l.spawning = false
+		if attachOnly {
+			log.Printf("[ERROR] STT socket wait failed while attaching: %v", socketErr)
+			l.cond.Broadcast()
+			l.mu.Unlock()
+			return nil
+		}
 		l.killing = true // Serialize kill before broadcasting
 		log.Printf("[ERROR] STT socket wait failed after spawn: %v", socketErr)
 		// Release lock before Kill to avoid deadlock
@@ -459,6 +554,7 @@ func (l *lazySTTLoader) EnsureRunning() func() {
 		}
 		l.mu.Lock()
 		l.killing = false
+		l.ownedWorker = false
 		l.cond.Broadcast() // wake waiters after cleanup
 		l.mu.Unlock()
 		return nil
@@ -474,11 +570,16 @@ func (l *lazySTTLoader) EnsureRunning() func() {
 
 	l.spawning = false
 	l.running = true
+	l.ownedWorker = !attachOnly
 	l.sessionCount++
 	l.cond.Broadcast() // wake waiters
 	cleanup := l.makeCleanup()
 	l.mu.Unlock()
-	log.Println("[INFO] STT worker ready")
+	if attachOnly {
+		log.Println("[INFO] Attached to existing STT worker")
+	} else {
+		log.Println("[INFO] STT worker ready")
+	}
 	return cleanup
 }
 
@@ -518,25 +619,33 @@ func (l *lazySTTLoader) shutdown() {
 	}
 
 	socketPath := l.spec.SocketPath
+	ownedWorker := l.ownedWorker
 	l.mu.Unlock()
 
-	// Kill outside the lock — Kill() blocks until the process exits
-	log.Println("[INFO] STT idle timeout reached, shutting down worker...")
-	killErr := l.runtime.Kill(l.spec.Name)
-	if killErr != nil {
-		log.Printf("[WARN] Failed to kill STT worker: %v", killErr)
-	}
-	if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
-		log.Printf("[WARN] Failed to remove STT socket: %v", err)
+	killErr := error(nil)
+	if ownedWorker {
+		// Kill outside the lock — Kill() blocks until the process exits
+		log.Println("[INFO] STT idle timeout reached, shutting down worker...")
+		killErr = l.runtime.Kill(l.spec.Name)
+		if killErr != nil {
+			log.Printf("[WARN] Failed to kill STT worker: %v", killErr)
+		}
+		if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
+			log.Printf("[WARN] Failed to remove STT socket: %v", err)
+		}
+	} else {
+		log.Println("[INFO] STT idle timeout reached, detaching from external worker...")
 	}
 
 	// Update state: only mark as not running if kill succeeded
 	l.mu.Lock()
-	if killErr == nil {
+	if !ownedWorker || killErr == nil {
 		l.running = false
+		l.ownedWorker = false
 	} else if !l.runtime.IsRunning(l.spec.Name) {
 		// Process is dead even though Kill returned error
 		l.running = false
+		l.ownedWorker = false
 	}
 	// If kill failed and process still running, we keep running=true
 	// so shutdown will be retried on next idle timeout
@@ -580,6 +689,16 @@ func newLazyTTSLoader(engine string, ctx context.Context, runtime *worker.Runtim
 	return l
 }
 
+func ttsClientHealthy(ctx context.Context, client *skywebrtc.TTSClient) bool {
+	if client == nil {
+		return false
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	_, err := client.GetStatus(probeCtx)
+	return err == nil
+}
+
 // EnsureRunning spawns the active TTS worker if not running.
 // Returns a cleanup func to call when the request completes, and the TTS client to use.
 func (l *lazyTTSLoader) EnsureRunning() (*skywebrtc.TTSClient, func()) {
@@ -602,6 +721,31 @@ func (l *lazyTTSLoader) EnsureRunning() (*skywebrtc.TTSClient, func()) {
 	}
 
 	if l.running && l.ttsClient != nil && (!l.ownedWorker || l.runtime.IsRunning(l.spec.Name)) {
+		if !l.ownedWorker {
+			client := l.ttsClient
+			l.mu.Unlock()
+			if !ttsClientHealthy(l.ctx, client) {
+				_ = client.Close()
+				l.mu.Lock()
+				if l.ttsClient == client {
+					l.running = false
+					l.ttsClient = nil
+					l.ownedWorker = false
+				}
+			} else {
+				l.mu.Lock()
+			}
+			for l.killing {
+				l.cond.Wait()
+			}
+			if l.inShutdown {
+				l.mu.Unlock()
+				return nil, nil
+			}
+		}
+	}
+
+	if l.running && l.ttsClient != nil && (!l.ownedWorker || l.runtime.IsRunning(l.spec.Name)) {
 		l.reqCount++
 		if l.idleTimer != nil {
 			l.idleTimer.Stop()
@@ -616,6 +760,30 @@ func (l *lazyTTSLoader) EnsureRunning() (*skywebrtc.TTSClient, func()) {
 	if l.spawning {
 		for l.spawning {
 			l.cond.Wait()
+		}
+		if l.running && l.ttsClient != nil && (!l.ownedWorker || l.runtime.IsRunning(l.spec.Name)) {
+			if !l.ownedWorker {
+				client := l.ttsClient
+				l.mu.Unlock()
+				if !ttsClientHealthy(l.ctx, client) {
+					_ = client.Close()
+					l.mu.Lock()
+					if l.ttsClient == client {
+						l.running = false
+						l.ttsClient = nil
+						l.ownedWorker = false
+					}
+				} else {
+					l.mu.Lock()
+				}
+				for l.killing {
+					l.cond.Wait()
+				}
+				if l.inShutdown {
+					l.mu.Unlock()
+					return nil, nil
+				}
+			}
 		}
 		if l.running && l.ttsClient != nil && (!l.ownedWorker || l.runtime.IsRunning(l.spec.Name)) {
 			l.reqCount++
@@ -633,12 +801,14 @@ func (l *lazyTTSLoader) EnsureRunning() (*skywebrtc.TTSClient, func()) {
 	}
 
 	l.spawning = true
-	attachOnly := false
-	if _, err := os.Stat(l.spec.SocketPath); err == nil {
-		attachOnly = true
-		log.Printf("[INFO] Found existing %s TTS socket, attempting attach...", l.engine)
-	} else if !os.IsNotExist(err) {
-		log.Printf("[WARN] Failed to stat %s TTS socket before spawn: %v", l.engine, err)
+	attachOnly := !l.spec.Managed
+	if !attachOnly {
+		if _, err := os.Stat(l.spec.SocketPath); err == nil {
+			attachOnly = true
+			log.Printf("[INFO] Found existing %s TTS socket, attempting attach...", l.engine)
+		} else if !os.IsNotExist(err) {
+			log.Printf("[WARN] Failed to stat %s TTS socket before spawn: %v", l.engine, err)
+		}
 	}
 
 	if !attachOnly {
@@ -659,36 +829,39 @@ func (l *lazyTTSLoader) EnsureRunning() (*skywebrtc.TTSClient, func()) {
 	}
 
 	l.mu.Unlock()
-	if !attachOnly {
-		socketErr := worker.WaitForSocket(l.ctx, l.spec.SocketPath, l.spec.SocketTimeout)
-		l.mu.Lock()
+	socketErr := worker.WaitForSocket(l.ctx, l.spec.SocketPath, l.spec.SocketTimeout)
+	l.mu.Lock()
 
-		if l.inShutdown || l.killing {
-			l.spawning = false
+	if l.inShutdown || l.killing {
+		l.spawning = false
+		l.cond.Broadcast()
+		l.mu.Unlock()
+		return nil, nil
+	}
+
+	if socketErr != nil {
+		l.spawning = false
+		if attachOnly {
+			log.Printf("[ERROR] %s TTS socket wait failed while attaching: %v", l.engine, socketErr)
 			l.cond.Broadcast()
 			l.mu.Unlock()
 			return nil, nil
 		}
-
-		if socketErr != nil {
-			l.spawning = false
-			l.killing = true
-			log.Printf("[ERROR] %s TTS socket wait failed: %v", l.engine, socketErr)
-			l.mu.Unlock()
-			if err := l.runtime.Kill(l.spec.Name); err != nil {
-				log.Printf("[WARN] Failed to kill %s TTS worker after socket error: %v", l.engine, err)
-			}
-			if err := os.Remove(l.spec.SocketPath); err != nil && !os.IsNotExist(err) {
-				log.Printf("[WARN] Failed to remove %s TTS socket after socket error: %v", l.engine, err)
-			}
-			l.mu.Lock()
-			l.killing = false
-			l.cond.Broadcast()
-			l.mu.Unlock()
-			return nil, nil
+		l.killing = true
+		log.Printf("[ERROR] %s TTS socket wait failed: %v", l.engine, socketErr)
+		l.mu.Unlock()
+		if err := l.runtime.Kill(l.spec.Name); err != nil {
+			log.Printf("[WARN] Failed to kill %s TTS worker after socket error: %v", l.engine, err)
 		}
-	} else {
+		if err := os.Remove(l.spec.SocketPath); err != nil && !os.IsNotExist(err) {
+			log.Printf("[WARN] Failed to remove %s TTS socket after socket error: %v", l.engine, err)
+		}
 		l.mu.Lock()
+		l.killing = false
+		l.ownedWorker = false
+		l.cond.Broadcast()
+		l.mu.Unlock()
+		return nil, nil
 	}
 
 	// Connect TTS client - release lock during potentially long operation
@@ -718,6 +891,9 @@ func (l *lazyTTSLoader) EnsureRunning() (*skywebrtc.TTSClient, func()) {
 		l.spawning = false
 		if attachOnly {
 			log.Printf("[WARN] Failed to attach to existing %s TTS worker: %v", l.engine, err)
+			l.running = false
+			l.ttsClient = nil
+			l.ownedWorker = false
 			l.cond.Broadcast()
 			l.mu.Unlock()
 			return nil, nil
@@ -744,6 +920,9 @@ func (l *lazyTTSLoader) EnsureRunning() (*skywebrtc.TTSClient, func()) {
 		l.spawning = false
 		if attachOnly {
 			log.Printf("[WARN] Existing %s TTS socket did not yield a client", l.engine)
+			l.running = false
+			l.ttsClient = nil
+			l.ownedWorker = false
 			l.cond.Broadcast()
 			l.mu.Unlock()
 			return nil, nil
@@ -969,6 +1148,7 @@ func (l *lazySTTLoader) Stop() {
 	}
 	wasRunning := l.running
 	wasSpawning := l.spawning
+	ownedWorker := l.ownedWorker
 	l.inShutdown = true
 	// Set killing to serialize with any in-flight spawn/kill operations
 	if wasRunning || wasSpawning {
@@ -980,22 +1160,31 @@ func (l *lazySTTLoader) Stop() {
 
 	if wasRunning || wasSpawning {
 		if wasRunning {
-			log.Println("[INFO] Stopping STT worker...")
+			if ownedWorker {
+				log.Println("[INFO] Stopping STT worker...")
+			} else {
+				log.Println("[INFO] Detaching from external STT worker...")
+			}
 		}
-		killErr := l.runtime.Kill(l.spec.Name)
-		if killErr != nil {
-			log.Printf("[WARN] Failed to kill STT worker on stop: %v", killErr)
-		}
-		// Clean up socket file
-		if err := os.Remove(l.spec.SocketPath); err != nil && !os.IsNotExist(err) {
-			log.Printf("[WARN] Failed to remove STT socket on stop: %v", err)
+		killErr := error(nil)
+		if ownedWorker {
+			killErr = l.runtime.Kill(l.spec.Name)
+			if killErr != nil {
+				log.Printf("[WARN] Failed to kill STT worker on stop: %v", killErr)
+			}
+			// Clean up socket file
+			if err := os.Remove(l.spec.SocketPath); err != nil && !os.IsNotExist(err) {
+				log.Printf("[WARN] Failed to remove STT socket on stop: %v", err)
+			}
 		}
 		// Update state: only mark as not running if kill succeeded
 		l.mu.Lock()
-		if killErr == nil {
+		if !ownedWorker || killErr == nil {
 			l.running = false
+			l.ownedWorker = false
 		} else if !l.runtime.IsRunning(l.spec.Name) {
 			l.running = false
+			l.ownedWorker = false
 		}
 		l.killing = false
 		l.spawning = false
@@ -1326,10 +1515,22 @@ func main() {
 	workerRuntime := worker.NewRuntime(mgr)
 	ttsEngine := resolveTTSEngine()
 	resolvedSTTSocketPath := resolveSTTSocketPath()
+	resolvedTTSPocketSocketPath := resolveTTSPocketSocketPath()
+	resolvedTTSKyutaiSocketPath := resolveTTSKyutaiSocketPath()
+	manageSTTWorker := shouldManageSTTWorker()
+	manageTTSWorker := shouldManageTTSWorker()
 	sttCommand, sttArgs := resolvePythonWorkerLauncher("workers/python-nemo")
 	ttsPocketCommand, ttsPocketArgs := resolvePythonWorkerLauncher("workers/python-pocket-tts")
 	ttsKyutaiCommand, ttsKyutaiArgs := resolvePythonWorkerLauncher("workers/python-kyutai-tts")
 	log.Printf("[INFO] Active TTS engine: %s", ttsEngine)
+	log.Printf(
+		"[INFO] Worker mode: stt_managed=%t tts_managed=%t stt_socket=%s pocket_socket=%s kyutai_socket=%s",
+		manageSTTWorker,
+		manageTTSWorker,
+		resolvedSTTSocketPath,
+		resolvedTTSPocketSocketPath,
+		resolvedTTSKyutaiSocketPath,
+	)
 
 	sttSpec := worker.Spec{
 		Name:           "stt-worker",
@@ -1340,24 +1541,29 @@ func main() {
 		SocketPath:     resolvedSTTSocketPath,
 		SocketTimeout:  120 * time.Second,
 		ReadinessProbe: "stt-worker",
+		Managed:        manageSTTWorker,
 	}
 	ttsPocketSpec := worker.Spec{
 		Name:           "tts-pocket",
 		Command:        ttsPocketCommand,
 		Args:           ttsPocketArgs,
 		Dir:            "workers/python-pocket-tts",
-		SocketPath:     ttsPocketSocketPath,
+		Env:            []string{"TTS_POCKET_SOCKET=" + resolvedTTSPocketSocketPath},
+		SocketPath:     resolvedTTSPocketSocketPath,
 		SocketTimeout:  120 * time.Second,
 		ReadinessProbe: "pocket",
+		Managed:        manageTTSWorker,
 	}
 	ttsKyutaiSpec := worker.Spec{
 		Name:           "tts-kyutai",
 		Command:        ttsKyutaiCommand,
 		Args:           ttsKyutaiArgs,
 		Dir:            "workers/python-kyutai-tts",
-		SocketPath:     ttsKyutaiSocketPath,
+		Env:            []string{"TTS_KYUTAI_SOCKET=" + resolvedTTSKyutaiSocketPath},
+		SocketPath:     resolvedTTSKyutaiSocketPath,
 		SocketTimeout:  180 * time.Second,
 		ReadinessProbe: "kyutai",
+		Managed:        manageTTSWorker,
 	}
 
 	var ttsLazy *lazyTTSLoader
@@ -1388,15 +1594,19 @@ func main() {
 		}
 	}()
 
-	// STT loader - preloaded at startup, then managed with the existing idle timeout
+	// STT loader - preloaded at startup by default, then managed with the existing idle timeout
 	sttLazy := newLazySTTLoader(ctx, workerRuntime, sttSpec, 60*time.Minute)
 	defer sttLazy.Stop()
-	sttPreloadCleanup := sttLazy.EnsureRunning()
-	if sttPreloadCleanup == nil {
-		log.Fatal("Failed to preload STT worker")
+	if shouldPreloadSTTWorker() {
+		sttPreloadCleanup := sttLazy.EnsureRunning()
+		if sttPreloadCleanup == nil {
+			log.Fatal("Failed to preload STT worker")
+		}
+		sttPreloadCleanup()
+		log.Println("[INFO] STT worker preloaded")
+	} else {
+		log.Println("[INFO] STT worker preload disabled by SKY_AUDIO_PRELOAD_STT")
 	}
-	sttPreloadCleanup()
-	log.Println("[INFO] STT worker preloaded")
 
 	transcripts := newTranscriptHub()
 	peerRegistry := skywebrtc.NewPeerRegistry()
@@ -1678,24 +1888,410 @@ type ttsVoiceCatalog struct {
 	DefaultPadding     int32    `json:"default_padding"`
 }
 
+type pocketLocalVoiceOverlay struct {
+	Default string                     `json:"default,omitempty"`
+	Voices  []string                   `json:"voices,omitempty"`
+	Preload []string                   `json:"preload,omitempty"`
+	Extra   map[string]json.RawMessage `json:"-"`
+}
+
+const pocketDeletedVoicesField = "deleted_voices"
+const pocketDeletedBuiltinVoicesField = "deleted_builtin_voices"
+const pocketVoiceHashesField = "voice_hashes"
+const pocketDeletedVoiceHashesField = "deleted_voice_hashes"
+
+func (o *pocketLocalVoiceOverlay) UnmarshalJSON(data []byte) error {
+	type alias pocketLocalVoiceOverlay
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+
+	rawFields := map[string]json.RawMessage{}
+	if err := json.Unmarshal(data, &rawFields); err != nil {
+		return err
+	}
+	delete(rawFields, "default")
+	delete(rawFields, "voices")
+	delete(rawFields, "preload")
+
+	*o = pocketLocalVoiceOverlay(decoded)
+	if len(rawFields) > 0 {
+		o.Extra = rawFields
+	} else {
+		o.Extra = nil
+	}
+	return nil
+}
+
+func (o pocketLocalVoiceOverlay) MarshalJSON() ([]byte, error) {
+	payload := make(map[string]json.RawMessage, len(o.Extra)+3)
+	for key, value := range o.Extra {
+		payload[key] = value
+	}
+
+	if o.Default != "" {
+		value, err := json.Marshal(o.Default)
+		if err != nil {
+			return nil, err
+		}
+		payload["default"] = value
+	}
+	if len(o.Voices) > 0 {
+		value, err := json.Marshal(o.Voices)
+		if err != nil {
+			return nil, err
+		}
+		payload["voices"] = value
+	}
+	if len(o.Preload) > 0 {
+		value, err := json.Marshal(o.Preload)
+		if err != nil {
+			return nil, err
+		}
+		payload["preload"] = value
+	}
+
+	return json.Marshal(payload)
+}
+
+type voiceCatalogEntry struct {
+	files   voiceCatalogFiles
+	base    ttsVoiceCatalog
+	overlay pocketLocalVoiceOverlay
+}
+
+func copyStringSlice(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	cloned := make([]string, len(values))
+	copy(cloned, values)
+	return cloned
+}
+
+func removeString(values []string, target string) ([]string, bool) {
+	result := make([]string, 0, len(values))
+	found := false
+	for _, value := range values {
+		if value == target {
+			found = true
+			continue
+		}
+		result = append(result, value)
+	}
+	return result, found
+}
+
+func readOverlayStringList(raw json.RawMessage) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	var decoded []string
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return nil
+	}
+	result := make([]string, 0, len(decoded))
+	seen := make(map[string]struct{}, len(decoded))
+	for _, value := range decoded {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+func overlayDeletedVoices(overlay pocketLocalVoiceOverlay) []string {
+	if overlay.Extra == nil {
+		return nil
+	}
+	return readOverlayStringList(overlay.Extra[pocketDeletedVoicesField])
+}
+
+func overlayDeletedBuiltinVoices(overlay pocketLocalVoiceOverlay) []string {
+	if overlay.Extra == nil {
+		return nil
+	}
+	return readOverlayStringList(overlay.Extra[pocketDeletedBuiltinVoicesField])
+}
+
+func readOverlayStringMap(raw json.RawMessage) map[string]string {
+	if len(raw) == 0 {
+		return nil
+	}
+	var decoded map[string]string
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return nil
+	}
+	if len(decoded) == 0 {
+		return nil
+	}
+	result := make(map[string]string, len(decoded))
+	for key, value := range decoded {
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if key == "" || value == "" {
+			continue
+		}
+		result[key] = value
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+func overlayVoiceHashes(overlay pocketLocalVoiceOverlay) map[string]string {
+	if overlay.Extra == nil {
+		return nil
+	}
+	return readOverlayStringMap(overlay.Extra[pocketVoiceHashesField])
+}
+
+func overlayDeletedVoiceHashes(overlay pocketLocalVoiceOverlay) map[string]string {
+	if overlay.Extra == nil {
+		return nil
+	}
+	return readOverlayStringMap(overlay.Extra[pocketDeletedVoiceHashesField])
+}
+
+func setOverlayDeletedVoices(overlay *pocketLocalVoiceOverlay, voices []string) error {
+	if len(voices) == 0 {
+		if overlay.Extra != nil {
+			delete(overlay.Extra, pocketDeletedVoicesField)
+			if len(overlay.Extra) == 0 {
+				overlay.Extra = nil
+			}
+		}
+		return nil
+	}
+	encoded, err := json.Marshal(voices)
+	if err != nil {
+		return err
+	}
+	if overlay.Extra == nil {
+		overlay.Extra = map[string]json.RawMessage{}
+	}
+	overlay.Extra[pocketDeletedVoicesField] = encoded
+	return nil
+}
+
+func addOverlayDeletedVoice(overlay *pocketLocalVoiceOverlay, voice string) error {
+	deletedVoices := overlayDeletedVoices(*overlay)
+	for _, deletedVoice := range deletedVoices {
+		if deletedVoice == voice {
+			return nil
+		}
+	}
+	deletedVoices = append(deletedVoices, voice)
+	return setOverlayDeletedVoices(overlay, deletedVoices)
+}
+
+func setOverlayDeletedBuiltinVoices(overlay *pocketLocalVoiceOverlay, voices []string) error {
+	if len(voices) == 0 {
+		if overlay.Extra != nil {
+			delete(overlay.Extra, pocketDeletedBuiltinVoicesField)
+			if len(overlay.Extra) == 0 {
+				overlay.Extra = nil
+			}
+		}
+		return nil
+	}
+	encoded, err := json.Marshal(voices)
+	if err != nil {
+		return err
+	}
+	if overlay.Extra == nil {
+		overlay.Extra = map[string]json.RawMessage{}
+	}
+	overlay.Extra[pocketDeletedBuiltinVoicesField] = encoded
+	return nil
+}
+
+func addOverlayDeletedBuiltinVoice(overlay *pocketLocalVoiceOverlay, voice string) error {
+	deletedVoices := overlayDeletedBuiltinVoices(*overlay)
+	for _, deletedVoice := range deletedVoices {
+		if deletedVoice == voice {
+			return nil
+		}
+	}
+	deletedVoices = append(deletedVoices, voice)
+	return setOverlayDeletedBuiltinVoices(overlay, deletedVoices)
+}
+
+func setOverlayDeletedVoiceHashes(overlay *pocketLocalVoiceOverlay, hashes map[string]string) error {
+	if len(hashes) == 0 {
+		if overlay.Extra != nil {
+			delete(overlay.Extra, pocketDeletedVoiceHashesField)
+			if len(overlay.Extra) == 0 {
+				overlay.Extra = nil
+			}
+		}
+		return nil
+	}
+	encoded, err := json.Marshal(hashes)
+	if err != nil {
+		return err
+	}
+	if overlay.Extra == nil {
+		overlay.Extra = map[string]json.RawMessage{}
+	}
+	overlay.Extra[pocketDeletedVoiceHashesField] = encoded
+	return nil
+}
+
+func addOverlayDeletedVoiceHash(overlay *pocketLocalVoiceOverlay, voice, hash string) error {
+	hash = strings.TrimSpace(hash)
+	if hash == "" {
+		return nil
+	}
+	hashes := overlayDeletedVoiceHashes(*overlay)
+	if hashes == nil {
+		hashes = map[string]string{}
+	}
+	hashes[voice] = hash
+	return setOverlayDeletedVoiceHashes(overlay, hashes)
+}
+
+func overlayIsEmpty(overlay pocketLocalVoiceOverlay) bool {
+	return overlay.Default == "" && len(overlay.Voices) == 0 && len(overlay.Preload) == 0 && len(overlay.Extra) == 0
+}
+
+func readVoiceCatalog(path string, target any) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(data, target)
+}
+
+func loadBaseVoiceCatalog(engine, path string) (ttsVoiceCatalog, error) {
+	var catalog ttsVoiceCatalog
+	if err := readVoiceCatalog(path, &catalog); err != nil {
+		return ttsVoiceCatalog{}, err
+	}
+	if catalog.Default == "" || len(catalog.Voices) == 0 {
+		return ttsVoiceCatalog{}, fmt.Errorf("%s catalog is empty", engine)
+	}
+	return catalog, nil
+}
+
+func loadPocketLocalVoiceOverlay(path string) (pocketLocalVoiceOverlay, error) {
+	if path == "" {
+		return pocketLocalVoiceOverlay{}, nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return pocketLocalVoiceOverlay{}, nil
+		}
+		return pocketLocalVoiceOverlay{}, err
+	}
+	var overlay pocketLocalVoiceOverlay
+	if err := json.Unmarshal(data, &overlay); err != nil {
+		return pocketLocalVoiceOverlay{}, err
+	}
+	return overlay, nil
+}
+
+func (e voiceCatalogEntry) mergedCatalog() (ttsVoiceCatalog, map[string]struct{}, error) {
+	merged := ttsVoiceCatalog{
+		Default:            e.base.Default,
+		Voices:             nil,
+		DefaultTemperature: e.base.DefaultTemperature,
+		DefaultCfgCoef:     e.base.DefaultCfgCoef,
+		DefaultPadding:     e.base.DefaultPadding,
+	}
+
+	localVoices := make(map[string]struct{}, len(e.overlay.Voices))
+	deletedBuiltinVoices := make(map[string]struct{})
+	for _, voice := range overlayDeletedBuiltinVoices(e.overlay) {
+		deletedBuiltinVoices[voice] = struct{}{}
+	}
+
+	seen := make(map[string]struct{}, len(e.base.Voices)+len(e.overlay.Voices))
+	for _, voice := range e.base.Voices {
+		if voice == "" {
+			return ttsVoiceCatalog{}, nil, fmt.Errorf("base catalog contains empty voice id")
+		}
+		if _, exists := seen[voice]; exists {
+			return ttsVoiceCatalog{}, nil, fmt.Errorf("base catalog contains duplicate voice id %q", voice)
+		}
+		seen[voice] = struct{}{}
+		if _, deleted := deletedBuiltinVoices[voice]; deleted {
+			continue
+		}
+		merged.Voices = append(merged.Voices, voice)
+	}
+
+	for _, voice := range e.overlay.Voices {
+		if voice == "" {
+			return ttsVoiceCatalog{}, nil, fmt.Errorf("pocket local overlay contains empty voice id")
+		}
+		if _, exists := seen[voice]; exists {
+			return ttsVoiceCatalog{}, nil, fmt.Errorf("pocket local voice %q conflicts with base catalog", voice)
+		}
+		seen[voice] = struct{}{}
+		localVoices[voice] = struct{}{}
+		merged.Voices = append(merged.Voices, voice)
+	}
+
+	for _, voice := range e.overlay.Preload {
+		if _, ok := localVoices[voice]; !ok {
+			return ttsVoiceCatalog{}, nil, fmt.Errorf("pocket preload voice %q is not a local overlay voice", voice)
+		}
+	}
+
+	if e.overlay.Default != "" {
+		if _, ok := localVoices[e.overlay.Default]; !ok {
+			return ttsVoiceCatalog{}, nil, fmt.Errorf("pocket local default %q is not a local overlay voice", e.overlay.Default)
+		}
+		merged.Default = e.overlay.Default
+	} else {
+		defaultVisible := false
+		for _, voice := range merged.Voices {
+			if voice == merged.Default {
+				defaultVisible = true
+				break
+			}
+		}
+		if !defaultVisible {
+			if len(merged.Voices) > 0 {
+				merged.Default = merged.Voices[0]
+			} else {
+				merged.Default = ""
+			}
+		}
+	}
+
+	return merged, localVoices, nil
+}
+
 // voiceCatalogManager handles mutable voice catalogs with thread-safe access.
 // It supports updating defaults and deleting voices while keeping the catalog
 // in sync with the JSON files on disk.
 type voiceCatalogManager struct {
-	mu       sync.RWMutex
-	catalogs map[string]ttsVoiceCatalog
-	paths    map[string]string
+	mu      sync.RWMutex
+	entries map[string]voiceCatalogEntry
 }
 
 // newVoiceCatalogManager creates a manager and loads initial catalogs from disk.
-func newVoiceCatalogManager(paths map[string]string) (*voiceCatalogManager, error) {
-	catalogs, err := loadTTSVoiceCatalogs(paths)
+func newVoiceCatalogManager(paths map[string]voiceCatalogFiles) (*voiceCatalogManager, error) {
+	entries, err := loadTTSVoiceCatalogs(paths)
 	if err != nil {
 		return nil, err
 	}
 	return &voiceCatalogManager{
-		catalogs: catalogs,
-		paths:    paths,
+		entries: entries,
 	}, nil
 }
 
@@ -1704,17 +2300,14 @@ func (m *voiceCatalogManager) Get() map[string]ttsVoiceCatalog {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	result := make(map[string]ttsVoiceCatalog, len(m.catalogs))
-	for engine, catalog := range m.catalogs {
-		voicesCopy := make([]string, len(catalog.Voices))
-		copy(voicesCopy, catalog.Voices)
-		result[engine] = ttsVoiceCatalog{
-			Default:            catalog.Default,
-			Voices:             voicesCopy,
-			DefaultTemperature: catalog.DefaultTemperature,
-			DefaultCfgCoef:     catalog.DefaultCfgCoef,
-			DefaultPadding:     catalog.DefaultPadding,
+	result := make(map[string]ttsVoiceCatalog, len(m.entries))
+	for engine, entry := range m.entries {
+		catalog, _, err := entry.mergedCatalog()
+		if err != nil {
+			log.Printf("[tts] failed to merge %s voice catalog: %v", engine, err)
+			continue
 		}
+		result[engine] = catalog
 	}
 	return result
 }
@@ -1724,9 +2317,14 @@ func (m *voiceCatalogManager) SetDefault(engine, voice string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	catalog, ok := m.catalogs[engine]
+	entry, ok := m.entries[engine]
 	if !ok {
 		return fmt.Errorf("unknown engine: %s", engine)
+	}
+
+	catalog, localVoices, err := entry.mergedCatalog()
+	if err != nil {
+		return fmt.Errorf("merge catalog: %w", err)
 	}
 
 	// Verify the voice exists in the catalog
@@ -1741,11 +2339,16 @@ func (m *voiceCatalogManager) SetDefault(engine, voice string) error {
 		return fmt.Errorf("voice not found: %s", voice)
 	}
 
-	catalog.Default = voice
-	m.catalogs[engine] = catalog
+	if _, isLocalVoice := localVoices[voice]; isLocalVoice {
+		entry.overlay.Default = voice
+	} else {
+		entry.base.Default = voice
+		entry.overlay.Default = ""
+	}
+	m.entries[engine] = entry
 
 	// Persist to disk while holding lock (low-frequency admin operation)
-	if err := m.saveCatalog(engine, catalog); err != nil {
+	if err := m.saveCatalog(engine, entry); err != nil {
 		return fmt.Errorf("failed to save catalog: %w", err)
 	}
 
@@ -1758,71 +2361,156 @@ func (m *voiceCatalogManager) DeleteVoice(engine, voice string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	catalog, ok := m.catalogs[engine]
+	entry, ok := m.entries[engine]
 	if !ok {
 		return fmt.Errorf("unknown engine: %s", engine)
 	}
 
-	// Find and remove the voice
-	newVoices := make([]string, 0, len(catalog.Voices)-1)
-	found := false
-	for _, v := range catalog.Voices {
-		if v == voice {
-			found = true
-			continue
+	_, localVoices, err := entry.mergedCatalog()
+	if err != nil {
+		return fmt.Errorf("merge catalog: %w", err)
+	}
+
+	if _, isLocalVoice := localVoices[voice]; isLocalVoice {
+		var found bool
+		entry.overlay.Voices, found = removeString(entry.overlay.Voices, voice)
+		if !found {
+			return fmt.Errorf("voice not found: %s", voice)
 		}
-		newVoices = append(newVoices, v)
-	}
-	if !found {
-		return fmt.Errorf("voice not found: %s", voice)
-	}
-
-	catalog.Voices = newVoices
-
-	// If we deleted the default voice, pick a new default (or clear if empty)
-	if catalog.Default == voice {
-		if len(catalog.Voices) > 0 {
-			catalog.Default = catalog.Voices[0]
-		} else {
-			catalog.Default = ""
+		entry.overlay.Preload, _ = removeString(entry.overlay.Preload, voice)
+		if entry.overlay.Default == voice {
+			entry.overlay.Default = ""
+		}
+		if err := addOverlayDeletedVoice(&entry.overlay, voice); err != nil {
+			return fmt.Errorf("record deleted local voice: %w", err)
+		}
+		if hash := overlayVoiceHashes(entry.overlay)[voice]; hash != "" {
+			if err := addOverlayDeletedVoiceHash(&entry.overlay, voice, hash); err != nil {
+				return fmt.Errorf("record deleted local voice hash: %w", err)
+			}
+		}
+	} else {
+		found := false
+		for _, existingVoice := range entry.base.Voices {
+			if existingVoice == voice {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("voice not found: %s", voice)
+		}
+		if err := addOverlayDeletedBuiltinVoice(&entry.overlay, voice); err != nil {
+			return fmt.Errorf("record deleted built-in voice: %w", err)
 		}
 	}
 
-	m.catalogs[engine] = catalog
+	if _, _, err := entry.mergedCatalog(); err != nil {
+		return fmt.Errorf("merge catalog: %w", err)
+	}
 
-	// Persist to disk while holding lock (low-frequency admin operation)
-	if err := m.saveCatalog(engine, catalog); err != nil {
+	m.entries[engine] = entry
+
+	if err := m.saveCatalog(engine, entry); err != nil {
 		return fmt.Errorf("failed to save catalog: %w", err)
 	}
 
 	return nil
 }
 
-// saveCatalog writes a single engine's catalog to its JSON file.
-// The catalog must be passed directly (captured while holding the lock);
-// this method does NOT read from m.catalogs.
-func (m *voiceCatalogManager) saveCatalog(engine string, catalog ttsVoiceCatalog) error {
-	path, ok := m.paths[engine]
-	if !ok {
-		return fmt.Errorf("unknown engine path: %s", engine)
-	}
-
+func saveVoiceCatalogFile(path string, catalog any) error {
 	data, err := json.MarshalIndent(catalog, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal catalog: %w", err)
 	}
 	data = append(data, '\n')
 
-	if err := os.WriteFile(path, data, 0644); err != nil {
-		return fmt.Errorf("write catalog file: %w", err)
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return fmt.Errorf("create catalog directory: %w", err)
+	}
+	tempFile, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temp catalog file: %w", err)
+	}
+	tempPath := tempFile.Name()
+	defer func() {
+		_ = os.Remove(tempPath)
+	}()
+
+	if _, err := tempFile.Write(data); err != nil {
+		_ = tempFile.Close()
+		return fmt.Errorf("write temp catalog file: %w", err)
+	}
+	if err := tempFile.Chmod(0644); err != nil {
+		_ = tempFile.Close()
+		return fmt.Errorf("chmod temp catalog file: %w", err)
+	}
+	if err := tempFile.Close(); err != nil {
+		return fmt.Errorf("close temp catalog file: %w", err)
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		return fmt.Errorf("replace catalog file: %w", err)
+	}
+	return nil
+}
+
+// saveCatalog writes a single engine's catalog to disk.
+func (m *voiceCatalogManager) saveCatalog(engine string, entry voiceCatalogEntry) error {
+	if entry.files.BasePath == "" {
+		return fmt.Errorf("unknown engine path: %s", engine)
+	}
+	if err := saveVoiceCatalogFile(entry.files.BasePath, entry.base); err != nil {
+		return err
 	}
 
+	if entry.files.OverlayPath == "" {
+		return nil
+	}
+
+	if overlayIsEmpty(entry.overlay) {
+		if err := os.Remove(entry.files.OverlayPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove overlay file: %w", err)
+		}
+		return nil
+	}
+
+	if err := saveVoiceCatalogFile(entry.files.OverlayPath, entry.overlay); err != nil {
+		return err
+	}
 	return nil
 }
 
 // MarshalJSON returns the current catalogs as JSON (for HTTP responses).
 func (m *voiceCatalogManager) MarshalJSON() ([]byte, error) {
 	return json.Marshal(m.Get())
+}
+
+func loadTTSVoiceCatalogs(paths map[string]voiceCatalogFiles) (map[string]voiceCatalogEntry, error) {
+	catalogs := make(map[string]voiceCatalogEntry, len(paths))
+	for engine, files := range paths {
+		baseCatalog, err := loadBaseVoiceCatalog(engine, files.BasePath)
+		if err != nil {
+			return nil, fmt.Errorf("read %s catalog: %w", engine, err)
+		}
+
+		entry := voiceCatalogEntry{
+			files: files,
+			base:  baseCatalog,
+		}
+		if engine == "pocket" && files.OverlayPath != "" {
+			overlay, err := loadPocketLocalVoiceOverlay(files.OverlayPath)
+			if err != nil {
+				return nil, fmt.Errorf("read %s local overlay: %w", engine, err)
+			}
+			entry.overlay = overlay
+		}
+
+		if _, _, err := entry.mergedCatalog(); err != nil {
+			return nil, fmt.Errorf("merge %s catalog: %w", engine, err)
+		}
+		catalogs[engine] = entry
+	}
+	return catalogs, nil
 }
 
 type ttsSynthesizer interface {
@@ -1860,25 +2548,6 @@ func (s *lazyAPITTSSynthesizer) Synthesize(ctx context.Context, text, voice stri
 		defer cleanup()
 	}
 	return client.Synthesize(ctx, text, voice, opts)
-}
-
-func loadTTSVoiceCatalogs(paths map[string]string) (map[string]ttsVoiceCatalog, error) {
-	catalogs := make(map[string]ttsVoiceCatalog, len(paths))
-	for engine, path := range paths {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return nil, fmt.Errorf("read %s catalog: %w", engine, err)
-		}
-		var catalog ttsVoiceCatalog
-		if err := json.Unmarshal(data, &catalog); err != nil {
-			return nil, fmt.Errorf("decode %s catalog: %w", engine, err)
-		}
-		if catalog.Default == "" || len(catalog.Voices) == 0 {
-			return nil, fmt.Errorf("%s catalog is empty", engine)
-		}
-		catalogs[engine] = catalog
-	}
-	return catalogs, nil
 }
 
 func ttsVoicesHandler(mgr *voiceCatalogManager) http.HandlerFunc {

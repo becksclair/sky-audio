@@ -15,27 +15,45 @@ import (
 	skywebrtc "github.com/heliasar/sky-audio/gateway/pkg/webrtc"
 )
 
-// TestVoiceCatalogManager_SetDefault tests setting the default voice
-func TestVoiceCatalogManager_SetDefault(t *testing.T) {
+func writeJSONFile(t *testing.T, path string, value any) {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal %s: %v", path, err)
+	}
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+func newPocketCatalogManager(t *testing.T, base ttsVoiceCatalog, overlay pocketLocalVoiceOverlay) (*voiceCatalogManager, string, string) {
+	t.Helper()
 	tmpDir := t.TempDir()
-
-	// Create initial catalog files
-	pocketPath := filepath.Join(tmpDir, "pocket.json")
-	pocketCatalog := ttsVoiceCatalog{
-		Default: "alba",
-		Voices:  []string{"alba", "anna", "george"},
+	basePath := filepath.Join(tmpDir, "pocket.json")
+	overlayPath := filepath.Join(tmpDir, "pocket.local.json")
+	writeJSONFile(t, basePath, base)
+	if !overlayIsEmpty(overlay) {
+		writeJSONFile(t, overlayPath, overlay)
 	}
-	data, _ := json.Marshal(pocketCatalog)
-	os.WriteFile(pocketPath, data, 0644)
-
-	paths := map[string]string{
-		"pocket": pocketPath,
-	}
-
-	mgr, err := newVoiceCatalogManager(paths)
+	mgr, err := newVoiceCatalogManager(map[string]voiceCatalogFiles{
+		"pocket": {
+			BasePath:    basePath,
+			OverlayPath: overlayPath,
+		},
+	})
 	if err != nil {
 		t.Fatalf("Failed to create manager: %v", err)
 	}
+	return mgr, basePath, overlayPath
+}
+
+// TestVoiceCatalogManager_SetDefault tests setting the default voice
+func TestVoiceCatalogManager_SetDefault(t *testing.T) {
+	mgr, pocketPath, overlayPath := newPocketCatalogManager(
+		t,
+		ttsVoiceCatalog{Default: "alba", Voices: []string{"alba", "anna", "george"}},
+		pocketLocalVoiceOverlay{},
+	)
 
 	// Test setting valid default
 	if err := mgr.SetDefault("pocket", "anna"); err != nil {
@@ -48,11 +66,14 @@ func TestVoiceCatalogManager_SetDefault(t *testing.T) {
 	}
 
 	// Verify persistence
-	data, _ = os.ReadFile(pocketPath)
+	data, _ := os.ReadFile(pocketPath)
 	var persisted ttsVoiceCatalog
 	json.Unmarshal(data, &persisted)
 	if persisted.Default != "anna" {
 		t.Errorf("Expected persisted default 'anna', got %s", persisted.Default)
+	}
+	if _, err := os.Stat(overlayPath); !os.IsNotExist(err) {
+		t.Fatalf("expected no overlay file for built-in default, got err=%v", err)
 	}
 
 	// Test setting invalid voice
@@ -68,21 +89,11 @@ func TestVoiceCatalogManager_SetDefault(t *testing.T) {
 
 // TestVoiceCatalogManager_DeleteVoice tests voice deletion
 func TestVoiceCatalogManager_DeleteVoice(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	pocketPath := filepath.Join(tmpDir, "pocket.json")
-	pocketCatalog := ttsVoiceCatalog{
-		Default: "alba",
-		Voices:  []string{"alba", "anna", "george"},
-	}
-	data, _ := json.Marshal(pocketCatalog)
-	os.WriteFile(pocketPath, data, 0644)
-
-	paths := map[string]string{
-		"pocket": pocketPath,
-	}
-
-	mgr, _ := newVoiceCatalogManager(paths)
+	mgr, _, _ := newPocketCatalogManager(
+		t,
+		ttsVoiceCatalog{Default: "alba", Voices: []string{"alba", "anna", "george"}},
+		pocketLocalVoiceOverlay{},
+	)
 
 	// Delete non-default voice
 	if err := mgr.DeleteVoice("pocket", "anna"); err != nil {
@@ -102,21 +113,11 @@ func TestVoiceCatalogManager_DeleteVoice(t *testing.T) {
 
 // TestVoiceCatalogManager_DeleteVoice_EmptysCatalog tests deleting the last voice
 func TestVoiceCatalogManager_DeleteVoice_EmptysCatalog(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	pocketPath := filepath.Join(tmpDir, "pocket.json")
-	pocketCatalog := ttsVoiceCatalog{
-		Default: "alba",
-		Voices:  []string{"alba"},
-	}
-	data, _ := json.Marshal(pocketCatalog)
-	os.WriteFile(pocketPath, data, 0644)
-
-	paths := map[string]string{
-		"pocket": pocketPath,
-	}
-
-	mgr, _ := newVoiceCatalogManager(paths)
+	mgr, pocketPath, overlayPath := newPocketCatalogManager(
+		t,
+		ttsVoiceCatalog{Default: "alba", Voices: []string{"alba"}},
+		pocketLocalVoiceOverlay{},
+	)
 
 	// Delete the only voice (which is also the default)
 	if err := mgr.DeleteVoice("pocket", "alba"); err != nil {
@@ -134,31 +135,33 @@ func TestVoiceCatalogManager_DeleteVoice_EmptysCatalog(t *testing.T) {
 	}
 
 	// Verify persistence
-	data, _ = os.ReadFile(pocketPath)
+	data, _ := os.ReadFile(pocketPath)
 	var persisted ttsVoiceCatalog
 	json.Unmarshal(data, &persisted)
-	if persisted.Default != "" {
-		t.Errorf("Expected persisted empty default, got %s", persisted.Default)
+	if persisted.Default != "alba" {
+		t.Errorf("Expected persisted baked default 'alba', got %s", persisted.Default)
+	}
+	if got := strings.Join(persisted.Voices, ","); got != "alba" {
+		t.Fatalf("expected persisted baked voices to remain unchanged, got %s", got)
+	}
+
+	var overlay pocketLocalVoiceOverlay
+	overlayData, _ := os.ReadFile(overlayPath)
+	if err := json.Unmarshal(overlayData, &overlay); err != nil {
+		t.Fatalf("unmarshal overlay: %v", err)
+	}
+	if got := strings.Join(overlayDeletedBuiltinVoices(overlay), ","); got != "alba" {
+		t.Fatalf("unexpected deleted built-in tombstones after delete: %s", got)
 	}
 }
 
 // TestVoiceCatalogManager_Get_ReturnsCopy tests that Get returns a copy
 func TestVoiceCatalogManager_Get_ReturnsCopy(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	pocketPath := filepath.Join(tmpDir, "pocket.json")
-	pocketCatalog := ttsVoiceCatalog{
-		Default: "alba",
-		Voices:  []string{"alba"},
-	}
-	data, _ := json.Marshal(pocketCatalog)
-	os.WriteFile(pocketPath, data, 0644)
-
-	paths := map[string]string{
-		"pocket": pocketPath,
-	}
-
-	mgr, _ := newVoiceCatalogManager(paths)
+	mgr, _, _ := newPocketCatalogManager(
+		t,
+		ttsVoiceCatalog{Default: "alba", Voices: []string{"alba"}},
+		pocketLocalVoiceOverlay{},
+	)
 
 	// Get first copy
 	catalog1 := mgr.Get()
@@ -176,10 +179,188 @@ func TestVoiceCatalogManager_Get_ReturnsCopy(t *testing.T) {
 	if catalog2["pocket"].Default != "alba" {
 		t.Error("Get() returned mutable data - default was modified")
 	}
-	// Note: The shallow copy means the voices slice might be shared
-	// This test documents the current behavior - a full deep copy would be needed
-	// to prevent any modification, but the important part is the catalog structure
-	// (Default, Voices slice header) is copied, not shared
+	if catalog2["pocket"].Voices[0] != "alba" {
+		t.Error("Get() returned mutable data - voices slice was modified")
+	}
+}
+
+func TestVoiceCatalogManager_LoadsMergedPocketOverlay(t *testing.T) {
+	mgr, _, _ := newPocketCatalogManager(
+		t,
+		ttsVoiceCatalog{Default: "alba", Voices: []string{"alba", "anna"}},
+		pocketLocalVoiceOverlay{
+			Default: "henry2",
+			Voices:  []string{"henry2", "her"},
+			Preload: []string{"henry2", "her"},
+		},
+	)
+
+	catalog := mgr.Get()["pocket"]
+	if catalog.Default != "henry2" {
+		t.Fatalf("expected merged default henry2, got %s", catalog.Default)
+	}
+	if got := strings.Join(catalog.Voices, ","); got != "alba,anna,henry2,her" {
+		t.Fatalf("unexpected merged voices: %s", got)
+	}
+}
+
+func TestVoiceCatalogManager_SetDefault_LocalVoicePersistsToOverlay(t *testing.T) {
+	mgr, pocketPath, overlayPath := newPocketCatalogManager(
+		t,
+		ttsVoiceCatalog{Default: "alba", Voices: []string{"alba", "anna"}},
+		pocketLocalVoiceOverlay{
+			Voices:  []string{"henry2", "her"},
+			Preload: []string{"henry2", "her"},
+		},
+	)
+
+	if err := mgr.SetDefault("pocket", "her"); err != nil {
+		t.Fatalf("set local default: %v", err)
+	}
+
+	catalog := mgr.Get()["pocket"]
+	if catalog.Default != "her" {
+		t.Fatalf("expected merged default her, got %s", catalog.Default)
+	}
+
+	var persistedBase ttsVoiceCatalog
+	baseData, _ := os.ReadFile(pocketPath)
+	if err := json.Unmarshal(baseData, &persistedBase); err != nil {
+		t.Fatalf("unmarshal base catalog: %v", err)
+	}
+	if persistedBase.Default != "alba" {
+		t.Fatalf("expected built-in base default to remain alba, got %s", persistedBase.Default)
+	}
+
+	var overlay pocketLocalVoiceOverlay
+	overlayData, _ := os.ReadFile(overlayPath)
+	if err := json.Unmarshal(overlayData, &overlay); err != nil {
+		t.Fatalf("unmarshal overlay: %v", err)
+	}
+	if overlay.Default != "her" {
+		t.Fatalf("expected overlay default her, got %s", overlay.Default)
+	}
+}
+
+func TestVoiceCatalogManager_DeleteVoice_LocalVoiceUpdatesOverlay(t *testing.T) {
+	mgr, _, overlayPath := newPocketCatalogManager(
+		t,
+		ttsVoiceCatalog{Default: "alba", Voices: []string{"alba", "anna"}},
+		pocketLocalVoiceOverlay{
+			Default: "henry2",
+			Voices:  []string{"henry2", "her"},
+			Preload: []string{"henry2", "her"},
+		},
+	)
+
+	if err := mgr.DeleteVoice("pocket", "henry2"); err != nil {
+		t.Fatalf("delete local voice: %v", err)
+	}
+
+	catalog := mgr.Get()["pocket"]
+	if catalog.Default != "alba" {
+		t.Fatalf("expected default to fall back to base alba, got %s", catalog.Default)
+	}
+	if got := strings.Join(catalog.Voices, ","); got != "alba,anna,her" {
+		t.Fatalf("unexpected merged voices after delete: %s", got)
+	}
+
+	var overlay pocketLocalVoiceOverlay
+	overlayData, _ := os.ReadFile(overlayPath)
+	if err := json.Unmarshal(overlayData, &overlay); err != nil {
+		t.Fatalf("unmarshal overlay: %v", err)
+	}
+	if overlay.Default != "" {
+		t.Fatalf("expected cleared overlay default, got %s", overlay.Default)
+	}
+	if got := strings.Join(overlay.Voices, ","); got != "her" {
+		t.Fatalf("unexpected overlay voices after delete: %s", got)
+	}
+	if got := strings.Join(overlay.Preload, ","); got != "her" {
+		t.Fatalf("unexpected overlay preload after delete: %s", got)
+	}
+	deletedVoices := overlayDeletedVoices(overlay)
+	if got := strings.Join(deletedVoices, ","); got != "henry2" {
+		t.Fatalf("unexpected deleted local voice tombstones after delete: %s", got)
+	}
+}
+
+func TestVoiceCatalogManager_DeleteVoice_BuiltInVoiceUpdatesOverlay(t *testing.T) {
+	mgr, pocketPath, overlayPath := newPocketCatalogManager(
+		t,
+		ttsVoiceCatalog{Default: "alba", Voices: []string{"alba", "anna"}},
+		pocketLocalVoiceOverlay{},
+	)
+
+	if err := mgr.DeleteVoice("pocket", "anna"); err != nil {
+		t.Fatalf("delete built-in voice: %v", err)
+	}
+
+	catalog := mgr.Get()["pocket"]
+	if got := strings.Join(catalog.Voices, ","); got != "alba" {
+		t.Fatalf("unexpected merged voices after built-in delete: %s", got)
+	}
+	if catalog.Default != "alba" {
+		t.Fatalf("expected default to remain alba, got %s", catalog.Default)
+	}
+
+	var persistedBase ttsVoiceCatalog
+	baseData, _ := os.ReadFile(pocketPath)
+	if err := json.Unmarshal(baseData, &persistedBase); err != nil {
+		t.Fatalf("unmarshal base catalog: %v", err)
+	}
+	if got := strings.Join(persistedBase.Voices, ","); got != "alba,anna" {
+		t.Fatalf("expected baked base voices to remain unchanged, got %s", got)
+	}
+
+	var overlay pocketLocalVoiceOverlay
+	overlayData, _ := os.ReadFile(overlayPath)
+	if err := json.Unmarshal(overlayData, &overlay); err != nil {
+		t.Fatalf("unmarshal overlay: %v", err)
+	}
+	if got := strings.Join(overlayDeletedBuiltinVoices(overlay), ","); got != "anna" {
+		t.Fatalf("unexpected deleted built-in voice tombstones after delete: %s", got)
+	}
+}
+
+func TestVoiceCatalogManager_SetDefault_PreservesUnknownOverlayFields(t *testing.T) {
+	mgr, _, overlayPath := newPocketCatalogManager(
+		t,
+		ttsVoiceCatalog{Default: "alba", Voices: []string{"alba", "anna"}},
+		pocketLocalVoiceOverlay{
+			Voices:  []string{"henry2", "her"},
+			Preload: []string{"henry2", "her"},
+			Extra: map[string]json.RawMessage{
+				"label":   json.RawMessage(`"Local clones"`),
+				"weights": json.RawMessage(`{"henry2":1}`),
+			},
+		},
+	)
+
+	if err := mgr.SetDefault("pocket", "her"); err != nil {
+		t.Fatalf("set local default: %v", err)
+	}
+
+	overlayData, err := os.ReadFile(overlayPath)
+	if err != nil {
+		t.Fatalf("read overlay: %v", err)
+	}
+
+	var persisted map[string]json.RawMessage
+	if err := json.Unmarshal(overlayData, &persisted); err != nil {
+		t.Fatalf("unmarshal overlay: %v", err)
+	}
+
+	if got := string(persisted["label"]); got != `"Local clones"` {
+		t.Fatalf("expected label field to survive round-trip, got %s", got)
+	}
+	var weights map[string]int
+	if err := json.Unmarshal(persisted["weights"], &weights); err != nil {
+		t.Fatalf("unmarshal weights field: %v", err)
+	}
+	if weights["henry2"] != 1 {
+		t.Fatalf("expected weights field to survive round-trip, got %+v", weights)
+	}
 }
 
 // TestTrackedSession verifies Close() calls onClose exactly once

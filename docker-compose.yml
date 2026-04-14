@@ -1,29 +1,110 @@
 services:
-  sky-audio:
-    build: .
-    image: sky-audio:latest
-    container_name: sky-audio
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.compose
+      target: gateway-runtime
+      provenance: false
+      sbom: false
+    image: sky-audio-gateway:latest
     restart: unless-stopped
+    init: true
+    depends_on:
+      stt:
+        condition: service_healthy
+      pocket:
+        condition: service_healthy
     ports:
-      - "${PORT:-8686}:${PORT:-8686}"
+      - "127.0.0.1:${PORT:-8585}:${PORT:-8585}"
     environment:
-      - TTS_ENGINE=${TTS_ENGINE:-pocket}
-      - PORT=${PORT:-8686}
-      - SKY_AUDIO_API_KEY=${SKY_AUDIO_API_KEY:-}
-    # volumes:
-    #   # Optional: mount custom voices
-    #   - ./custom-voices:/app/workers/python-pocket-tts/voices
-    # healthcheck:
-    #   test: ["CMD", "curl", "-f", "http://localhost:${PORT:-8585}/health"]
-    #   interval: 30s
-    #   timeout: 10s
-    #   retries: 3
+      TTS_ENGINE: pocket
+      PORT: ${PORT:-8585}
+      SKY_AUDIO_API_KEY: ${SKY_AUDIO_API_KEY:-sky-audio-local-dev}
+      SKY_AUDIO_PRELOAD_STT: ${SKY_AUDIO_PRELOAD_STT:-1}
+      SKY_AUDIO_EXTERNAL_STT: "1"
+      SKY_AUDIO_EXTERNAL_TTS: "1"
+      SKY_AUDIO_TTS_POCKET_BASE_CATALOG: /state/pocket/voices.json
+      SKY_AUDIO_TTS_POCKET_OVERLAY: /state/pocket/voices.local.json
+      SKY_AUDIO_STT_SOCKET: /sockets/sky-audio-stt.sock
+      SKY_AUDIO_TTS_POCKET_SOCKET: /sockets/sky-audio-tts-pocket.sock
+      SKY_AUDIO_TTS_KYUTAI_SOCKET: /sockets/sky-audio-tts-kyutai.sock
+    volumes:
+      - sky-audio-sockets:/sockets
+      - sky-audio-pocket-state:/state/pocket
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${PORT:-8585}/health', timeout=5).read()"
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
 
-    ## --- GPU support (uncomment for Kyutai with NVIDIA GPU) ---
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: 1
-    #           capabilities: [gpu]
+  pocket:
+    build:
+      context: .
+      dockerfile: Dockerfile.compose
+      target: pocket-worker-runtime
+      provenance: false
+      sbom: false
+    image: sky-audio-pocket-worker:latest
+    restart: unless-stopped
+    init: true
+    environment:
+      TTS_POCKET_MANIFEST_PATH: /state/pocket/voices.json
+      TTS_POCKET_LOCAL_MANIFEST_PATH: /state/pocket/voices.local.json
+      TTS_POCKET_LOCAL_VOICE_DIR: /state/pocket/voices/local
+      TTS_POCKET_SOCKET: /sockets/sky-audio-tts-pocket.sock
+    command:
+      - sh
+      - -lc
+      - >
+        /app/workers/python-pocket-tts/.venv/bin/python /app/workers/python-pocket-tts/sync_shared_state.py &&
+        rm -f "$$TTS_POCKET_SOCKET" &&
+        exec /app/workers/python-pocket-tts/.venv/bin/python /app/workers/python-pocket-tts/main.py
+    volumes:
+      - sky-audio-sockets:/sockets
+      - sky-audio-pocket-state:/state/pocket
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - test -S /sockets/sky-audio-tts-pocket.sock
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  stt:
+    build:
+      context: .
+      dockerfile: Dockerfile.compose
+      target: stt-worker-runtime
+      provenance: false
+      sbom: false
+    image: sky-audio-stt-worker:latest
+    restart: unless-stopped
+    init: true
+    gpus: all
+    environment:
+      STT_SOCKET: /sockets/sky-audio-stt.sock
+      STT_DEVICE: cuda
+    command:
+      - sh
+      - -lc
+      - rm -f "$$STT_SOCKET" && exec /app/workers/python-nemo/.venv/bin/python /app/workers/python-nemo/main.py
+    volumes:
+      - sky-audio-sockets:/sockets
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - test -S /sockets/sky-audio-stt.sock
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 20s
+
+volumes:
+  sky-audio-sockets:
+  sky-audio-pocket-state:

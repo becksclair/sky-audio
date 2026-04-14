@@ -115,6 +115,10 @@ run = "cd workers/python-nemo && uv run python streaming_eval.py"
 description = "Run PocketTTS worker standalone (for debugging)"
 run = "cd workers/python-pocket-tts && uv run python main.py"
 
+[tasks."tts:sync:pocket-local"]
+description = "Sync local cloned Pocket voices into worker assets and overlay manifest"
+run = "python3 workers/python-pocket-tts/sync_custom_voices.py"
+
 [tasks."worker:tts-kyutai"]
 description = "Run KyutaiTTS worker standalone (for debugging)"
 run = "cd workers/python-kyutai-tts && uv run python main.py"
@@ -130,3 +134,45 @@ run = "cd workers/python-kyutai-tts && uv run python prefetch_voices.py"
 [tasks."tts:prefetch"]
 description = "Download and catalog all TTS voices locally"
 depends = ["tts:prefetch:pocket", "tts:prefetch:kyutai"]
+
+[tasks."docker:build"]
+description = "Build the default local Docker Compose stack (gateway + Pocket + STT)"
+run = "docker compose build gateway pocket stt"
+
+[tasks."docker:up"]
+description = "Rebuild and run the default Pocket + GPU STT Docker deployment locally"
+depends = ["docker:build"]
+run = "docker compose up -d --force-recreate --remove-orphans gateway pocket stt"
+
+[tasks."docker:down"]
+description = "Stop the local Docker deployment without deleting persistent volumes"
+run = "docker compose down --remove-orphans"
+
+[tasks."docker:reset"]
+description = "Stop the local Docker deployment and delete persistent volumes"
+run = "docker compose down -v --remove-orphans"
+
+[tasks."docker:logs"]
+description = "Tail logs from the default Pocket + GPU STT Docker deployment"
+run = "docker compose logs -f gateway pocket stt"
+
+[tasks."docker:build:kyutai"]
+description = "Build the alternate Kyutai + CPU STT Docker deployment images"
+run = "docker compose -f docker-compose.kyutai.yml build gateway stt kyutai"
+
+[tasks."docker:up:kyutai"]
+description = "Run the alternate Kyutai + CPU STT Docker deployment locally"
+depends = ["docker:build:kyutai"]
+run = "docker compose -f docker-compose.kyutai.yml up -d --force-recreate --remove-orphans gateway stt kyutai"
+
+[tasks."docker:down:kyutai"]
+description = "Stop the alternate Kyutai + CPU STT Docker deployment without deleting persistent volumes"
+run = "docker compose -f docker-compose.kyutai.yml down --remove-orphans"
+
+[tasks."docker:reset:kyutai"]
+description = "Stop the alternate Kyutai + CPU STT Docker deployment and delete persistent volumes"
+run = "docker compose -f docker-compose.kyutai.yml down -v --remove-orphans"
+
+[tasks."docker:logs:kyutai"]
+description = "Tail logs from the alternate Kyutai + CPU STT Docker deployment"
+run = "docker compose -f docker-compose.kyutai.yml logs -f gateway stt kyutai"

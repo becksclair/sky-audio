@@ -1,0 +1,229 @@
+# sky-audio compose-first container targets
+#
+# This file defines separate images for the gateway, Pocket TTS, NeMo STT, and
+# Kyutai TTS so Docker Compose can build and run the stack as distinct services
+# instead of forcing one giant all-in-one artifact through the daemon.
+
+FROM oven/bun:1 AS dashboard-builder
+WORKDIR /src/dashboard
+COPY dashboard/package.json dashboard/bun.lock ./
+RUN bun install --frozen-lockfile
+COPY dashboard/ ./
+RUN bun run build
+
+FROM golang:1.26-bookworm AS gateway-builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    wget ca-certificates pkg-config libopus-dev libopusfile-dev && \
+    wget -qL https://github.com/microsoft/onnxruntime/releases/download/v1.24.4/onnxruntime-linux-x64-1.24.4.tgz && \
+    tar xzf onnxruntime-linux-x64-1.24.4.tgz && \
+    mkdir -p /usr/local/lib/onnxruntime /usr/local/include/onnxruntime && \
+    cp -r onnxruntime-linux-x64-1.24.4/lib/* /usr/local/lib/onnxruntime/ && \
+    cp -r onnxruntime-linux-x64-1.24.4/include/* /usr/local/include/onnxruntime/ && \
+    ldconfig && \
+    rm -rf onnxruntime-linux-x64-1.24.4*
+WORKDIR /src
+COPY go.work go.work.sum ./
+COPY gateway/go.mod gateway/go.sum ./gateway/
+RUN cd gateway && go mod download
+COPY --from=dashboard-builder /src/dashboard/dist/ ./gateway/pkg/dashboard/dist/
+COPY gateway/ ./gateway/
+ENV CGO_LDFLAGS='-L/usr/local/lib/onnxruntime -lonnxruntime -Wl,-rpath,/usr/local/lib/onnxruntime'
+ENV CGO_CFLAGS='-I/usr/local/include/onnxruntime'
+RUN cd gateway && go build -o /sky-audio ./cmd/sky-audio
+
+FROM debian:bookworm-slim AS pocket-overlay-builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    python3 \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY custom-voices/ ./custom-voices/
+COPY workers/python-pocket-tts/ ./workers/python-pocket-tts/
+RUN python3 /app/workers/python-pocket-tts/sync_custom_voices.py
+
+FROM debian:bookworm-slim AS python-builder-base
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    python3 \
+    python3-dev \
+    build-essential \
+    gcc \
+    libc6-dev \
+    ffmpeg \
+    libopus0 \
+    libopusfile0 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+ENV UV_LINK_MODE=copy
+ENV UV_PYTHON_INSTALL_DIR=/opt/sky-audio-python
+ENV HF_HOME=/opt/sky-audio-model-cache/huggingface
+ENV HF_HUB_CACHE=/opt/sky-audio-model-cache/huggingface/hub
+ENV HF_HUB_DISABLE_TELEMETRY=1
+ENV HF_HUB_DISABLE_PROGRESS_BARS=1
+WORKDIR /app
+COPY proto/ ./proto/
+
+FROM python-builder-base AS pocket-builder
+COPY workers/python-pocket-tts/ ./workers/python-pocket-tts/
+COPY --from=pocket-overlay-builder /app/workers/python-pocket-tts/ ./workers/python-pocket-tts/
+RUN mkdir -p \
+    /opt/sky-audio-pocket-runtime \
+    /opt/sky-audio-model-cache/huggingface \
+    /opt/sky-audio-python
+RUN printf '%s\n' \
+    '[project]' \
+    'name = "sky-audio-pocket-runtime"' \
+    'version = "0.1.0"' \
+    'requires-python = ">=3.13"' \
+    'dependencies = [' \
+    '  "grpcio>=1.78.0",' \
+    '  "huggingface-hub>=0.36.0",' \
+    '  "numpy>=2.4.3",' \
+    '  "pocket-tts",' \
+    '  "protobuf>=5.29.6,<6",' \
+    '  "torch>=2.5.0",' \
+    ']' \
+    '' \
+    '[[tool.uv.index]]' \
+    'name = "pytorch-cpu"' \
+    'url = "https://download.pytorch.org/whl/cpu"' \
+    'explicit = true' \
+    '' \
+    '[tool.uv.sources]' \
+    'torch = { index = "pytorch-cpu" }' \
+    > /opt/sky-audio-pocket-runtime/pyproject.toml
+RUN set -eux; \
+    cd /opt/sky-audio-pocket-runtime; \
+    uv sync --python 3.13
+RUN rm -rf /app/workers/python-pocket-tts/.venv && \
+    ln -s /opt/sky-audio-pocket-runtime/.venv /app/workers/python-pocket-tts/.venv
+RUN set -eux; \
+    cd /app/workers/python-pocket-tts; \
+    .venv/bin/python prefetch_model.py
+RUN find /app/workers/python-pocket-tts -type d \( -name '__pycache__' -o -name '.pytest_cache' \) -prune -exec rm -rf {} + && \
+    find /opt/sky-audio-pocket-runtime -type d -name '__pycache__' -prune -exec rm -rf {} + && \
+    find /opt/sky-audio-pocket-runtime -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete && \
+    find /opt/sky-audio-model-cache -type d \( -name 'logs' -o -name '.locks' \) -prune -exec rm -rf {} + && \
+    rm -rf /opt/sky-audio-model-cache/huggingface/xet
+
+FROM python-builder-base AS gpu-runtime-builder
+RUN mkdir -p \
+    /opt/sky-audio-gpu-runtime \
+    /opt/sky-audio-model-cache/huggingface \
+    /opt/sky-audio-python
+RUN printf '%s\n' \
+    '[project]' \
+    'name = "sky-audio-gpu-runtime"' \
+    'version = "0.1.0"' \
+    'requires-python = ">=3.13,<3.14"' \
+    'dependencies = [' \
+    '  "cuda-python>=12.3",' \
+    '  "grpcio>=1.78.0",' \
+    '  "huggingface-hub>=0.36.0",' \
+    '  "moshi==0.2.13",' \
+    '  "nemo-toolkit[asr]==2.7.2",' \
+    '  "protobuf>=5.29.6,<6",' \
+    ']' \
+    > /opt/sky-audio-gpu-runtime/pyproject.toml
+RUN set -eux; \
+    cd /opt/sky-audio-gpu-runtime; \
+    uv sync --python 3.13
+
+FROM gpu-runtime-builder AS stt-builder
+COPY workers/python-nemo/ ./workers/python-nemo/
+RUN rm -rf /app/workers/python-nemo/.venv && \
+    ln -s /opt/sky-audio-gpu-runtime/.venv /app/workers/python-nemo/.venv
+RUN set -eux; \
+    cd /app/workers/python-nemo; \
+    .venv/bin/python prefetch_model.py
+RUN find /app/workers/python-nemo -type d \( -name '__pycache__' -o -name '.pytest_cache' \) -prune -exec rm -rf {} + && \
+    find /opt/sky-audio-gpu-runtime -type d -name '__pycache__' -prune -exec rm -rf {} + && \
+    find /opt/sky-audio-gpu-runtime -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete && \
+    find /opt/sky-audio-model-cache -type d \( -name 'logs' -o -name '.locks' \) -prune -exec rm -rf {} + && \
+    rm -rf /opt/sky-audio-model-cache/huggingface/xet
+
+FROM gpu-runtime-builder AS kyutai-builder
+COPY workers/python-kyutai-tts/ ./workers/python-kyutai-tts/
+RUN rm -rf /app/workers/python-kyutai-tts/.venv && \
+    ln -s /opt/sky-audio-gpu-runtime/.venv /app/workers/python-kyutai-tts/.venv
+RUN set -eux; \
+    cd /app/workers/python-kyutai-tts; \
+    .venv/bin/python prefetch_model.py
+RUN find /app/workers/python-kyutai-tts -type d \( -name '__pycache__' -o -name '.pytest_cache' \) -prune -exec rm -rf {} + && \
+    find /opt/sky-audio-gpu-runtime -type d -name '__pycache__' -prune -exec rm -rf {} + && \
+    find /opt/sky-audio-gpu-runtime -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete && \
+    find /opt/sky-audio-model-cache -type d \( -name 'logs' -o -name '.locks' \) -prune -exec rm -rf {} + && \
+    rm -rf /opt/sky-audio-model-cache/huggingface/xet
+
+FROM debian:bookworm-slim AS gateway-runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    python3 \
+    ffmpeg \
+    libopus0 \
+    libopusfile0 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=gateway-builder /usr/local/lib/onnxruntime/ /usr/local/lib/onnxruntime/
+RUN echo "/usr/local/lib/onnxruntime" > /etc/ld.so.conf.d/onnxruntime.conf && ldconfig
+WORKDIR /app
+COPY --from=gateway-builder /sky-audio ./sky-audio
+COPY gateway/models/ ./gateway/models/
+COPY proto/ ./proto/
+COPY workers/python-pocket-tts/voices.json ./workers/python-pocket-tts/voices.json
+COPY workers/python-kyutai-tts/voices.json ./workers/python-kyutai-tts/voices.json
+COPY --from=pocket-overlay-builder /app/workers/python-pocket-tts/ ./workers/python-pocket-tts/
+ENV TTS_ENGINE=pocket
+ENV PORT=8585
+ENV LD_LIBRARY_PATH=/usr/local/lib/onnxruntime
+CMD ["/app/sky-audio"]
+
+FROM debian:bookworm-slim AS pocket-worker-runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    python3 \
+    ffmpeg \
+    libopus0 \
+    libopusfile0 \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY --from=pocket-builder /opt/sky-audio-pocket-runtime /opt/sky-audio-pocket-runtime
+COPY --from=pocket-builder /opt/sky-audio-model-cache /opt/sky-audio-model-cache
+COPY --from=pocket-builder /opt/sky-audio-python /opt/sky-audio-python
+COPY --from=pocket-builder /app/workers/python-pocket-tts /app/workers/python-pocket-tts
+ENV UV_PYTHON_INSTALL_DIR=/opt/sky-audio-python
+ENV HF_HOME=/opt/sky-audio-model-cache/huggingface
+ENV HF_HUB_CACHE=/opt/sky-audio-model-cache/huggingface/hub
+ENV HF_HUB_OFFLINE=1
+ENV TRANSFORMERS_OFFLINE=1
+ENV HF_HUB_DISABLE_TELEMETRY=1
+CMD ["/app/workers/python-pocket-tts/.venv/bin/python", "/app/workers/python-pocket-tts/main.py"]
+
+FROM debian:bookworm-slim AS gpu-worker-runtime-base
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    gcc \
+    libc6-dev \
+    python3 \
+    ffmpeg \
+    libopus0 \
+    libopusfile0 \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY --from=gpu-runtime-builder /opt/sky-audio-gpu-runtime /opt/sky-audio-gpu-runtime
+COPY --from=gpu-runtime-builder /opt/sky-audio-python /opt/sky-audio-python
+ENV UV_PYTHON_INSTALL_DIR=/opt/sky-audio-python
+ENV HF_HOME=/opt/sky-audio-model-cache/huggingface
+ENV HF_HUB_CACHE=/opt/sky-audio-model-cache/huggingface/hub
+ENV HF_HUB_OFFLINE=1
+ENV TRANSFORMERS_OFFLINE=1
+ENV HF_HUB_DISABLE_TELEMETRY=1
+
+FROM gpu-worker-runtime-base AS stt-worker-runtime
+COPY --from=stt-builder /opt/sky-audio-model-cache /opt/sky-audio-model-cache
+COPY --from=stt-builder /app/workers/python-nemo /app/workers/python-nemo
+CMD ["/app/workers/python-nemo/.venv/bin/python", "/app/workers/python-nemo/main.py"]
+
+FROM gpu-worker-runtime-base AS kyutai-worker-runtime
+COPY --from=kyutai-builder /opt/sky-audio-model-cache /opt/sky-audio-model-cache
+COPY --from=kyutai-builder /app/workers/python-kyutai-tts /app/workers/python-kyutai-tts
+CMD ["/app/workers/python-kyutai-tts/.venv/bin/python", "/app/workers/python-kyutai-tts/main.py"]
