@@ -12,3 +12,4 @@
 - Keep the lane split hard-pinned in compose/tasks rather than relying on ad-hoc `TTS_ENGINE` or `STT_DEVICE` overrides; otherwise it is too easy to end up with the wrong gateway mode and no matching worker.
 - On this machine's 8GB RTX 4060, NeMo STT and Kyutai TTS do not fit concurrently in VRAM when both try to use CUDA; keep STT on CPU in the Kyutai lane.
 - After interrupted `docker compose build` / `up` runs, stale compose processes can leave containers stuck in `Created` or trigger phantom name conflicts. Kill the orphaned `docker compose` processes and clean the partial containers before retrying.
+- On this host, `docker compose build` / BuildKit may hang in `exporting to image` for large sky-audio images even after the image artifact already exists. The reliable local path is to build the runtime targets from `Dockerfile.compose` with direct `docker build --target <runtime-stage> -t ...` commands, then run `docker compose up --no-build`.

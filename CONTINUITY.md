@@ -55,6 +55,28 @@ Current state:
   - Kyutai worker came up on `CUDA`
   - Kyutai synthesized successfully
   - STT transcribed the generated Kyutai audio successfully through the same gateway
+- Fresh post-merge compose refresh completed on `main` with the build path fixed at source:
+  - `mise run docker:build` now builds the runtime images directly from `Dockerfile.compose` targets instead of relying on `docker compose build`
+  - current default-lane image tags:
+    - `sky-audio-gateway:latest` = `abdf5cb408b1`
+    - `sky-audio-pocket-worker:latest` = `4876745da173`
+    - `sky-audio-stt-worker:latest` = `9f83736b7c3d`
+    - `sky-audio-kyutai-worker:latest` = `6ead819bb4b5`
+  - current live containers:
+    - `sky-audio-gateway-1` healthy on `127.0.0.1:8585`
+    - `sky-audio-pocket-1` healthy
+    - `sky-audio-stt-1` healthy
+  - live verification on the refreshed deployment:
+    - `/health` returned `ok`
+    - `/api/tts/voices` returned Pocket default `alba` plus local voices `henry2` and `her`
+    - Pocket synthesized a valid WAV with `voice=henry2` (`pcm_s16le`, `24000 Hz`, `3.20s`)
+    - STT transcribed that generated WAV through `/v1/audio/transcriptions` with `model=sky-nemo-parakeet` as `Host composed smoke tests for Pocket TTS and STT.`
+    - Pocket preload log confirmed `warmed=alba,henry2,her`
+  - alternate Kyutai image was also refreshed through the same direct-target build path; the default live deployment remains the Pocket lane
+  - known Docker daemon wart on this host:
+    - `docker compose build` / BuildKit can still stall while exporting large images even when the image artifact has already been created
+    - direct `docker build --target <runtime-stage> -t ... -f Dockerfile.compose .` through the legacy builder succeeds reliably for the gateway, Pocket worker, STT worker, and Kyutai worker on this host
+    - `mise run docker:up*` now depends on those direct builds and then uses `docker compose up --no-build` so compose cannot fall back onto the flaky exporter path
 - Important hardware constraint on this machine:
   - NeMo STT + Kyutai TTS together exceed the available VRAM on the 8GB RTX 4060 when both try to use CUDA at the same time.
   - Default local live stack should remain Pocket + GPU STT.
@@ -63,4 +85,5 @@ Current state:
 
 Next sensible move:
 - Keep Pocket + GPU STT as the default compose stack and Kyutai + CPU STT as the alternate compose lane.
+- If Docker/BuildKit behavior on this host matters again, debug it as infrastructure work; the repo-side deployment path is now routed around the exporter hang.
 - If Kyutai must coexist with GPU STT on this hardware, revisit model/runtime strategy rather than Docker packaging.

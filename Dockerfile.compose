@@ -198,32 +198,12 @@ ENV TRANSFORMERS_OFFLINE=1
 ENV HF_HUB_DISABLE_TELEMETRY=1
 CMD ["/app/workers/python-pocket-tts/.venv/bin/python", "/app/workers/python-pocket-tts/main.py"]
 
-FROM debian:bookworm-slim AS gpu-worker-runtime-base
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    gcc \
-    libc6-dev \
-    python3 \
-    ffmpeg \
-    libopus0 \
-    libopusfile0 \
-    && rm -rf /var/lib/apt/lists/*
-WORKDIR /app
-COPY --from=gpu-runtime-builder /opt/sky-audio-gpu-runtime /opt/sky-audio-gpu-runtime
-COPY --from=gpu-runtime-builder /opt/sky-audio-python /opt/sky-audio-python
-ENV UV_PYTHON_INSTALL_DIR=/opt/sky-audio-python
-ENV HF_HOME=/opt/sky-audio-model-cache/huggingface
-ENV HF_HUB_CACHE=/opt/sky-audio-model-cache/huggingface/hub
+FROM stt-builder AS stt-worker-runtime
 ENV HF_HUB_OFFLINE=1
 ENV TRANSFORMERS_OFFLINE=1
-ENV HF_HUB_DISABLE_TELEMETRY=1
-
-FROM gpu-worker-runtime-base AS stt-worker-runtime
-COPY --from=stt-builder /opt/sky-audio-model-cache /opt/sky-audio-model-cache
-COPY --from=stt-builder /app/workers/python-nemo /app/workers/python-nemo
 CMD ["/app/workers/python-nemo/.venv/bin/python", "/app/workers/python-nemo/main.py"]
 
-FROM gpu-worker-runtime-base AS kyutai-worker-runtime
-COPY --from=kyutai-builder /opt/sky-audio-model-cache /opt/sky-audio-model-cache
-COPY --from=kyutai-builder /app/workers/python-kyutai-tts /app/workers/python-kyutai-tts
+FROM kyutai-builder AS kyutai-worker-runtime
+ENV HF_HUB_OFFLINE=1
+ENV TRANSFORMERS_OFFLINE=1
 CMD ["/app/workers/python-kyutai-tts/.venv/bin/python", "/app/workers/python-kyutai-tts/main.py"]
