@@ -32,6 +32,8 @@ import (
 	"github.com/heliasar/sky-audio/gateway/pkg/vram"
 	skywebrtc "github.com/heliasar/sky-audio/gateway/pkg/webrtc"
 	"github.com/heliasar/sky-audio/gateway/pkg/worker"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -655,6 +657,14 @@ func (l *lazySTTLoader) shutdown() {
 	l.mu.Unlock()
 }
 
+const (
+	// ttsMaxConcurrent caps concurrent synthesis requests against the single-threaded
+	// TTS worker. Requests beyond the cap queue on lazyTTSLoader.sem.
+	ttsMaxConcurrent = 4
+	// ttsMaxAttempts is the total attempt count for buffered Synthesize (1 initial + 1 retry).
+	ttsMaxAttempts = 2
+)
+
 // lazyTTSLoader manages on-demand TTS worker spawning and idle shutdown.
 // The active TTS engine is not started at startup; it spawns on the first request and shuts down after idle timeout.
 type lazyTTSLoader struct {
@@ -663,6 +673,11 @@ type lazyTTSLoader struct {
 	runtime     *worker.Runtime
 	spec        worker.Spec
 	idleTimeout time.Duration
+
+	// sem bounds concurrent synthesis requests against the single-threaded
+	// TTS worker. Shared across all synthesizers wrapping this loader so the
+	// limit reflects the actual worker bottleneck, not per-entrypoint.
+	sem chan struct{}
 
 	mu          sync.Mutex
 	cond        *sync.Cond
@@ -684,9 +699,25 @@ func newLazyTTSLoader(engine string, ctx context.Context, runtime *worker.Runtim
 		runtime:     runtime,
 		spec:        spec,
 		idleTimeout: idleTimeout,
+		sem:         make(chan struct{}, ttsMaxConcurrent),
 	}
 	l.cond = sync.NewCond(&l.mu)
 	return l
+}
+
+// acquireSlot blocks until a concurrency slot is available or ctx is canceled.
+func (l *lazyTTSLoader) acquireSlot(ctx context.Context) error {
+	select {
+	case l.sem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// releaseSlot returns a concurrency slot. Must be paired with a successful acquireSlot.
+func (l *lazyTTSLoader) releaseSlot() {
+	<-l.sem
 }
 
 func ttsClientHealthy(ctx context.Context, client *skywebrtc.TTSClient) bool {
@@ -983,7 +1014,7 @@ func (l *lazyTTSLoader) makeCleanup() func() {
 		if l.reqCount < 0 {
 			l.reqCount = 0
 		}
-		needsTimer := l.reqCount == 0 && l.running && !l.inShutdown
+		needsTimer := l.reqCount == 0 && l.running && !l.inShutdown && l.idleTimeout > 0
 		l.mu.Unlock()
 
 		if needsTimer {
@@ -1002,6 +1033,11 @@ func (l *lazyTTSLoader) makeCleanup() func() {
 
 func (l *lazyTTSLoader) shutdown() {
 	l.mu.Lock()
+	if l.idleTimeout == 0 {
+		// Persistent connection mode — never shut down on idle.
+		l.mu.Unlock()
+		return
+	}
 	if l.reqCount > 0 || !l.running || l.inShutdown || l.spawning {
 		l.mu.Unlock()
 		return
@@ -1108,32 +1144,115 @@ func (l *lazyTTSLoader) Stop() {
 	}
 }
 
-// lazyTTSSynthesizer wraps the lazy TTS loader as a TTSSynthesizer.
-// It ensures the active TTS worker is running before each synthesis call.
+// markStale marks the TTS connection as broken so the next EnsureRunning
+// will reconnect instead of reusing a dead gRPC connection. This is called
+// after transient gRPC errors (Canceled, Unavailable) to trigger a reconnect.
+func (l *lazyTTSLoader) markStale() {
+	l.mu.Lock()
+	if l.inShutdown {
+		l.mu.Unlock()
+		return
+	}
+	client := l.ttsClient
+	l.ttsClient = nil
+	l.running = false
+	l.ownedWorker = false
+	l.mu.Unlock()
+
+	if client != nil {
+		if err := client.Close(); err != nil {
+			log.Printf("[WARN] Failed to close stale %s TTS client: %v", l.engine, err)
+		}
+	}
+	log.Printf("[INFO] Marked %s TTS client as stale, will reconnect on next request", l.engine)
+}
+
+// lazyTTSSynthesizer wraps the lazy TTS loader. It ensures the active TTS
+// worker is running before each synthesis call, shares the loader's
+// concurrency semaphore, and retries once on transient gRPC errors.
 type lazyTTSSynthesizer struct {
 	loader *lazyTTSLoader
 }
 
+// isTransientGRPCErr reports whether err is a gRPC transport-level or
+// queue-timeout error that is safe to retry with a fresh connection.
+func isTransientGRPCErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	// status.FromError walks the error chain via errors.As, so it finds
+	// wrapped gRPC status errors at any depth. It returns ok=false only
+	// when no gRPC status is present anywhere in the chain.
+	if st, ok := status.FromError(err); ok {
+		switch st.Code() {
+		case codes.Canceled, codes.Unavailable, codes.Internal, codes.DeadlineExceeded:
+			return true
+		}
+		return false
+	}
+	// Fallback for errors that flattened the gRPC status into plain text
+	// via %v or %s formatting (which loses the wrapped error type).
+	msg := err.Error()
+	return strings.Contains(msg, "code = Canceled") ||
+		strings.Contains(msg, "code = Unavailable") ||
+		strings.Contains(msg, "code = Internal") ||
+		strings.Contains(msg, "code = DeadlineExceeded")
+}
+
 func (s *lazyTTSSynthesizer) Synthesize(ctx context.Context, text, voice string, opts *skywebrtc.SynthesisOptions) ([]byte, int32, error) {
-	client, cleanup := s.loader.EnsureRunning()
-	if client == nil {
-		return nil, 0, fmt.Errorf("%s TTS worker unavailable", s.loader.engine)
+	if err := s.loader.acquireSlot(ctx); err != nil {
+		return nil, 0, fmt.Errorf("%s TTS worker: queue wait aborted: %w", s.loader.engine, err)
 	}
-	if cleanup != nil {
-		defer cleanup()
+	defer s.loader.releaseSlot()
+
+	textLen := utf8.RuneCountInString(text)
+	for attempt := 1; attempt <= ttsMaxAttempts; attempt++ {
+		client, cleanup := s.loader.EnsureRunning()
+		if client == nil {
+			return nil, 0, fmt.Errorf("%s TTS worker unavailable", s.loader.engine)
+		}
+		pcm, sampleRate, err := client.Synthesize(ctx, text, voice, opts)
+		cleanup()
+		if err != nil && isTransientGRPCErr(err) && attempt < ttsMaxAttempts && ctx.Err() == nil {
+			log.Printf("[tts] %s synthesis transient error (attempt %d/%d, chars=%d, voice=%s): %v — reconnecting and retrying",
+				s.loader.engine, attempt, ttsMaxAttempts, textLen, voice, err)
+			s.loader.markStale()
+			continue
+		}
+		if err != nil && ctx.Err() == nil {
+			log.Printf("[tts] %s synthesis error (chars=%d, voice=%s): %v", s.loader.engine, textLen, voice, err)
+		}
+		return pcm, sampleRate, err
 	}
-	return client.Synthesize(ctx, text, voice, opts)
+	return nil, 0, fmt.Errorf("%s TTS worker unavailable after retry", s.loader.engine)
 }
 
 func (s *lazyTTSSynthesizer) SynthesizeStream(ctx context.Context, text, voice string, opts *skywebrtc.SynthesisOptions, onChunk func(pcm []byte, sampleRate int32) error) error {
+	if err := s.loader.acquireSlot(ctx); err != nil {
+		return fmt.Errorf("%s TTS worker: queue wait aborted: %w", s.loader.engine, err)
+	}
+	defer s.loader.releaseSlot()
+
+	// Streaming synthesis delivers audio chunks incrementally via onChunk.
+	// Retrying after partial delivery would duplicate chunks, so we mark
+	// the connection stale on transient errors but do not retry.
 	client, cleanup := s.loader.EnsureRunning()
 	if client == nil {
 		return fmt.Errorf("%s TTS worker unavailable", s.loader.engine)
 	}
-	if cleanup != nil {
-		defer cleanup()
+	err := client.SynthesizeStream(ctx, text, voice, opts, onChunk)
+	cleanup()
+	if err != nil && ctx.Err() == nil {
+		textLen := utf8.RuneCountInString(text)
+		if isTransientGRPCErr(err) {
+			s.loader.markStale()
+			log.Printf("[tts] %s stream transient error (chars=%d, voice=%s): %v — connection marked stale, no retry (partial delivery possible)",
+				s.loader.engine, textLen, voice, err)
+		} else {
+			log.Printf("[tts] %s stream error (chars=%d, voice=%s): %v", s.loader.engine, textLen, voice, err)
+		}
 	}
-	return client.SynthesizeStream(ctx, text, voice, opts, onChunk)
+	return err
 }
 
 func (l *lazySTTLoader) Stop() {
@@ -1576,8 +1695,15 @@ func main() {
 		ttsSpec = ttsPocketSpec
 	}
 
-	ttsLazy = newLazyTTSLoader(ttsEngine, ctx, workerRuntime, ttsSpec, 2*time.Minute)
+	ttsIdleTimeout := 30 * time.Minute
+	if !manageTTSWorker {
+		// External workers (Docker) are always running; no point destroying
+		// the gRPC connection on idle — it just forces expensive reconnections.
+		ttsIdleTimeout = 0
+	}
+	ttsLazy = newLazyTTSLoader(ttsEngine, ctx, workerRuntime, ttsSpec, ttsIdleTimeout)
 	defer ttsLazy.Stop()
+	log.Printf("[INFO] TTS idle timeout: %s (managed=%t)", ttsIdleTimeout, manageTTSWorker)
 
 	// Check ffmpeg availability - required for OpenAI TTS endpoint (default is OGG/Opus)
 	if !audio.IsFfmpegAvailable() {
@@ -2529,25 +2655,9 @@ func (a ttsClientAdapter) Synthesize(ctx context.Context, text, voice string, op
 func ttsHandlerLazy(ttsLazy *lazyTTSLoader, defaultEngine string) http.HandlerFunc {
 	adapted := make(map[string]ttsSynthesizer, 1)
 	if ttsLazy != nil {
-		adapted[defaultEngine] = &lazyAPITTSSynthesizer{loader: ttsLazy}
+		adapted[defaultEngine] = &lazyTTSSynthesizer{loader: ttsLazy}
 	}
 	return ttsHandlerWithSynth(adapted, defaultEngine)
-}
-
-// lazyAPITTSSynthesizer adapts lazyTTSLoader to the internal ttsSynthesizer interface.
-type lazyAPITTSSynthesizer struct {
-	loader *lazyTTSLoader
-}
-
-func (s *lazyAPITTSSynthesizer) Synthesize(ctx context.Context, text, voice string, opts *skywebrtc.SynthesisOptions) ([]byte, int32, error) {
-	client, cleanup := s.loader.EnsureRunning()
-	if client == nil {
-		return nil, 0, fmt.Errorf("%s TTS worker unavailable", s.loader.engine)
-	}
-	if cleanup != nil {
-		defer cleanup()
-	}
-	return client.Synthesize(ctx, text, voice, opts)
 }
 
 func ttsVoicesHandler(mgr *voiceCatalogManager) http.HandlerFunc {

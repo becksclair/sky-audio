@@ -400,12 +400,15 @@ func (r *RealtimeResponseRunner) Start(parent context.Context, req *RealtimeResp
 		defer close(active.done)
 		defer cancel()
 		err := runPreparedRealtimeResponse(ctx, r.sessionID, responseID, plan, r.sink, r.onPCM, r.emitAudioDeltas)
-		if err != nil && !errors.Is(err, context.Canceled) && r.sink != nil {
-			_ = r.sink(map[string]any{
-				"type":    "error",
-				"code":    "api_error",
-				"message": err.Error(),
-			})
+		if err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("[realtime] session=%s response=%s synthesis error: %v", r.sessionID, responseID, err)
+			if r.sink != nil {
+				_ = r.sink(map[string]any{
+					"type":    "error",
+					"code":    "api_error",
+					"message": err.Error(),
+				})
+			}
 		}
 		r.mu.Lock()
 		if r.active == active {

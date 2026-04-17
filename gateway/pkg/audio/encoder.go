@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os/exec"
 	"strconv"
+	"syscall"
 	"time"
 )
 
@@ -65,6 +67,22 @@ func (e *FFmpegEncoder) Encode(ctx context.Context, pcm []byte, sampleRate int32
 		normalizedFormat = "opus"
 	}
 
+	// Defensive: if PCM input is extremely large (>20 MB ≈ 10 min of 16kHz mono audio),
+	// skip ffmpeg encoding to avoid OOM-killing the subprocess. Fall back to WAV.
+	const maxPCMForFfmpeg = 20 * 1024 * 1024
+	if normalizedFormat != "wav" && normalizedFormat != "pcm" && len(pcm) > maxPCMForFfmpeg {
+		log.Printf("[tts] PCM input too large for ffmpeg encoding (%d bytes, format=%s, rate=%d) — falling back to WAV",
+			len(pcm), normalizedFormat, sampleRate)
+		var buf bytes.Buffer
+		if err := WriteWAV(&buf, pcm, sampleRate); err != nil {
+			return nil, fmt.Errorf("wav fallback encoding failed for oversized input: %w", err)
+		}
+		return &EncodeResult{
+			Body:        buf.Bytes(),
+			ContentType: "audio/wav",
+		}, nil
+	}
+
 	// Fast path for PCM (pass-through)
 	if normalizedFormat == "pcm" {
 		return &EncodeResult{
@@ -103,7 +121,30 @@ func (e *FFmpegEncoder) Encode(ctx context.Context, pcm []byte, sampleRate int32
 		if len(errMsg) > 500 {
 			errMsg = errMsg[:500] + "..."
 		}
-		return nil, fmt.Errorf("ffmpeg encode failed: %w (stderr: %s)", err, errMsg)
+		// Distinguish OOM kill (SIGKILL) from context deadline exceeded
+		// and other ffmpeg failure modes.
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			status := exitErr.ProcessState.Sys()
+			if ws, ok := status.(syscall.WaitStatus); ok && ws.Signaled() {
+				sig := ws.Signal()
+				log.Printf("[tts] ffmpeg killed by signal %v (pcm=%d bytes, format=%s, rate=%d, stderr=%q)",
+					sig, len(pcm), normalizedFormat, sampleRate, errMsg)
+				if sig == syscall.SIGKILL {
+					return nil, fmt.Errorf("ffmpeg killed by SIGKILL (likely OOM): pcm=%d bytes, format=%s, rate=%d (stderr: %s)",
+						len(pcm), normalizedFormat, sampleRate, errMsg)
+				}
+				return nil, fmt.Errorf("ffmpeg killed by signal %v: pcm=%d bytes, format=%s, rate=%d (stderr: %s)",
+					sig, len(pcm), normalizedFormat, sampleRate, errMsg)
+			}
+		}
+		// Context cancellation (deadline exceeded, caller canceled)
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("ffmpeg encode canceled: %v (pcm=%d bytes, format=%s, stderr: %s)",
+				ctx.Err(), len(pcm), normalizedFormat, errMsg)
+		}
+		return nil, fmt.Errorf("ffmpeg encode failed: %w (pcm=%d bytes, format=%s, rate=%d, stderr: %s)",
+			err, len(pcm), normalizedFormat, sampleRate, errMsg)
 	}
 
 	if len(stdout) > MaxEncodedAudioBytes {

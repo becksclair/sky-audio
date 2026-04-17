@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"time"
 
 	pb "github.com/heliasar/sky-audio/gateway/pkg/pb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
 )
 
 const maxPCMBytes = 50 * 1024 * 1024 // 50MB
@@ -31,6 +33,11 @@ func NewTTSClient(socketPath string) (*TTSClient, error) {
 	conn, err := grpc.NewClient(
 		"unix://"+socketPath,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                30 * time.Second,
+			Timeout:             10 * time.Second,
+			PermitWithoutStream: true,
+		}),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("dial tts socket: %w", err)
@@ -71,7 +78,7 @@ func (c *TTSClient) Synthesize(ctx context.Context, text, voice string, opts *Sy
 	return pcmBuf, sr, nil
 }
 
-func (c *TTSClient) SynthesizeStream(ctx context.Context, text, voice string, opts *SynthesisOptions, onChunk func(pcm []byte, sampleRate int32) error) error {
+func (c *TTSClient) SynthesizeStream(ctx context.Context, text, voice string, opts *SynthesisOptions, onChunk func(pcm []byte, chunkSampleRate int32) error) error {
 	stream, err := c.client.SynthesizeStream(ctx)
 	if err != nil {
 		return fmt.Errorf("start synthesize stream: %w", err)

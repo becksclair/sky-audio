@@ -319,10 +319,15 @@ func TTSHandlerWithSynth(synthesizers map[string]TTSSynthesizer) http.HandlerFun
 
 		pcm, sampleRate, err := prepared.synth.Synthesize(ctx, prepared.text, prepared.voice, prepared.opts)
 		if err != nil {
-			// Log detailed error server-side, return generic message to client
-			// to avoid leaking internal paths and implementation details
-			// (security: prevent information disclosure)
-			log.Printf("[tts] synthesis error: %v", err)
+			// Client-side cancellation (disconnected before we could respond)
+			// is not a server error — check the request context directly
+			// since gRPC wraps context.Canceled as "code = Canceled", losing
+			// the sentinel for errors.Is.
+			if r.Context().Err() != nil {
+				return
+			}
+			log.Printf("[tts] synthesis error (engine=%s, voice=%s, chars=%d): %v",
+				prepared.engineName, prepared.voice, utf8.RuneCountInString(prepared.text), err)
 			writeTTSError(w, http.StatusInternalServerError, "api_error", "Synthesis failed")
 			return
 		}
@@ -333,7 +338,12 @@ func TTSHandlerWithSynth(synthesizers map[string]TTSSynthesizer) http.HandlerFun
 
 		result, err := encoder.Encode(encodeCtx, pcm, sampleRate, string(format))
 		if err != nil {
-			log.Printf("[tts] encode error: %v", err)
+			// Client disconnected mid-encode is not a server error.
+			if r.Context().Err() != nil {
+				return
+			}
+			log.Printf("[tts] encode error (engine=%s, voice=%s, chars=%d, format=%s, pcm=%d bytes): %v",
+				prepared.engineName, prepared.voice, utf8.RuneCountInString(prepared.text), format, len(pcm), err)
 			writeTTSError(w, http.StatusInternalServerError, "api_error", "Audio encoding failed")
 			return
 		}
