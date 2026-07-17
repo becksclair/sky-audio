@@ -10,5 +10,5 @@ dependencies = [
     "huggingface-hub>=0.36.0",
     "numpy>=2.4.3",
     "pocket-tts",
-    "torch>=2.5.0",
+    "torch>=2.13.0",
 ]
